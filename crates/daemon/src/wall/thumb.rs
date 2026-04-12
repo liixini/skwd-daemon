@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use image::DynamicImage;
+use image::imageops::FilterType;
 use tokio::process::Command;
 
 use crate::util::{self, CommandExt};
@@ -12,6 +13,17 @@ fn tmp_path(dest: &Path) -> PathBuf {
     name.push(".tmp.");
     name.push(ext);
     dest.with_file_name(name)
+}
+
+fn resize_and_crop(img: &DynamicImage, w: u32, h: u32) -> DynamicImage {
+    let (iw, ih) = (img.width(), img.height());
+    let scale = (w as f64 / iw as f64).max(h as f64 / ih as f64);
+    let nw = (iw as f64 * scale).ceil() as u32;
+    let nh = (ih as f64 * scale).ceil() as u32;
+    let resized = img.resize_exact(nw, nh, FilterType::Lanczos3);
+    let x = (nw.saturating_sub(w)) / 2;
+    let y = (nh.saturating_sub(h)) / 2;
+    resized.crop_imm(x, y, w, h)
 }
 
 pub const THUMB_W: u32 = 640;
@@ -31,36 +43,29 @@ pub async fn generate_static(src: &Path, thumb_path: &Path, thumb_sm_path: &Path
         tokio::fs::create_dir_all(parent).await.ok();
     }
 
-    let src_arg = format!("{}[0]", src.display());
-    let tmp_thumb = tmp_path(thumb_path);
-    let mut cmd = Command::new("magick");
-    cmd.args([
-        src_arg.as_ref(),
-        "-resize".as_ref(),
-        format!("{THUMB_W}x{THUMB_H}^").as_ref(),
-        "-gravity".as_ref(),
-        "center".as_ref(),
-        "-extent".as_ref(),
-        format!("{THUMB_W}x{THUMB_H}").as_ref(),
-        "-quality".as_ref(),
-        "85".as_ref(),
-        tmp_thumb.as_os_str(),
-    ])
-    .silent();
-    let status = util::timed_status(&mut cmd, util::CMD_TIMEOUT).await?;
+    let src = src.to_path_buf();
+    let thumb_path = thumb_path.to_path_buf();
+    let thumb_sm_path_c = thumb_sm_path.to_path_buf();
+    let tmp_thumb = tmp_path(&thumb_path);
 
-    if !status.success() {
-        let _ = tokio::fs::remove_file(&tmp_thumb).await;
-        anyhow::bail!("magick failed for {}", src.display());
-    }
-    tokio::fs::rename(&tmp_thumb, thumb_path).await?;
+    let thumb_path_c = thumb_path.clone();
+    let tmp_thumb_c = tmp_thumb.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let img = image::open(&src)?;
+        let thumb = resize_and_crop(&img, THUMB_W, THUMB_H);
+        thumb.save(&tmp_thumb_c)?;
+        Ok(())
+    })
+    .await??;
 
-    generate_small_thumb(thumb_path, thumb_sm_path).await?;
-    let (hue, sat) = extract_hue_sat_from_file(thumb_path).await;
+    tokio::fs::rename(&tmp_thumb, &thumb_path).await?;
+
+    generate_small_thumb(&thumb_path, &thumb_sm_path_c).await?;
+    let (hue, sat) = extract_hue_sat_from_file(&thumb_path_c).await;
 
     Ok(ThumbResult {
         thumb_path: thumb_path.display().to_string(),
-        thumb_sm_path: thumb_sm_path.display().to_string(),
+        thumb_sm_path: thumb_sm_path_c.display().to_string(),
         hue,
         sat,
     })
@@ -121,28 +126,20 @@ async fn generate_small_thumb(thumb_path: &Path, thumb_sm_path: &Path) -> anyhow
     if let Some(parent) = thumb_sm_path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
+    let thumb_path = thumb_path.to_path_buf();
     let tmp_sm = tmp_path(thumb_sm_path);
-    let mut cmd = Command::new("magick");
-    cmd.args([
-        thumb_path.as_os_str(),
-        "-resize".as_ref(),
-        format!("{SMALL_W}x{SMALL_H}^").as_ref(),
-        "-gravity".as_ref(),
-        "center".as_ref(),
-        "-extent".as_ref(),
-        format!("{SMALL_W}x{SMALL_H}").as_ref(),
-        "-quality".as_ref(),
-        "85".as_ref(),
-        tmp_sm.as_os_str(),
-    ])
-    .silent();
-    let status = util::timed_status(&mut cmd, util::CMD_TIMEOUT).await?;
+    let thumb_sm_path = thumb_sm_path.to_path_buf();
+    let tmp_sm_c = tmp_sm.clone();
 
-    if !status.success() {
-        let _ = tokio::fs::remove_file(&tmp_sm).await;
-        anyhow::bail!("magick small thumb failed for {}", thumb_path.display());
-    }
-    tokio::fs::rename(&tmp_sm, thumb_sm_path).await?;
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let img = image::open(&thumb_path)?;
+        let small = resize_and_crop(&img, SMALL_W, SMALL_H);
+        small.save(&tmp_sm_c)?;
+        Ok(())
+    })
+    .await??;
+
+    tokio::fs::rename(&tmp_sm, &thumb_sm_path).await?;
     Ok(())
 }
 
