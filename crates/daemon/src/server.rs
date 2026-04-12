@@ -17,7 +17,7 @@ use crate::wall::matugen::MatugenState;
 use crate::wall::optimize::OptimizeState;
 use crate::wall::steam::SteamState;
 use crate::wall::watcher::SuppressSet;
-use crate::wall::{self, analysis, cache, matugen, optimize, steam, watcher};
+use crate::wall::{self, analysis, apply, cache, matugen, optimize, steam, watcher};
 
 use notify::Watcher as _;
 
@@ -358,6 +358,11 @@ async fn run_watcher_loop(
                 let db = state.db_shared.clone();
                 cache::rebuild(&config, db.clone(), state.cache_state.clone(), tx.clone()).await;
                 auto_optimize_if_enabled(&config, db, tx.clone(), state.optimize_state.clone()).await;
+
+                match apply::restore(&config).await {
+                    Ok(name) => info!("auto-restored wallpaper: {name}"),
+                    Err(e) => info!("no wallpaper to restore: {e}"),
+                }
             }
         }
     }
