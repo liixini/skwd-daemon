@@ -1,0 +1,9 @@
+max_width = 120
+use_field_init_shorthand = true
+use_try_shorthand = true
+edition = "2024"
+newline_style = "Unix"
+# Nightly-only (uncomment when using nightly toolchain):
+# imports_granularity = "Crate"
+# group_imports = "StdExternalCrate"
+# format_code_in_doc_comments = true

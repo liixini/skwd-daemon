@@ -1,0 +1,16 @@
+[package]
+name = "skwd-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "skwd"
+path = "src/main.rs"
+
+[dependencies]
+skwd-proto = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

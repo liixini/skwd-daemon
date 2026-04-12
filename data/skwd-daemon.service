@@ -1,0 +1,15 @@
+[Unit]
+Description=Skwd Daemon
+Documentation=https://github.com/liixini/skwd-daemon
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/skwd-daemon
+Restart=on-failure
+RestartSec=2
+Environment="RUST_LOG=info"
+
+[Install]
+WantedBy=graphical-session.target

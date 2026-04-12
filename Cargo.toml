@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = ["crates/daemon", "crates/cli", "crates/proto"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["liixini"]
+
+[workspace.dependencies]
+skwd-proto = { path = "crates/proto" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+notify = "6"
+image = { version = "0.25", features = ["webp"] }
+walkdir = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+base64 = "0.22"
+anyhow = "1"
+
+# ── Workspace-wide lints ──────────────────────────────
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+elided_lifetimes_in_paths = "warn"
+
+[workspace.lints.clippy]
+# Correctness / suspicious
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+cast_lossless = "warn"
+manual_let_else = "warn"
+collapsible_if = "warn"
+collapsible_else_if = "warn"
+redundant_closure = "warn"
+redundant_closure_for_method_calls = "warn"
+unnecessary_wraps = "warn"
+# Style
+cloned_instead_of_copied = "warn"
+flat_map_option = "warn"
+needless_pass_by_value = "warn"
+uninlined_format_args = "warn"
+semicolon_if_nothing_returned = "warn"
+match_same_arms = "warn"
+implicit_clone = "warn"
+# Perf
+manual_string_new = "warn"
+or_fun_call = "warn"
+map_unwrap_or = "warn"
+# Nursery (stable & useful)
+redundant_else = "warn"
+# Allow — too noisy or inapplicable for this project
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+struct_excessive_bools = "allow"
+too_many_lines = "allow"
