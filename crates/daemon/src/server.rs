@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusqlite::Connection;
@@ -55,9 +55,11 @@ impl UiProcess {
             return;
         }
         info!("launching UI: quickshell -p {}", self.shell_qml.display());
+        let install_dir = self.shell_qml.parent().unwrap_or(Path::new("/usr/share/skwd-wall"));
         match tokio::process::Command::new("quickshell")
             .arg("-p")
             .arg(&self.shell_qml)
+            .env("SKWD_WALL_INSTALL", install_dir)
             .silent()
             .spawn()
         {
@@ -95,7 +97,7 @@ fn resolve_shell_qml() -> PathBuf {
     if local.exists() {
         return std::fs::canonicalize(&local).unwrap_or(local);
     }
-    let sibling = PathBuf::from("../skwd-wall-rust/shell.qml");
+    let sibling = PathBuf::from("../skwd-wall/shell.qml");
     if sibling.exists() {
         return std::fs::canonicalize(&sibling).unwrap_or(sibling);
     }
