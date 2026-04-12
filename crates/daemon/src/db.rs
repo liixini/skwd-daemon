@@ -98,7 +98,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn import_from_qml(conn: &Connection) -> anyhow::Result<usize> {
+pub fn import_from_qml(conn: &Connection) -> anyhow::Result<i64> {
     let src_path = qml_db_path();
     if !src_path.exists() {
         anyhow::bail!("QML database not found at {}", src_path.display());
@@ -124,7 +124,7 @@ pub fn import_from_qml(conn: &Connection) -> anyhow::Result<usize> {
          INSERT OR REPLACE INTO state SELECT * FROM qml.state WHERE key != 'imported_from_qml';",
     )?;
 
-    let count: usize = conn.query_row("SELECT count(*) FROM meta", [], |r| r.get(0))?;
+    let count: i64 = conn.query_row("SELECT count(*) FROM meta", [], |r| r.get(0))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
