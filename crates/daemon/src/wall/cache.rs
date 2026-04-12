@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use tokio::sync::{Mutex, Semaphore, broadcast};
 use tracing::{debug, info, warn};
 
-const MAX_THUMB_JOBS: usize = 16;
+const MAX_THUMB_JOBS: usize = 4;
 
 use super::thumb;
 use crate::config::Config;
