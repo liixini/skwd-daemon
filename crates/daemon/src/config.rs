@@ -142,6 +142,12 @@ pub struct PerformanceConfig {
     pub auto_delete_video_trash: bool,
     #[serde(default = "default_trash_days", rename = "videoTrashDays")]
     pub video_trash_days: u32,
+    #[serde(default = "default_max_thumb_jobs", rename = "maxThumbJobs")]
+    pub max_thumb_jobs: usize,
+}
+
+fn default_max_thumb_jobs() -> usize {
+    16
 }
 
 fn default_trash_days() -> u32 {

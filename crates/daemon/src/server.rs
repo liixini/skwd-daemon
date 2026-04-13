@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use skwd_proto::{Event, Request, Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -506,6 +506,43 @@ async fn dispatch_request(
         }
 
         "theme.colors" => Response::ok(req.id, serde_json::json!({"colors": {}})),
+
+        "state.get" => {
+            let key = req.str_param("key", "");
+            if key.is_empty() {
+                return Response::err(req.id, -32602, "missing key".to_string());
+            }
+            let db = state.db.lock().await;
+            let val: Option<String> = db
+                .query_row(
+                    "SELECT val FROM state WHERE key=?1",
+                    params![key],
+                    |r| r.get(0),
+                )
+                .ok();
+            Response::ok(req.id, serde_json::json!({ "value": val }))
+        }
+
+        "state.set" => {
+            let key = req.str_param("key", "");
+            let val = req.opt_str("value");
+            if key.is_empty() {
+                return Response::err(req.id, -32602, "missing key".to_string());
+            }
+            let db = state.db.lock().await;
+            match val {
+                Some(v) => {
+                    let _ = db.execute(
+                        "INSERT OR REPLACE INTO state(key, val) VALUES(?1, ?2)",
+                        params![key, v],
+                    );
+                }
+                None => {
+                    let _ = db.execute("DELETE FROM state WHERE key=?1", params![key]);
+                }
+            }
+            Response::ok(req.id, serde_json::json!({ "ok": true }))
+        }
 
         _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
     }

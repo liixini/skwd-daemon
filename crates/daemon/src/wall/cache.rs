@@ -6,8 +6,6 @@ use rusqlite::Connection;
 use tokio::sync::{Mutex, Semaphore, broadcast};
 use tracing::{debug, info, warn};
 
-const MAX_THUMB_JOBS: usize = 4;
-
 use super::thumb;
 use crate::config::Config;
 use crate::db;
@@ -203,11 +201,12 @@ pub async fn rebuild(
         return;
     }
 
-    info!("starting thumbnail generation ({total} items, {MAX_THUMB_JOBS} concurrent)");
+    let max_jobs = config.performance.max_thumb_jobs.max(1);
+    info!("starting thumbnail generation ({total} items, {max_jobs} concurrent)");
 
     let ok_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let fail_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let sem = Arc::new(Semaphore::new(MAX_THUMB_JOBS));
+    let sem = Arc::new(Semaphore::new(max_jobs));
     let mut handles = Vec::with_capacity(total);
 
     for (i, item) in filtered.into_iter().enumerate() {
