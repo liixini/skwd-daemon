@@ -280,8 +280,7 @@ pub fn delete_by_name_prefix(conn: &Connection, prefix: &str) -> rusqlite::Resul
 
 pub fn set_matugen(conn: &Connection, key: &str, matugen_json: &str) -> rusqlite::Result<bool> {
     let changed = conn.execute(
-        "INSERT INTO meta(key, matugen) VALUES(?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET matugen = excluded.matugen",
+        "UPDATE meta SET matugen = ?2 WHERE key = ?1",
         params![key, matugen_json],
     )?;
     Ok(changed > 0)
@@ -292,8 +291,7 @@ pub fn set_matugen_batch(conn: &Connection, entries: &[(String, String)]) -> rus
     let mut count = 0;
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO meta(key, matugen) VALUES(?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET matugen = excluded.matugen",
+            "UPDATE meta SET matugen = ?2 WHERE key = ?1",
         )?;
         for (key, matugen_json) in entries {
             count += stmt.execute(params![key, matugen_json])?;
