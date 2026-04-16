@@ -15,6 +15,7 @@ BuildRequires:  cargo >= 1.85
 BuildRequires:  rust >= 1.85
 BuildRequires:  gcc
 BuildRequires:  pkgconfig
+BuildRequires:  systemd-rpm-macros
 
 Requires:       ImageMagick
 
@@ -42,12 +43,12 @@ cargo build --release
 %install
 install -Dpm 0755 target/release/skwd-daemon %{buildroot}%{_bindir}/skwd-daemon
 install -Dpm 0755 target/release/skwd %{buildroot}%{_bindir}/skwd
-install -Dpm 0644 data/skwd-daemon.service %{buildroot}%{_userunitdir}/skwd-daemon.service
+install -Dpm 0644 data/skwd-daemon.service %{buildroot}%{_prefix}/lib/systemd/user/skwd-daemon.service
 install -Dpm 0644 LICENSE %{buildroot}%{_datadir}/licenses/%{name}/LICENSE
 
 # Systemd user preset - auto-enable on first login
-mkdir -p %{buildroot}%{_userpresetdir}
-echo "enable skwd-daemon.service" > %{buildroot}%{_userpresetdir}/90-skwd-daemon.preset
+mkdir -p %{buildroot}%{_prefix}/lib/systemd/user-preset
+echo "enable skwd-daemon.service" > %{buildroot}%{_prefix}/lib/systemd/user-preset/90-skwd-daemon.preset
 
 %post
 systemctl --global preset skwd-daemon.service 2>/dev/null || :
@@ -61,5 +62,5 @@ fi
 %license LICENSE
 %{_bindir}/skwd-daemon
 %{_bindir}/skwd
-%{_userunitdir}/skwd-daemon.service
-%{_userpresetdir}/90-skwd-daemon.preset
+%{_prefix}/lib/systemd/user/skwd-daemon.service
+%{_prefix}/lib/systemd/user-preset/90-skwd-daemon.preset
