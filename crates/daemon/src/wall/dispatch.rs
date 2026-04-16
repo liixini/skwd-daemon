@@ -194,6 +194,22 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             }
         }
 
+        "update_metadata" => {
+            let key = req.str_param("key", "");
+            if key.is_empty() {
+                return Response::err(req.id, 1, "missing 'key' parameter");
+            }
+            let filesize = req.params.get("filesize").and_then(|v| v.as_i64()).unwrap_or(0);
+            let width = req.params.get("width").and_then(|v| v.as_i64()).unwrap_or(0);
+            let height = req.params.get("height").and_then(|v| v.as_i64()).unwrap_or(0);
+
+            let db = state.db.lock().await;
+            match crate::db::update_meta_dimensions(&db, key, filesize, width, height) {
+                Ok(()) => Response::ok(req.id, serde_json::json!({"updated": key})),
+                Err(e) => Response::err(req.id, 2, format!("db error: {e}")),
+            }
+        }
+
         "delete" => {
             let name = req.str_param("name", "");
             let wp_type = req.str_param("type", "static");

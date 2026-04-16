@@ -394,7 +394,6 @@ pub fn clear_all(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
 pub fn update_meta_dimensions(
     conn: &Connection,
     key: &str,
