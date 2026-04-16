@@ -108,6 +108,11 @@ pub async fn start(
 
     let total = work_items.len();
 
+    if work_items.is_empty() {
+        let _ = event_tx.send(make_event("skwd.wall.matugen.ready", serde_json::json!({})));
+        return Ok(());
+    }
+
     {
         let mut s = state.lock().await;
         s.running = true;
@@ -117,13 +122,6 @@ pub async fn start(
     }
 
     broadcast_progress(&event_tx, &state).await;
-
-    if work_items.is_empty() {
-        let mut s = state.lock().await;
-        s.running = false;
-        let _ = event_tx.send(make_event("skwd.wall.matugen.ready", serde_json::json!({})));
-        return Ok(());
-    }
 
     let sem = Arc::new(Semaphore::new(MAX_JOBS));
     let mut handles = Vec::new();

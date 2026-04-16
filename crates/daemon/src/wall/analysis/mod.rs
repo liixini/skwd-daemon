@@ -738,14 +738,7 @@ fn format_eta(seconds: f64) -> String {
 
 fn thumb_to_key(path: &str) -> String {
     let fname = path.rsplit('/').next().unwrap_or(path);
-    let stem = fname.rsplit_once('.').map_or(fname, |(s, _)| s);
-    if path.contains("/we-thumbs/") {
-        format!("we:{stem}")
-    } else if path.contains("/video-thumbs/") {
-        format!("video:{stem}")
-    } else {
-        format!("static:{stem}")
-    }
+    fname.rsplit_once('.').map_or(fname, |(s, _)| s).to_string()
 }
 
 fn load_existing(conn: &Connection, model: &str) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
