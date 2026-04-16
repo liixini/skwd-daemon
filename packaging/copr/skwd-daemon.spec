@@ -37,8 +37,7 @@ management, and caching. The CLI provides command-line control.
 %build
 export RUSTUP_TOOLCHAIN=stable
 export CARGO_TARGET_DIR=target
-# Remove Arch-specific LTO stripping, use Fedora defaults
-cargo build --release --locked
+cargo build --release
 
 %install
 install -Dpm 0755 target/release/skwd-daemon %{buildroot}%{_bindir}/skwd-daemon
