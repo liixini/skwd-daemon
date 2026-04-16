@@ -52,7 +52,7 @@ pub async fn apply_video(path: &str, config: &Config) -> anyhow::Result<()> {
     } else {
         let mute_flag = if mute { "loop --mute=yes" } else { "loop" };
         let cmd = format!(
-            "pkill mpvpaper 2>/dev/null; sleep 0.5; nohup setsid mpvpaper -o '{}' '*' {} </dev/null >/dev/null 2>&1 &",
+            "pkill -9 mpvpaper 2>/dev/null; while pgrep -x mpvpaper >/dev/null; do sleep 0.1; done; nohup setsid mpvpaper -o '{}' '*' {} </dev/null >/dev/null 2>&1 &",
             mute_flag,
             shell_quote(path)
         );
@@ -385,7 +385,7 @@ async fn find_we_preview(item_dir: &Path) -> Option<PathBuf> {
 async fn kill_wallpaper_procs() {
     let _ = run_sh(
         "pkill -9 -f '[l]inux-wallpaperengine' 2>/dev/null; \
-         pkill mpvpaper 2>/dev/null; \
+         pkill -9 mpvpaper 2>/dev/null; \
          pkill awww 2>/dev/null; \
          pkill awww-daemon 2>/dev/null; \
          true",
