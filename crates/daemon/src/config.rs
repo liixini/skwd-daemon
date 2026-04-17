@@ -32,6 +32,8 @@ pub struct Config {
     pub performance: PerformanceConfig,
     #[serde(default, rename = "defaultMatugenConfig")]
     pub default_matugen_config: Option<String>,
+    #[serde(default, rename = "externalMatugenCommand")]
+    pub external_matugen_command: Option<String>,
     #[serde(default, rename = "postProcessing")]
     pub post_processing: Vec<String>,
     #[serde(default, rename = "postProcessOnRestore")]

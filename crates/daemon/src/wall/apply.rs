@@ -348,25 +348,14 @@ async fn run_matugen_inner(image_path: &str, config: &Config, config_path: &Path
     if let Some(default_cfg) = config.default_matugen_config_path()
         && default_cfg.exists()
     {
-        let status = Command::new("matugen")
-            .arg("-c")
-            .arg(&default_cfg)
-            .arg("image")
-            .arg("-t")
-            .arg(scheme)
-            .arg("-m")
-            .arg(mode)
-            .arg("--source-color-index")
-            .arg("0")
-            .arg(image_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .status()
-            .await;
-
-        if let Err(e) = status {
-            warn!("failed to run matugen with default config: {e}");
+        let default_cmd = "matugen -c %config% image %path%".to_string();
+        let cmd_template = config.external_matugen_command.as_deref().unwrap_or(&default_cmd);
+        let cmd = cmd_template
+            .replace("%config%", &shell_quote(&default_cfg.display().to_string()))
+            .replace("%path%", &shell_quote(image_path));
+        info!("running external matugen: {cmd}");
+        if let Err(e) = run_sh(&cmd).await {
+            warn!("failed to run external matugen: {e}");
         }
     }
 }
