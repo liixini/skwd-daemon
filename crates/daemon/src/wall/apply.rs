@@ -56,11 +56,18 @@ pub async fn apply_video(path: &str, outputs: &[String], config: &Config) -> any
     if is_kde {
         apply_kde_video(path, mute).await?;
     } else {
-        let mute_flag = if mute { "loop --mute=yes" } else { "loop" };
+        let mpv_opts = {
+            let mut opts = String::from("loop");
+            if mute { opts.push_str(" --mute=yes"); }
+            if config.features.video_auto_scale {
+                opts.push_str(" --keepaspect=yes --panscan=1.0 --video-unscaled=no");
+            }
+            opts
+        };
         if outputs.is_empty() {
             let cmd = format!(
                 "pkill -9 mpvpaper 2>/dev/null; while pgrep -x mpvpaper >/dev/null; do sleep 0.1; done; nohup setsid mpvpaper -o '{}' '*' {} </dev/null >/dev/null 2>&1 &",
-                mute_flag,
+                mpv_opts,
                 shell_quote(path)
             );
             info!("apply_video cmd: {cmd}");
@@ -70,7 +77,7 @@ pub async fn apply_video(path: &str, outputs: &[String], config: &Config) -> any
             for output in outputs {
                 parts.push(format!(
                     "nohup setsid mpvpaper -o '{}' {} {} </dev/null >/dev/null 2>&1 &",
-                    mute_flag,
+                    mpv_opts,
                     shell_quote(output),
                     shell_quote(path)
                 ));
