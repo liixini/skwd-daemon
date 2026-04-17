@@ -72,6 +72,8 @@ pub struct FeaturesConfig {
     pub steam: bool,
     #[serde(default)]
     pub wallhaven: bool,
+    #[serde(default)]
+    pub videoAutoScale: bool,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -80,6 +82,7 @@ impl Default for FeaturesConfig {
             ollama: false,
             steam: false,
             wallhaven: false,
+	    videoAutoScale: false,
         }
     }
 }

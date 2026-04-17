@@ -56,7 +56,19 @@ pub async fn apply_video(path: &str, outputs: &[String], config: &Config) -> any
     if is_kde {
         apply_kde_video(path, mute).await?;
     } else {
-        let mute_flag = if mute { "loop --mute=yes" } else { "loop" };
+
+        let scale_flags = if config.features.videoAutoScale {
+	    "--keepaspect=yes --panscan=1.0 --video-unscaled=no"
+	} else {
+	    "--keepaspect=yes"
+	};
+
+	let mute_flag = if mute {
+	    format!("loop --mute=yes {}", scale_flags)
+	} else {
+	    format!("loop {}", scale_flags)
+	};
+
         if outputs.is_empty() {
             let cmd = format!(
                 "pkill -9 mpvpaper 2>/dev/null; while pgrep -x mpvpaper >/dev/null; do sleep 0.1; done; nohup setsid mpvpaper -o '{}' '*' {} </dev/null >/dev/null 2>&1 &",
