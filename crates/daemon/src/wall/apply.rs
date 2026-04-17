@@ -7,7 +7,7 @@ use tracing::{info, warn};
 use crate::config::{self, Config};
 use crate::util::CommandExt;
 
-pub async fn apply_static(path: &str, config: &Config) -> anyhow::Result<()> {
+pub async fn apply_static(path: &str, outputs: &[String], config: &Config) -> anyhow::Result<()> {
     let is_kde = is_kde();
 
     kill_wallpaper_procs().await;
@@ -15,13 +15,19 @@ pub async fn apply_static(path: &str, config: &Config) -> anyhow::Result<()> {
     if is_kde {
         run_sh(&format!("plasma-apply-wallpaperimage {}", shell_quote(path))).await?;
     } else {
+        let outputs_flag = if outputs.is_empty() {
+            String::new()
+        } else {
+            format!(" -o {}", shell_quote(&outputs.join(",")))
+        };
         run_sh(&format!(
             "if ! pgrep -x awww-daemon >/dev/null; then \
                setsid awww-daemon >/dev/null 2>&1 & disown; \
                for i in 1 2 3 4 5; do sleep 0.3; pgrep -x awww-daemon >/dev/null && break; done; \
              fi; \
-             awww img {} --transition-type wipe --transition-angle 45 --transition-duration 0.5",
-            shell_quote(path)
+             awww img {}{} --transition-type wipe --transition-angle 45 --transition-duration 0.5",
+            shell_quote(path),
+            outputs_flag
         ))
         .await?;
     }
@@ -40,7 +46,7 @@ pub async fn apply_static(path: &str, config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn apply_video(path: &str, config: &Config) -> anyhow::Result<()> {
+pub async fn apply_video(path: &str, outputs: &[String], config: &Config) -> anyhow::Result<()> {
     let is_kde = is_kde();
     let mute = config.is_muted();
 
@@ -51,13 +57,28 @@ pub async fn apply_video(path: &str, config: &Config) -> anyhow::Result<()> {
         apply_kde_video(path, mute).await?;
     } else {
         let mute_flag = if mute { "loop --mute=yes" } else { "loop" };
-        let cmd = format!(
-            "pkill -9 mpvpaper 2>/dev/null; while pgrep -x mpvpaper >/dev/null; do sleep 0.1; done; nohup setsid mpvpaper -o '{}' '*' {} </dev/null >/dev/null 2>&1 &",
-            mute_flag,
-            shell_quote(path)
-        );
-        info!("apply_video cmd: {cmd}");
-        run_sh(&cmd).await?;
+        if outputs.is_empty() {
+            let cmd = format!(
+                "pkill -9 mpvpaper 2>/dev/null; while pgrep -x mpvpaper >/dev/null; do sleep 0.1; done; nohup setsid mpvpaper -o '{}' '*' {} </dev/null >/dev/null 2>&1 &",
+                mute_flag,
+                shell_quote(path)
+            );
+            info!("apply_video cmd: {cmd}");
+            run_sh(&cmd).await?;
+        } else {
+            let mut parts = vec!["pkill -9 mpvpaper 2>/dev/null; while pgrep -x mpvpaper >/dev/null; do sleep 0.1; done".to_string()];
+            for output in outputs {
+                parts.push(format!(
+                    "nohup setsid mpvpaper -o '{}' {} {} </dev/null >/dev/null 2>&1 &",
+                    mute_flag,
+                    shell_quote(output),
+                    shell_quote(path)
+                ));
+            }
+            let cmd = parts.join("; ");
+            info!("apply_video cmd: {cmd}");
+            run_sh(&cmd).await?;
+        }
     }
 
     let thumb_path: Option<PathBuf> = extract_video_thumb(path, config).await;
@@ -173,7 +194,7 @@ pub async fn restore(config: &Config) -> anyhow::Result<String> {
             if path.is_empty() {
                 anyhow::bail!("no path in state");
             }
-            apply_static(path, config).await?;
+            apply_static(path, &[], config).await?;
             Ok(path.to_string())
         }
         "video" => {
@@ -181,7 +202,7 @@ pub async fn restore(config: &Config) -> anyhow::Result<String> {
             if path.is_empty() {
                 anyhow::bail!("no path in state");
             }
-            apply_video(path, config).await?;
+            apply_video(path, &[], config).await?;
             Ok(path.to_string())
         }
         "we" => {

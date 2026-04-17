@@ -61,6 +61,12 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             let path = req.str_param("path", "");
             let we_id = req.str_param("we_id", "");
             let wp_type = req.str_param("type", "static");
+            let outputs: Vec<String> = req
+                .params
+                .get("outputs")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+                .unwrap_or_default();
 
             let config = state.config.read().await.clone();
 
@@ -69,13 +75,13 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                     if path.is_empty() {
                         return Response::err(req.id, 1, "missing 'path' parameter");
                     }
-                    apply::apply_static(path, &config).await
+                    apply::apply_static(path, &outputs, &config).await
                 }
                 "video" => {
                     if path.is_empty() {
                         return Response::err(req.id, 1, "missing 'path' parameter");
                     }
-                    apply::apply_video(path, &config).await
+                    apply::apply_video(path, &outputs, &config).await
                 }
                 "we" => {
                     if we_id.is_empty() {
