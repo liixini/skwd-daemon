@@ -7,7 +7,6 @@ pub mod watcher;
 pub mod weather;
 
 pub mod analysis;
-pub mod matugen;
 pub mod optimize;
 pub mod steam;
 

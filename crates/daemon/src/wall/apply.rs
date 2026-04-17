@@ -196,6 +196,18 @@ pub async fn restore(config: &Config) -> anyhow::Result<String> {
     }
 }
 
+pub async fn retheme(config: &Config, scheme: Option<&str>, mode: Option<&str>) -> anyhow::Result<()> {
+    let current_jpg = config.cache_dir().join("wallpaper/current.jpg");
+    if !current_jpg.exists() {
+        anyhow::bail!("no current wallpaper image to retheme");
+    }
+    let image_path = current_jpg.display().to_string();
+    run_matugen_with(&image_path, config, scheme, mode).await;
+    run_reloads(config).await;
+    info!("retheme completed for {image_path}");
+    Ok(())
+}
+
 
 async fn generate_matugen_config(config: &Config) -> PathBuf {
     let config_path = config.matugen_config_path();
@@ -274,13 +286,29 @@ async fn run_matugen(image_path: &str, config: &Config) {
 
     let config_path = generate_matugen_config(config).await;
     let scheme = config.matugen_scheme();
+    let mode = config.matugen_mode();
+    run_matugen_inner(image_path, config, &config_path, scheme, mode).await;
+}
 
+async fn run_matugen_with(image_path: &str, config: &Config, scheme: Option<&str>, mode: Option<&str>) {
+    if !config.features.matugen {
+        return;
+    }
+    let config_path = generate_matugen_config(config).await;
+    let scheme = scheme.unwrap_or_else(|| config.matugen_scheme());
+    let mode = mode.unwrap_or_else(|| config.matugen_mode());
+    run_matugen_inner(image_path, config, &config_path, scheme, mode).await;
+}
+
+async fn run_matugen_inner(image_path: &str, config: &Config, config_path: &Path, scheme: &str, mode: &str) {
     let status = Command::new("matugen")
         .arg("-c")
         .arg(&config_path)
         .arg("image")
         .arg("-t")
         .arg(scheme)
+        .arg("-m")
+        .arg(mode)
         .arg("--source-color-index")
         .arg("0")
         .arg(image_path)
@@ -305,6 +333,8 @@ async fn run_matugen(image_path: &str, config: &Config) {
             .arg("image")
             .arg("-t")
             .arg(scheme)
+            .arg("-m")
+            .arg(mode)
             .arg("--source-color-index")
             .arg("0")
             .arg(image_path)

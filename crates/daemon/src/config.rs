@@ -98,6 +98,8 @@ pub struct OllamaConfig {
 pub struct MatugenConfig {
     #[serde(default, rename = "schemeType")]
     pub scheme_type: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -196,6 +198,10 @@ impl Config {
 
     pub fn matugen_scheme(&self) -> &str {
         self.matugen.scheme_type.as_deref().unwrap_or("scheme-fidelity")
+    }
+
+    pub fn matugen_mode(&self) -> &str {
+        self.matugen.mode.as_deref().unwrap_or("dark")
     }
 
     pub fn is_muted(&self) -> bool {

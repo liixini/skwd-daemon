@@ -122,6 +122,16 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             }
         }
 
+        "retheme" => {
+            let scheme = req.params.get("scheme").and_then(|v| v.as_str()).map(String::from);
+            let mode = req.params.get("mode").and_then(|v| v.as_str()).map(String::from);
+            let config = state.config.read().await.clone();
+            match apply::retheme(&config, scheme.as_deref(), mode.as_deref()).await {
+                Ok(()) => Response::ok(req.id, serde_json::json!({"rethemed": true})),
+                Err(e) => Response::err(req.id, 6, format!("{e}")),
+            }
+        }
+
         "cache_rebuild" => {
             let config = state.config.read().await.clone();
             let cache_state = state.cache_state.clone();
@@ -255,44 +265,6 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             );
 
             Response::ok(req.id, serde_json::json!({"deleted": name}))
-        }
-
-        "set_matugen" => {
-            let key = req.str_param("key", "");
-            let matugen = req.str_param("matugen", "");
-            if key.is_empty() || matugen.is_empty() {
-                return Response::err(req.id, 1, "missing 'key' or 'matugen' parameter");
-            }
-            let db = state.db.lock().await;
-            match crate::db::set_matugen(&db, key, matugen) {
-                Ok(_) => Response::ok(req.id, serde_json::json!({"key": key})),
-                Err(e) => Response::err(req.id, 2, format!("db error: {e}")),
-            }
-        }
-
-        "set_matugen_batch" => {
-            let entries = req.params.get("entries").and_then(|v| v.as_array());
-            match entries {
-                Some(arr) => {
-                    let batch: Vec<(String, String)> = arr
-                        .iter()
-                        .filter_map(|e| {
-                            let k = e.get("key")?.as_str()?;
-                            let m = e.get("matugen")?.as_str()?;
-                            Some((k.to_string(), m.to_string()))
-                        })
-                        .collect();
-                    if batch.is_empty() {
-                        return Response::err(req.id, 1, "empty or invalid entries array");
-                    }
-                    let db = state.db.lock().await;
-                    match crate::db::set_matugen_batch(&db, &batch) {
-                        Ok(count) => Response::ok(req.id, serde_json::json!({"updated": count})),
-                        Err(e) => Response::err(req.id, 2, format!("db error: {e}")),
-                    }
-                }
-                None => Response::err(req.id, 1, "missing 'entries' array"),
-            }
         }
 
         "suppress" => {

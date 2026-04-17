@@ -13,11 +13,10 @@ use crate::db;
 use crate::util::CommandExt;
 use crate::wall::analysis::AnalysisState;
 use crate::wall::cache::CacheState;
-use crate::wall::matugen::MatugenState;
 use crate::wall::optimize::OptimizeState;
 use crate::wall::steam::SteamState;
 use crate::wall::watcher::SuppressSet;
-use crate::wall::{self, analysis, apply, cache, matugen, optimize, steam, watcher};
+use crate::wall::{self, analysis, apply, cache, optimize, steam, watcher};
 
 use notify::Watcher as _;
 
@@ -116,7 +115,6 @@ pub struct SharedState {
     pub optimize_state: Arc<Mutex<OptimizeState>>,
     pub convert_state: Arc<Mutex<optimize::ConvertState>>,
     pub analysis_state: Arc<Mutex<AnalysisState>>,
-    pub matugen_state: Arc<Mutex<MatugenState>>,
     pub suppress_set: SuppressSet,
 }
 
@@ -153,7 +151,6 @@ pub async fn run() -> anyhow::Result<()> {
         optimize_state: Arc::new(Mutex::new(OptimizeState::default())),
         convert_state: Arc::new(Mutex::new(optimize::ConvertState::default())),
         analysis_state: Arc::new(Mutex::new(AnalysisState::default())),
-        matugen_state: Arc::new(Mutex::new(MatugenState::default())),
         suppress_set: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     };
 
@@ -474,10 +471,6 @@ async fn dispatch_request(
     if req.method.starts_with("analysis.") {
         return analysis::dispatch(req, event_tx, state).await;
     }
-    if req.method.starts_with("matugen.") {
-        return matugen::dispatch(req, event_tx, state).await;
-    }
-
     match req.method.as_str() {
         "subscribe" => {
             if let Some(events) = req.params.get("events").and_then(|v| v.as_array()) {

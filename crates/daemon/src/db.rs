@@ -278,29 +278,6 @@ pub fn delete_by_name_prefix(conn: &Connection, prefix: &str) -> rusqlite::Resul
     Ok(names)
 }
 
-pub fn set_matugen(conn: &Connection, key: &str, matugen_json: &str) -> rusqlite::Result<bool> {
-    let changed = conn.execute(
-        "UPDATE meta SET matugen = ?2 WHERE key = ?1",
-        params![key, matugen_json],
-    )?;
-    Ok(changed > 0)
-}
-
-pub fn set_matugen_batch(conn: &Connection, entries: &[(String, String)]) -> rusqlite::Result<usize> {
-    let tx = conn.unchecked_transaction()?;
-    let mut count = 0;
-    {
-        let mut stmt = tx.prepare_cached(
-            "UPDATE meta SET matugen = ?2 WHERE key = ?1",
-        )?;
-        for (key, matugen_json) in entries {
-            count += stmt.execute(params![key, matugen_json])?;
-        }
-    }
-    tx.commit()?;
-    Ok(count)
-}
-
 
 pub fn list_image_optimizations(conn: &Connection) -> rusqlite::Result<Vec<(String, String, String)>> {
     let mut stmt = conn.prepare("SELECT src, preset, format FROM image_optimize")?;
