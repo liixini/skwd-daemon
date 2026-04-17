@@ -229,7 +229,7 @@ async fn drain_queue(state: &Arc<Mutex<SteamState>>, event_tx: &broadcast::Sende
         st.batch_running = true;
         std::mem::take(&mut st.queue)
     };
-    spawn_batch(state.clone(), event_tx.clone(), batch).await;
+    tokio::spawn(spawn_batch(state.clone(), event_tx.clone(), batch));
 }
 
 async fn spawn_batch(state: Arc<Mutex<SteamState>>, event_tx: broadcast::Sender<String>, ids: Vec<String>) {
