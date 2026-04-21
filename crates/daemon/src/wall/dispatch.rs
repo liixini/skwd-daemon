@@ -1,8 +1,9 @@
 use skwd_proto::{Request, Response};
 use tokio::sync::broadcast;
+use tracing::warn;
 
 use super::{apply, cache};
-use crate::server::{SharedState, broadcast_event};
+use crate::server::{RandomRotation, SharedState, broadcast_event};
 
 pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state: &SharedState) -> Response {
     let method = req.method.strip_prefix("wall.").unwrap_or(&req.method);
@@ -302,6 +303,86 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                     }),
                 ),
                 Err(e) => Response::err(req.id, 10, format!("{e}")),
+            }
+        }
+
+        "random_start" => {
+            let interval_secs = req.params.get("interval").and_then(|v| v.as_u64()).unwrap_or(300);
+            if interval_secs == 0 {
+                return Response::err(req.id, 1, "interval must be > 0");
+            }
+
+            {
+                let mut rot = state.random_rotation.lock().await;
+                if let Some(prev) = rot.take() {
+                    prev.handle.abort();
+                }
+            }
+
+            let db = state.db.clone();
+            let config = state.config.clone();
+            let current_wp = state.current_wallpaper.clone();
+            let tx = event_tx.clone();
+
+            let handle = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                let mut last_name: Option<String> = current_wp.lock().await.clone();
+                loop {
+                    interval.tick().await;
+                    let name = {
+                        let conn = db.lock().await;
+                        crate::db::random_image_name(&conn, last_name.as_deref()).ok().flatten()
+                    };
+                    let Some(name) = name else {
+                        warn!("[random] no wallpapers in database, skipping");
+                        continue;
+                    };
+                    let cfg = config.read().await.clone();
+                    let path = cfg.wallpaper_dir().join(&name);
+                    let path_str = path.display().to_string();
+                    match apply::apply_static(&path_str, &[], &cfg).await {
+                        Ok(()) => {
+                            last_name = Some(name.clone());
+                            *current_wp.lock().await = Some(name.clone());
+                            let _ = broadcast_event(
+                                &tx,
+                                "skwd.wall.applied",
+                                serde_json::json!({"type": "static", "name": &name, "path": &path_str, "random": true}),
+                            );
+                        }
+                        Err(e) => {
+                            warn!("[random] failed to apply {path_str}: {e}");
+                        }
+                    }
+                }
+            });
+
+            {
+                let mut rot = state.random_rotation.lock().await;
+                *rot = Some(RandomRotation { handle, interval_secs });
+            }
+            let _ = broadcast_event(event_tx, "skwd.wall.random_started", serde_json::json!({"interval": interval_secs}));
+            Response::ok(req.id, serde_json::json!({"started": true, "interval": interval_secs}))
+        }
+
+        "random_stop" => {
+            let mut rot = state.random_rotation.lock().await;
+            if let Some(prev) = rot.take() {
+                prev.handle.abort();
+                let _ = broadcast_event(event_tx, "skwd.wall.random_stopped", serde_json::json!({}));
+                Response::ok(req.id, serde_json::json!({"stopped": true}))
+            } else {
+                Response::ok(req.id, serde_json::json!({"stopped": false, "reason": "not running"}))
+            }
+        }
+
+        "random_status" => {
+            let rot = state.random_rotation.lock().await;
+            match rot.as_ref() {
+                Some(r) if !r.handle.is_finished() => {
+                    Response::ok(req.id, serde_json::json!({"running": true, "interval": r.interval_secs}))
+                }
+                _ => Response::ok(req.id, serde_json::json!({"running": false})),
             }
         }
 

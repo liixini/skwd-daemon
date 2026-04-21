@@ -22,16 +22,20 @@ use notify::Watcher as _;
 
 const CONFIG_RELOAD_DELAY_MS: u64 = 200;
 
-pub struct UiProcess {
+pub struct ManagedProcess {
     child: Option<tokio::process::Child>,
     shell_qml: PathBuf,
+    label: &'static str,
+    env_key: &'static str,
 }
 
-impl UiProcess {
-    fn new() -> Self {
+impl ManagedProcess {
+    fn new(label: &'static str, env_key: &'static str, shell_qml: PathBuf) -> Self {
         Self {
             child: None,
-            shell_qml: resolve_shell_qml(),
+            shell_qml,
+            label,
+            env_key,
         }
     }
 
@@ -53,12 +57,12 @@ impl UiProcess {
         if self.is_running() {
             return;
         }
-        info!("launching UI: quickshell -p {}", self.shell_qml.display());
+        info!("launching {}: quickshell -p {}", self.label, self.shell_qml.display());
         let install_dir = self.shell_qml.parent().unwrap_or(Path::new("/usr/share/skwd-wall"));
         match tokio::process::Command::new("quickshell")
             .arg("-p")
             .arg(&self.shell_qml)
-            .env("SKWD_WALL_INSTALL", install_dir)
+            .env(self.env_key, install_dir)
             .silent()
             .spawn()
         {
@@ -66,14 +70,14 @@ impl UiProcess {
                 self.child = Some(child);
             }
             Err(e) => {
-                warn!("failed to launch UI: {e}");
+                warn!("failed to launch {}: {e}", self.label);
             }
         }
     }
 
     pub fn kill(&mut self) {
         if let Some(ref mut child) = self.child {
-            info!("killing UI process");
+            info!("killing {} process", self.label);
             let _ = child.start_kill();
             self.child = None;
         }
@@ -103,12 +107,73 @@ fn resolve_shell_qml() -> PathBuf {
     PathBuf::from("/usr/share/skwd-wall/shell.qml")
 }
 
+fn resolve_bar_qml() -> PathBuf {
+    if let Ok(p) = std::env::var("SKWD_BAR_QML") {
+        return PathBuf::from(p);
+    }
+    let sibling = PathBuf::from("../skwd-bar/shell.qml");
+    if sibling.exists() {
+        return std::fs::canonicalize(&sibling).unwrap_or(sibling);
+    }
+    PathBuf::from("/usr/share/skwd-bar/shell.qml")
+}
+
+fn resolve_launch_qml() -> PathBuf {
+    if let Ok(p) = std::env::var("SKWD_LAUNCH_QML") {
+        return PathBuf::from(p);
+    }
+    let sibling = PathBuf::from("../skwd-launch/shell.qml");
+    if sibling.exists() {
+        return std::fs::canonicalize(&sibling).unwrap_or(sibling);
+    }
+    PathBuf::from("/usr/share/skwd-launch/shell.qml")
+}
+
+fn resolve_switch_qml() -> PathBuf {
+    if let Ok(p) = std::env::var("SKWD_SWITCH_QML") {
+        return PathBuf::from(p);
+    }
+    let sibling = PathBuf::from("../skwd-switch/shell.qml");
+    if sibling.exists() {
+        return std::fs::canonicalize(&sibling).unwrap_or(sibling);
+    }
+    PathBuf::from("/usr/share/skwd-switch/shell.qml")
+}
+
+fn switch_fifo_path() -> PathBuf {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(format!("{}/skwd/switch-cmd", runtime_dir))
+}
+
+fn send_switch_cmd(cmd: &str) {
+    let fifo = switch_fifo_path();
+    let cmd = format!("{}\n", cmd);
+    tokio::spawn(async move {
+        match tokio::fs::OpenOptions::new().write(true).open(&fifo).await {
+            Ok(mut f) => {
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut f, cmd.as_bytes()).await;
+            }
+            Err(e) => {
+                warn!("failed to write to switch FIFO: {e}");
+            }
+        }
+    });
+}
+
+pub struct RandomRotation {
+    pub handle: tokio::task::JoinHandle<()>,
+    pub interval_secs: u64,
+}
+
 #[derive(Clone)]
 pub struct SharedState {
     pub config: Arc<RwLock<Config>>,
     pub db: Arc<Mutex<Connection>>,
     pub db_shared: Arc<Mutex<Connection>>,
-    pub ui: Arc<Mutex<UiProcess>>,
+    pub ui: Arc<Mutex<ManagedProcess>>,
+    pub bar: Arc<Mutex<ManagedProcess>>,
+    pub launcher: Arc<Mutex<ManagedProcess>>,
+    pub switch: Arc<Mutex<ManagedProcess>>,
     pub current_wallpaper: Arc<Mutex<Option<String>>>,
     pub cache_state: Arc<Mutex<CacheState>>,
     pub steam_state: Arc<Mutex<SteamState>>,
@@ -116,6 +181,7 @@ pub struct SharedState {
     pub convert_state: Arc<Mutex<optimize::ConvertState>>,
     pub analysis_state: Arc<Mutex<AnalysisState>>,
     pub suppress_set: SuppressSet,
+    pub random_rotation: Arc<Mutex<Option<RandomRotation>>>,
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -144,7 +210,10 @@ pub async fn run() -> anyhow::Result<()> {
         config: Arc::new(RwLock::new(config.clone())),
         db: Arc::new(Mutex::new(db::open().expect("failed to open database"))),
         db_shared: Arc::new(Mutex::new(db::open().expect("failed to open shared db"))),
-        ui: Arc::new(Mutex::new(UiProcess::new())),
+        ui: Arc::new(Mutex::new(ManagedProcess::new("wall-ui", "SKWD_WALL_INSTALL", resolve_shell_qml()))),
+        bar: Arc::new(Mutex::new(ManagedProcess::new("bar", "SKWD_BAR_INSTALL", resolve_bar_qml()))),
+        launcher: Arc::new(Mutex::new(ManagedProcess::new("launcher", "SKWD_LAUNCH_INSTALL", resolve_launch_qml()))),
+        switch: Arc::new(Mutex::new(ManagedProcess::new("switch", "SKWD_SWITCH_INSTALL", resolve_switch_qml()))),
         current_wallpaper: Arc::new(Mutex::new(None)),
         cache_state: Arc::new(Mutex::new(CacheState::default())),
         steam_state,
@@ -152,6 +221,7 @@ pub async fn run() -> anyhow::Result<()> {
         convert_state: Arc::new(Mutex::new(optimize::ConvertState::default())),
         analysis_state: Arc::new(Mutex::new(AnalysisState::default())),
         suppress_set: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        random_rotation: Arc::new(Mutex::new(None)),
     };
 
     let _watcher_handle: Option<notify::RecommendedWatcher> = match watcher::start(&config, &state.suppress_set) {
@@ -290,12 +360,36 @@ async fn run_watcher_loop(
                 }
             }
             watcher::FsEvent::FileRemoved { name, file_type } => {
+                let wp_type = if *file_type == watcher::FileType::Static { "static" } else { "video" };
+                let config = state.config.read().await.clone();
+                {
+                    let db = state.db_shared.clone();
+                    let conn = db.lock().await;
+                    let _ = db::delete_by_name(&conn, name);
+                    let src_path = if *file_type == watcher::FileType::Static {
+                        config.wallpaper_dir().join(name)
+                    } else {
+                        config.video_dir().join(name)
+                    };
+                    let _ = db::delete_optimize_by_src(&conn, &src_path.display().to_string());
+                }
+                {
+                    let cache_dir = config.cache_dir().join("wallpaper");
+                    let thumb_name = name.replace('/', "--") + ".webp";
+                    if wp_type == "static" {
+                        let _ = std::fs::remove_file(cache_dir.join("thumbs").join(&thumb_name));
+                        let _ = std::fs::remove_file(cache_dir.join("thumbs-sm").join(&thumb_name));
+                    } else {
+                        let _ = std::fs::remove_file(cache_dir.join("video-thumbs").join(&thumb_name));
+                        let _ = std::fs::remove_file(cache_dir.join("thumbs-sm").join(format!("vid-{thumb_name}")));
+                    }
+                }
                 let _ = broadcast_event(
                     &tx,
                     "skwd.wall.file_removed",
                     serde_json::json!({
                         "name": name,
-                        "type": if *file_type == watcher::FileType::Static { "static" } else { "video" }
+                        "type": wp_type
                     }),
                 );
             }
@@ -442,15 +536,132 @@ async fn handle_client(
         };
 
         debug!(method = %req.method, id = req.id, "<- request");
-        let response = dispatch_request(&req, &event_tx, &subscriptions, &state).await;
-        let mut w = writer.lock().await;
-        w.write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
-            .await?;
+        let event_tx = event_tx.clone();
+        let subscriptions = subscriptions.clone();
+        let state = state.clone();
+        let writer = writer.clone();
+        tokio::spawn(async move {
+            let response = dispatch_request(&req, &event_tx, &subscriptions, &state).await;
+            let mut w = writer.lock().await;
+            let _ = w.write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes()).await;
+        });
     }
 
     event_forwarder.abort();
     info!("client disconnected");
     Ok(())
+}
+
+async fn dispatch_bar(
+    req: &Request,
+    event_tx: &broadcast::Sender<String>,
+    state: &SharedState,
+) -> Response {
+    let method = req.method.strip_prefix("bar.").unwrap_or(&req.method);
+    match method {
+        "toggle" => {
+            let mut bar = state.bar.lock().await;
+            bar.toggle();
+            let running = bar.is_running();
+            drop(bar);
+            let _ = broadcast_event(event_tx, "skwd.bar.toggle", serde_json::json!({"visible": running}));
+            Response::ok(req.id, serde_json::json!({"toggled": true, "visible": running}))
+        }
+        "show" => {
+            state.bar.lock().await.launch();
+            let _ = broadcast_event(event_tx, "skwd.bar.show", serde_json::json!({}));
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+        "hide" => {
+            state.bar.lock().await.kill();
+            let _ = broadcast_event(event_tx, "skwd.bar.hide", serde_json::json!({}));
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+        _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
+    }
+}
+
+async fn dispatch_launcher(
+    req: &Request,
+    event_tx: &broadcast::Sender<String>,
+    state: &SharedState,
+) -> Response {
+    let method = req.method.strip_prefix("launcher.").unwrap_or(&req.method);
+    match method {
+        "toggle" => {
+            let mut launcher = state.launcher.lock().await;
+            launcher.toggle();
+            let running = launcher.is_running();
+            drop(launcher);
+            let _ = broadcast_event(event_tx, "skwd.launcher.toggle", serde_json::json!({"visible": running}));
+            Response::ok(req.id, serde_json::json!({"toggled": true, "visible": running}))
+        }
+        "show" => {
+            state.launcher.lock().await.launch();
+            let _ = broadcast_event(event_tx, "skwd.launcher.show", serde_json::json!({}));
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+        "hide" => {
+            state.launcher.lock().await.kill();
+            let _ = broadcast_event(event_tx, "skwd.launcher.hide", serde_json::json!({}));
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+        _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
+    }
+}
+
+async fn dispatch_switch(
+    req: &Request,
+    event_tx: &broadcast::Sender<String>,
+    state: &SharedState,
+) -> Response {
+    let method = req.method.strip_prefix("switch.").unwrap_or(&req.method);
+    match method {
+        "open" => {
+            let mut sw = state.switch.lock().await;
+            if !sw.is_running() {
+                sw.launch();
+            } else {
+                send_switch_cmd("open");
+            }
+            drop(sw);
+            let _ = broadcast_event(event_tx, "skwd.switch.open", serde_json::json!({}));
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+        "next" => {
+            {
+                let mut sw = state.switch.lock().await;
+                if !sw.is_running() {
+                    sw.launch();
+                    return Response::ok(req.id, serde_json::json!({"ok": true}));
+                }
+            }
+            send_switch_cmd("next");
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+        "prev" => {
+            send_switch_cmd("prev");
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+        "confirm" => {
+            send_switch_cmd("confirm");
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+        "cancel" => {
+            send_switch_cmd("cancel");
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+        "close" => {
+            send_switch_cmd("close");
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+        "hide" => {
+            state.switch.lock().await.kill();
+            let _ = broadcast_event(event_tx, "skwd.switch.hide", serde_json::json!({}));
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+        _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
+    }
 }
 
 async fn dispatch_request(
@@ -462,6 +673,15 @@ async fn dispatch_request(
     if req.method.starts_with("wall.") {
         return wall::dispatch(req, event_tx, state).await;
     }
+    if req.method.starts_with("bar.") {
+        return dispatch_bar(req, event_tx, state).await;
+    }
+    if req.method.starts_with("launcher.") {
+        return dispatch_launcher(req, event_tx, state).await;
+    }
+    if req.method.starts_with("switch.") {
+        return dispatch_switch(req, event_tx, state).await;
+    }
     if req.method.starts_with("steam.") {
         return steam::dispatch(req, event_tx, state).await;
     }
@@ -470,6 +690,9 @@ async fn dispatch_request(
     }
     if req.method.starts_with("analysis.") {
         return analysis::dispatch(req, event_tx, state).await;
+    }
+    if req.method.starts_with("lyrics.") {
+        return crate::lyrics::dispatch(req, event_tx, state).await;
     }
     match req.method.as_str() {
         "subscribe" => {

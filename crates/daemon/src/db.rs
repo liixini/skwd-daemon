@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use tracing::{debug, info};
 
 fn xdg_data_home() -> PathBuf {
@@ -86,6 +86,15 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS state(
             key TEXT PRIMARY KEY,
             val TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS lyrics(
+            artist TEXT NOT NULL,
+            title TEXT NOT NULL,
+            enhanced INTEGER NOT NULL DEFAULT 0,
+            data TEXT NOT NULL,
+            fetched_at INTEGER NOT NULL,
+            PRIMARY KEY (artist, title)
         );",
     )?;
 
@@ -139,6 +148,22 @@ pub fn import_from_qml(conn: &Connection) -> anyhow::Result<i64> {
 
     info!("imported {count} wallpapers from QML database");
     Ok(count)
+}
+
+pub fn random_image_name(conn: &Connection, exclude_name: Option<&str>) -> rusqlite::Result<Option<String>> {
+    match exclude_name {
+        Some(cur) => conn.query_row(
+            "SELECT name FROM meta WHERE type = 'static' AND name != ?1 ORDER BY RANDOM() LIMIT 1",
+            params![cur],
+            |row| row.get::<_, String>(0),
+        ),
+        None => conn.query_row(
+            "SELECT name FROM meta WHERE type = 'static' ORDER BY RANDOM() LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        ),
+    }
+    .optional()
 }
 
 pub fn list_wallpapers(conn: &Connection, favourite_only: bool) -> rusqlite::Result<Vec<serde_json::Value>> {
@@ -263,6 +288,12 @@ pub fn get_cache_entries(conn: &Connection) -> rusqlite::Result<Vec<(String, Str
 pub fn delete_by_name(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
     let changed = conn.execute("DELETE FROM meta WHERE name = ?1", params![name])?;
     Ok(changed > 0)
+}
+
+pub fn delete_optimize_by_src(conn: &Connection, src: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM image_optimize WHERE src = ?1", params![src])?;
+    conn.execute("DELETE FROM video_convert WHERE src = ?1", params![src])?;
+    Ok(())
 }
 
 pub fn delete_by_name_prefix(conn: &Connection, prefix: &str) -> rusqlite::Result<Vec<String>> {

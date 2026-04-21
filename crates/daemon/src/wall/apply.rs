@@ -10,7 +10,7 @@ use crate::util::CommandExt;
 pub async fn apply_static(path: &str, outputs: &[String], config: &Config) -> anyhow::Result<()> {
     let is_kde = is_kde();
 
-    kill_wallpaper_procs().await;
+    kill_video_procs().await;
 
     if is_kde {
         run_sh(&format!("plasma-apply-wallpaperimage {}", shell_quote(path))).await?;
@@ -39,10 +39,15 @@ pub async fn apply_static(path: &str, outputs: &[String], config: &Config) -> an
 
     save_state(&config.cache_dir(), "static", path, "").await;
 
-    run_matugen(path, config).await;
-    run_reloads(config).await;
+    let path = path.to_string();
+    let config = config.clone();
+    tokio::spawn(async move {
+        run_matugen(&path, &config).await;
+        run_reloads(&config).await;
+        info!("post-apply tasks done for static: {path}");
+    });
 
-    info!("applied static wallpaper: {path}");
+    info!("applied static wallpaper");
     Ok(())
 }
 
@@ -88,15 +93,21 @@ pub async fn apply_video(path: &str, outputs: &[String], config: &Config) -> any
         }
     }
 
-    let thumb_path: Option<PathBuf> = extract_video_thumb(path, config).await;
-    if let Some(ref thumb) = thumb_path {
-        let _ = tokio::fs::copy(thumb, config.cache_dir().join("wallpaper/current.jpg")).await;
-        run_matugen(thumb.to_str().unwrap_or(""), config).await;
-        run_reloads(config).await;
-    }
-
     save_state(&config.cache_dir(), "video", path, "").await;
-    info!("applied video wallpaper: {path}");
+
+    let path = path.to_string();
+    let config = config.clone();
+    tokio::spawn(async move {
+        let thumb_path: Option<PathBuf> = extract_video_thumb(&path, &config).await;
+        if let Some(ref thumb) = thumb_path {
+            let _ = tokio::fs::copy(thumb, config.cache_dir().join("wallpaper/current.jpg")).await;
+            run_matugen(thumb.to_str().unwrap_or(""), &config).await;
+            run_reloads(&config).await;
+        }
+        info!("post-apply tasks done for video: {path}");
+    });
+
+    info!("applied video wallpaper");
     Ok(())
 }
 
@@ -173,16 +184,22 @@ pub async fn apply_we(we_id: &str, screens: &[String], config: &Config) -> anyho
 
     save_state(&config.cache_dir(), "we", "", we_id).await;
 
-    if let Some(preview) = find_we_preview(&item_dir).await {
-        let wd_cache = config.cache_dir().join("wallpaper");
-        let _ = tokio::fs::create_dir_all(&wd_cache).await;
-        let _ = tokio::fs::copy(&preview, wd_cache.join("current.jpg")).await;
-        let preview_str = preview.display().to_string();
-        run_matugen(&preview_str, config).await;
-        run_reloads(config).await;
-    }
+    let config = config.clone();
+    let item_dir = item_dir.clone();
+    let we_id = we_id.to_string();
+    tokio::spawn(async move {
+        if let Some(preview) = find_we_preview(&item_dir).await {
+            let wd_cache = config.cache_dir().join("wallpaper");
+            let _ = tokio::fs::create_dir_all(&wd_cache).await;
+            let _ = tokio::fs::copy(&preview, wd_cache.join("current.jpg")).await;
+            let preview_str = preview.display().to_string();
+            run_matugen(&preview_str, &config).await;
+            run_reloads(&config).await;
+        }
+        info!("post-apply tasks done for WE: {we_id}");
+    });
 
-    info!("applied WE wallpaper: {we_id}");
+    info!("applied WE wallpaper");
     Ok(())
 }
 
@@ -435,6 +452,15 @@ async fn kill_wallpaper_procs() {
          pkill -9 mpvpaper 2>/dev/null; \
          pkill awww 2>/dev/null; \
          pkill awww-daemon 2>/dev/null; \
+         true",
+    )
+    .await;
+}
+
+async fn kill_video_procs() {
+    let _ = run_sh(
+        "pkill -9 -f '[l]inux-wallpaperengine' 2>/dev/null; \
+         pkill -9 mpvpaper 2>/dev/null; \
          true",
     )
     .await;
