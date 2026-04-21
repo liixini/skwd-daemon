@@ -63,9 +63,13 @@ pub async fn apply_video(path: &str, outputs: &[String], config: &Config) -> any
     } else {
         let mpv_opts = {
             let mut opts = String::from("loop");
-            if mute { opts.push_str(" --mute=yes"); }
+            if mute {
+                opts.push_str(" mute=yes");
+            } else {
+                opts.push_str(&format!(" mute=no volume={}", config.volume()));
+            }
             if config.features.video_auto_scale {
-                opts.push_str(" --keepaspect=yes --panscan=1.0 --video-unscaled=no");
+                opts.push_str(" keepaspect=yes panscan=1.0 video-unscaled=no");
             }
             opts
         };
@@ -147,16 +151,26 @@ pub async fn apply_we(we_id: &str, screens: &[String], config: &Config) -> anyho
         if is_kde() {
             apply_kde_video(&video_str, config.is_muted()).await?;
         } else {
-            let mute_flag = if config.is_muted() { "loop --mute=yes" } else { "loop" };
+            let mpv_opts = if config.is_muted() {
+                String::from("loop mute=yes")
+            } else {
+                format!("loop mute=no volume={}", config.volume())
+            };
             run_sh(&format!(
                 "nohup setsid mpvpaper -o '{}' '*' {} </dev/null >/dev/null 2>&1 &",
-                mute_flag,
+                mpv_opts,
                 shell_quote(&video_str)
             ))
             .await?;
         }
     } else {
-        let audio_flag = if config.is_muted() { "--silent" } else { "" };
+        let audio_flag = if config.is_muted() {
+            "--silent".to_string()
+        } else {
+            // linux-wallpaperengine takes --volume <0-128>
+            let scaled = (config.volume() as f32 * 1.28).round() as u32;
+            format!("--volume {}", scaled.min(128))
+        };
         let assets_arg = config
             .we_assets_dir()
             .map(|d| format!("--assets-dir {}", shell_quote(&d.display().to_string())))
@@ -167,7 +181,7 @@ pub async fn apply_we(we_id: &str, screens: &[String], config: &Config) -> anyho
         } else {
             screens
                 .iter()
-                .map(|n| format!(" --screen-root {n} --scaling fill"))
+                .map(|n| format!(" --screen-root {} --scaling fill", shell_quote(n)))
                 .collect()
         };
 
@@ -538,7 +552,7 @@ async fn get_screen_args() -> String {
         if !names.is_empty() {
             return names
                 .iter()
-                .map(|n| format!(" --screen-root {n} --scaling fill"))
+                .map(|n| format!(" --screen-root {} --scaling fill", shell_quote(n)))
                 .collect::<String>();
         }
     }
@@ -560,7 +574,7 @@ async fn get_screen_args() -> String {
         if !names.is_empty() {
             return names
                 .iter()
-                .map(|n| format!(" --screen-root {n} --scaling fill"))
+                .map(|n| format!(" --screen-root {} --scaling fill", shell_quote(n)))
                 .collect::<String>();
         }
     }
@@ -575,21 +589,28 @@ async fn get_screen_args() -> String {
         && output.status.success()
     {
         let text = String::from_utf8_lossy(&output.stdout);
-        let names: Vec<&str> = text
+        let names: Vec<String> = text
             .lines()
             .filter_map(|l| {
                 let trimmed = l.trim();
-                if trimmed.starts_with("Output") {
-                    trimmed.split_whitespace().nth(1).map(|s| s.trim_end_matches(':'))
-                } else {
-                    None
+                if !trimmed.starts_with("Output") {
+                    return None;
                 }
+                if let (Some(open), Some(close)) = (trimmed.rfind('('), trimmed.rfind(')'))
+                    && open < close
+                {
+                    return Some(trimmed[open + 1..close].to_string());
+                }
+                trimmed
+                    .split_whitespace()
+                    .nth(1)
+                    .map(|s| s.trim_matches(|c: char| c == '"' || c == ':').to_string())
             })
             .collect();
         if !names.is_empty() {
             return names
                 .iter()
-                .map(|n| format!(" --screen-root {n} --scaling fill"))
+                .map(|n| format!(" --screen-root {} --scaling fill", shell_quote(n)))
                 .collect::<String>();
         }
     }

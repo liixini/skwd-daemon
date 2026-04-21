@@ -28,6 +28,8 @@ pub struct Config {
     pub integrations: Vec<Integration>,
     #[serde(default, rename = "wallpaperMute")]
     pub wallpaper_mute: Option<bool>,
+    #[serde(default, rename = "wallpaperVolume")]
+    pub wallpaper_volume: Option<u32>,
     #[serde(default)]
     pub performance: PerformanceConfig,
     #[serde(default, rename = "defaultMatugenConfig")]
@@ -211,6 +213,10 @@ impl Config {
 
     pub fn is_muted(&self) -> bool {
         self.wallpaper_mute.unwrap_or(true)
+    }
+
+    pub fn volume(&self) -> u32 {
+        self.wallpaper_volume.unwrap_or(100).min(100)
     }
 
     pub fn matugen_config_path(&self) -> PathBuf {
