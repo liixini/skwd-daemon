@@ -174,34 +174,62 @@ fn chrono_or_now() -> String {
         .to_string()
 }
 
+fn normalize_token(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn tokenize(s: &str) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "by",
+        "for", "with", "from", "is", "it", "i", "im", "you", "me", "my",
+        "feat", "ft", "featuring", "with", "vs", "remix", "edit", "version",
+        "remastered", "remaster", "mix", "official", "video", "audio",
+    ];
+    s.split_whitespace()
+        .map(normalize_token)
+        .filter(|t| t.len() >= 3 && !STOP.contains(&t.as_str()))
+        .collect()
+}
+
+fn token_overlap(target: &[String], candidate: &[String]) -> usize {
+    target.iter().filter(|t| candidate.contains(t)).count()
+}
+
 fn mx_best_match(
     track_list: &[serde_json::Value],
     artist: &str,
     title: &str,
 ) -> Option<i64> {
-    let target = format!("{} {}", artist, title).to_lowercase();
-    let target_words: Vec<&str> = target.split_whitespace().collect();
+    let target_artist_tokens = tokenize(artist);
+    let target_title_tokens = tokenize(title);
+    let need_artist = !target_artist_tokens.is_empty();
+    let need_title = !target_title_tokens.is_empty();
 
     let mut best_id: Option<i64> = None;
     let mut best_score: usize = 0;
 
     for item in track_list {
-        let track = item.get("track")?;
-        let name = track
-            .get("track_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let art = track
-            .get("artist_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let candidate = format!("{} {}", name, art).to_lowercase();
+        let Some(track) = item.get("track") else { continue };
+        let name = track.get("track_name").and_then(|v| v.as_str()).unwrap_or("");
+        let art = track.get("artist_name").and_then(|v| v.as_str()).unwrap_or("");
 
-        let score = target_words
-            .iter()
-            .filter(|w| candidate.contains(**w))
-            .count();
+        let cand_artist_tokens = tokenize(art);
+        let cand_title_tokens = tokenize(name);
 
+        let artist_overlap = token_overlap(&target_artist_tokens, &cand_artist_tokens);
+        let title_overlap = token_overlap(&target_title_tokens, &cand_title_tokens);
+
+        if need_artist && artist_overlap == 0 {
+            continue;
+        }
+        if need_title && title_overlap == 0 {
+            continue;
+        }
+
+        let score = artist_overlap * 2 + title_overlap;
         if score > best_score {
             best_score = score;
             best_id = track.get("track_id").and_then(|v| v.as_i64());

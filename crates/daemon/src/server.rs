@@ -163,6 +163,8 @@ fn send_switch_cmd(cmd: &str) {
 pub struct RandomRotation {
     pub handle: tokio::task::JoinHandle<()>,
     pub interval_secs: u64,
+    pub types: Vec<String>,
+    pub favourites_only: bool,
 }
 
 #[derive(Clone)]

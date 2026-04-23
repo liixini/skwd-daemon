@@ -150,19 +150,44 @@ pub fn import_from_qml(conn: &Connection) -> anyhow::Result<i64> {
     Ok(count)
 }
 
-pub fn random_image_name(conn: &Connection, exclude_name: Option<&str>) -> rusqlite::Result<Option<String>> {
-    match exclude_name {
-        Some(cur) => conn.query_row(
-            "SELECT name FROM meta WHERE type = 'static' AND name != ?1 ORDER BY RANDOM() LIMIT 1",
-            params![cur],
-            |row| row.get::<_, String>(0),
-        ),
-        None => conn.query_row(
-            "SELECT name FROM meta WHERE type = 'static' ORDER BY RANDOM() LIMIT 1",
-            [],
-            |row| row.get::<_, String>(0),
-        ),
+pub fn random_pick(
+    conn: &Connection,
+    exclude_name: Option<&str>,
+    types: &[&str],
+    favourites_only: bool,
+) -> rusqlite::Result<Option<(String, String, String, String, String)>> {
+    if types.is_empty() {
+        return Ok(None);
     }
+
+    let placeholders = std::iter::repeat_n("?", types.len()).collect::<Vec<_>>().join(",");
+    let mut sql = format!(
+        "SELECT key, type, name, COALESCE(video_file,''), COALESCE(we_id,'') \
+         FROM meta WHERE type IN ({placeholders})"
+    );
+    if favourites_only {
+        sql.push_str(" AND favourite = 1");
+    }
+    if exclude_name.is_some() {
+        sql.push_str(" AND name != ?");
+    }
+    sql.push_str(" ORDER BY RANDOM() LIMIT 1");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params_dyn: Vec<&dyn rusqlite::ToSql> =
+        types.iter().map(|t| t as &dyn rusqlite::ToSql).collect();
+    if let Some(n) = exclude_name.as_ref() {
+        params_dyn.push(n);
+    }
+    stmt.query_row(rusqlite::params_from_iter(params_dyn), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })
     .optional()
 }
 

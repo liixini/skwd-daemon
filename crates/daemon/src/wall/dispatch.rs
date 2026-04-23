@@ -312,6 +312,23 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                 return Response::err(req.id, 1, "interval must be > 0");
             }
 
+            let types: Vec<String> = req
+                .params
+                .get("types")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .filter(|s| matches!(*s, "static" | "video" | "we"))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_else(|| vec!["static".into(), "video".into(), "we".into()]);
+            let favourites_only = req.bool_param("favourites_only", false);
+            if types.is_empty() {
+                return Response::err(req.id, 1, "types must contain at least one of static|video|we");
+            }
+
             {
                 let mut rot = state.random_rotation.lock().await;
                 if let Some(prev) = rot.take() {
@@ -323,35 +340,59 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             let config = state.config.clone();
             let current_wp = state.current_wallpaper.clone();
             let tx = event_tx.clone();
+            let task_types = types.clone();
 
             let handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
                 let mut last_name: Option<String> = current_wp.lock().await.clone();
                 loop {
                     interval.tick().await;
-                    let name = {
+                    let pick = {
                         let conn = db.lock().await;
-                        crate::db::random_image_name(&conn, last_name.as_deref()).ok().flatten()
+                        let type_refs: Vec<&str> = task_types.iter().map(String::as_str).collect();
+                        crate::db::random_pick(&conn, last_name.as_deref(), &type_refs, favourites_only).ok().flatten()
                     };
-                    let Some(name) = name else {
-                        warn!("[random] no wallpapers in database, skipping");
+                    let Some((_key, wp_type, name, video_file, we_id)) = pick else {
+                        warn!("[random] no matching wallpapers, skipping");
                         continue;
                     };
                     let cfg = config.read().await.clone();
-                    let path = cfg.wallpaper_dir().join(&name);
-                    let path_str = path.display().to_string();
-                    match apply::apply_static(&path_str, &[], &cfg).await {
-                        Ok(()) => {
+
+                    let result = match wp_type.as_str() {
+                        "video" => {
+                            let path = if video_file.is_empty() {
+                                cfg.video_dir().join(&name)
+                            } else {
+                                std::path::PathBuf::from(&video_file)
+                            };
+                            let path_str = path.display().to_string();
+                            apply::apply_video(&path_str, &[], &cfg).await
+                                .map(|()| ("video", path_str))
+                        }
+                        "we" => {
+                            apply::apply_we(&we_id, &[], &cfg).await
+                                .map(|()| ("we", we_id.clone()))
+                        }
+                        _ => {
+                            let path = cfg.wallpaper_dir().join(&name);
+                            let path_str = path.display().to_string();
+                            apply::apply_static(&path_str, &[], &cfg).await
+                                .map(|()| ("static", path_str))
+                        }
+                    };
+
+                    match result {
+                        Ok((kind, path_str)) => {
                             last_name = Some(name.clone());
                             *current_wp.lock().await = Some(name.clone());
                             let _ = broadcast_event(
                                 &tx,
                                 "skwd.wall.applied",
-                                serde_json::json!({"type": "static", "name": &name, "path": &path_str, "random": true}),
+                                serde_json::json!({"type": kind, "name": &name, "path": &path_str, "random": true}),
                             );
                         }
                         Err(e) => {
-                            warn!("[random] failed to apply {path_str}: {e}");
+                            warn!("[random] failed to apply {wp_type} {name}: {e}");
                         }
                     }
                 }
@@ -359,10 +400,31 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
 
             {
                 let mut rot = state.random_rotation.lock().await;
-                *rot = Some(RandomRotation { handle, interval_secs });
+                *rot = Some(RandomRotation {
+                    handle,
+                    interval_secs,
+                    types: types.clone(),
+                    favourites_only,
+                });
             }
-            let _ = broadcast_event(event_tx, "skwd.wall.random_started", serde_json::json!({"interval": interval_secs}));
-            Response::ok(req.id, serde_json::json!({"started": true, "interval": interval_secs}))
+            let _ = broadcast_event(
+                event_tx,
+                "skwd.wall.random_started",
+                serde_json::json!({
+                    "interval": interval_secs,
+                    "types": &types,
+                    "favourites_only": favourites_only,
+                }),
+            );
+            Response::ok(
+                req.id,
+                serde_json::json!({
+                    "started": true,
+                    "interval": interval_secs,
+                    "types": types,
+                    "favourites_only": favourites_only,
+                }),
+            )
         }
 
         "random_stop" => {
@@ -379,9 +441,15 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
         "random_status" => {
             let rot = state.random_rotation.lock().await;
             match rot.as_ref() {
-                Some(r) if !r.handle.is_finished() => {
-                    Response::ok(req.id, serde_json::json!({"running": true, "interval": r.interval_secs}))
-                }
+                Some(r) if !r.handle.is_finished() => Response::ok(
+                    req.id,
+                    serde_json::json!({
+                        "running": true,
+                        "interval": r.interval_secs,
+                        "types": &r.types,
+                        "favourites_only": r.favourites_only,
+                    }),
+                ),
                 _ => Response::ok(req.id, serde_json::json!({"running": false})),
             }
         }
