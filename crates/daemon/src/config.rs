@@ -40,12 +40,39 @@ pub struct Config {
     pub post_processing: Vec<String>,
     #[serde(default, rename = "postProcessOnRestore")]
     pub post_process_on_restore: bool,
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationsBuiltIn {
+    #[default]
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+pub struct NotificationsConfig {
+    #[serde(default, rename = "builtIn")]
+    pub built_in: NotificationsBuiltIn,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct GeneralConfig {
     #[serde(default)]
     pub locale: String,
+    #[serde(default = "default_true", rename = "notifyOnWallpaperChange")]
+    pub notify_on_wallpaper_change: bool,
+}
+impl Default for GeneralConfig {
+    fn default() -> Self {
+        Self {
+            locale: String::new(),
+            notify_on_wallpaper_change: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

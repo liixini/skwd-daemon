@@ -140,6 +140,48 @@ fn resolve_switch_qml() -> PathBuf {
     PathBuf::from("/usr/share/skwd-switch/shell.qml")
 }
 
+fn resolve_notification_qml() -> PathBuf {
+    if let Ok(p) = std::env::var("SKWD_NOTIFICATION_QML") {
+        return PathBuf::from(p);
+    }
+    let sibling = PathBuf::from("../skwd-notification/shell.qml");
+    if sibling.exists() {
+        return std::fs::canonicalize(&sibling).unwrap_or(sibling);
+    }
+    PathBuf::from("/usr/share/skwd-notification/shell.qml")
+}
+
+async fn fdo_notifications_owned() -> bool {
+    use zbus::Connection;
+    use zbus::fdo::DBusProxy;
+
+    let Ok(conn) = Connection::session().await else {
+        return false;
+    };
+    let Ok(proxy) = DBusProxy::new(&conn).await else {
+        return false;
+    };
+    let Ok(name) = "org.freedesktop.Notifications".try_into() else {
+        return false;
+    };
+    proxy.name_has_owner(name).await.unwrap_or(false)
+}
+
+async fn should_launch_notification(config: &Config) -> bool {
+    use crate::config::NotificationsBuiltIn::{Always, Auto, Never};
+    match config.notifications.built_in {
+        Never => false,
+        Always => true,
+        Auto => {
+            let owned = fdo_notifications_owned().await;
+            if owned {
+                info!("[notif] org.freedesktop.Notifications already owned; skipping built-in");
+            }
+            !owned
+        }
+    }
+}
+
 fn switch_fifo_path() -> PathBuf {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(format!("{}/skwd/switch-cmd", runtime_dir))
@@ -176,6 +218,7 @@ pub struct SharedState {
     pub bar: Arc<Mutex<ManagedProcess>>,
     pub launcher: Arc<Mutex<ManagedProcess>>,
     pub switch: Arc<Mutex<ManagedProcess>>,
+    pub notification: Arc<Mutex<ManagedProcess>>,
     pub current_wallpaper: Arc<Mutex<Option<String>>>,
     pub cache_state: Arc<Mutex<CacheState>>,
     pub steam_state: Arc<Mutex<SteamState>>,
@@ -216,6 +259,7 @@ pub async fn run() -> anyhow::Result<()> {
         bar: Arc::new(Mutex::new(ManagedProcess::new("bar", "SKWD_BAR_INSTALL", resolve_bar_qml()))),
         launcher: Arc::new(Mutex::new(ManagedProcess::new("launcher", "SKWD_LAUNCH_INSTALL", resolve_launch_qml()))),
         switch: Arc::new(Mutex::new(ManagedProcess::new("switch", "SKWD_SWITCH_INSTALL", resolve_switch_qml()))),
+        notification: Arc::new(Mutex::new(ManagedProcess::new("notification", "SKWD_NOTIFICATION_INSTALL", resolve_notification_qml()))),
         current_wallpaper: Arc::new(Mutex::new(None)),
         cache_state: Arc::new(Mutex::new(CacheState::default())),
         steam_state,
@@ -225,6 +269,10 @@ pub async fn run() -> anyhow::Result<()> {
         suppress_set: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         random_rotation: Arc::new(Mutex::new(None)),
     };
+
+    if should_launch_notification(&config).await {
+        state.notification.lock().await.launch();
+    }
 
     let _watcher_handle: Option<notify::RecommendedWatcher> = match watcher::start(&config, &state.suppress_set) {
         Ok((rx, handle)) => {

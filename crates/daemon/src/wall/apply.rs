@@ -416,7 +416,9 @@ async fn run_reloads(config: &Config) {
         let _ = run_sh(&cmd).await;
     }
 
-    let _ = run_sh("command -v notify-send >/dev/null && notify-send 'Wallpaper Changed' || true").await;
+    if config.general.notify_on_wallpaper_change {
+        let _ = run_sh("command -v notify-send >/dev/null && notify-send 'Wallpaper Changed' || true").await;
+    }
 }
 
 async fn extract_video_thumb(video_path: &str, config: &Config) -> Option<PathBuf> {

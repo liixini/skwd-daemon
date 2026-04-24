@@ -22,6 +22,7 @@ walkdir = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 base64 = "0.22"
 anyhow = "1"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 # ── Workspace-wide lints ──────────────────────────────
 [workspace.lints.rust]
