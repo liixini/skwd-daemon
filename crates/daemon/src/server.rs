@@ -54,18 +54,21 @@ impl ManagedProcess {
     }
 
     pub fn launch(&mut self) {
+        self.launch_with_env(&[]);
+    }
+
+    pub fn launch_with_env(&mut self, extra_env: &[(&str, String)]) {
         if self.is_running() {
             return;
         }
         info!("launching {}: quickshell -p {}", self.label, self.shell_qml.display());
         let install_dir = self.shell_qml.parent().unwrap_or(Path::new("/usr/share/skwd-wall"));
-        match tokio::process::Command::new("quickshell")
-            .arg("-p")
-            .arg(&self.shell_qml)
-            .env(self.env_key, install_dir)
-            .silent()
-            .spawn()
-        {
+        let mut cmd = tokio::process::Command::new("quickshell");
+        cmd.arg("-p").arg(&self.shell_qml).env(self.env_key, install_dir);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        match cmd.silent().spawn() {
             Ok(child) => {
                 self.child = Some(child);
             }
@@ -84,10 +87,14 @@ impl ManagedProcess {
     }
 
     pub fn toggle(&mut self) {
+        self.toggle_with_env(&[]);
+    }
+
+    pub fn toggle_with_env(&mut self, extra_env: &[(&str, String)]) {
         if self.is_running() {
             self.kill();
         } else {
-            self.launch();
+            self.launch_with_env(extra_env);
         }
     }
 }
