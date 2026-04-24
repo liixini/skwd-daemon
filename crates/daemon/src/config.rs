@@ -47,9 +47,9 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum NotificationsBuiltIn {
-    #[default]
     Auto,
     Always,
+    #[default]
     Never,
 }
 
