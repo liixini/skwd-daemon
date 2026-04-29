@@ -8,11 +8,24 @@ use crate::config::{self, Config};
 use crate::util::CommandExt;
 
 pub async fn apply_static(path: &str, outputs: &[String], config: &Config) -> anyhow::Result<()> {
+    apply_static_inner(path, outputs, config, false).await
+}
+
+async fn apply_static_inner(
+    path: &str,
+    outputs: &[String],
+    config: &Config,
+    restoring: bool,
+) -> anyhow::Result<()> {
     let is_kde = is_kde();
 
     kill_video_procs().await;
 
-    if is_kde {
+    if config.wants_external_render() {
+        kill_wallpaper_procs().await;
+        let _ = tokio::fs::remove_file(config.video_dir().join("lockscreen-video.mp4")).await;
+        run_external_apply(config, "static", path, path).await;
+    } else if is_kde {
         run_sh(&format!("plasma-apply-wallpaperimage {}", shell_quote(path))).await?;
     } else {
         let outputs_flag = if outputs.is_empty() {
@@ -44,6 +57,7 @@ pub async fn apply_static(path: &str, outputs: &[String], config: &Config) -> an
     tokio::spawn(async move {
         run_matugen(&path, &config).await;
         run_reloads(&config).await;
+        run_post_processing(&config, "static", &basename(&path), &path, &path, restoring).await;
         info!("post-apply tasks done for static: {path}");
     });
 
@@ -52,13 +66,25 @@ pub async fn apply_static(path: &str, outputs: &[String], config: &Config) -> an
 }
 
 pub async fn apply_video(path: &str, outputs: &[String], config: &Config) -> anyhow::Result<()> {
+    apply_video_inner(path, outputs, config, false).await
+}
+
+async fn apply_video_inner(
+    path: &str,
+    outputs: &[String],
+    config: &Config,
+    restoring: bool,
+) -> anyhow::Result<()> {
     let is_kde = is_kde();
     let mute = config.is_muted();
 
     kill_wallpaper_procs().await;
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-    if is_kde {
+    if config.wants_external_render() {
+        // Built-in mpvpaper backend skipped; defer external apply until thumb is ready.
+        let _ = tokio::fs::remove_file(config.video_dir().join("lockscreen-video.mp4")).await;
+    } else if is_kde {
         apply_kde_video(path, mute).await?;
     } else {
         let mpv_opts = {
@@ -103,11 +129,20 @@ pub async fn apply_video(path: &str, outputs: &[String], config: &Config) -> any
     let config = config.clone();
     tokio::spawn(async move {
         let thumb_path: Option<PathBuf> = extract_video_thumb(&path, &config).await;
+        let thumb_str = thumb_path
+            .as_ref()
+            .and_then(|p| p.to_str())
+            .unwrap_or("")
+            .to_string();
         if let Some(ref thumb) = thumb_path {
             let _ = tokio::fs::copy(thumb, config.cache_dir().join("wallpaper/current.jpg")).await;
             run_matugen(thumb.to_str().unwrap_or(""), &config).await;
             run_reloads(&config).await;
         }
+        if config.wants_external_render() {
+            run_external_apply(&config, "video", &path, &thumb_str).await;
+        }
+        run_post_processing(&config, "video", &basename(&path), &path, &thumb_str, restoring).await;
         info!("post-apply tasks done for video: {path}");
     });
 
@@ -116,6 +151,15 @@ pub async fn apply_video(path: &str, outputs: &[String], config: &Config) -> any
 }
 
 pub async fn apply_we(we_id: &str, screens: &[String], config: &Config) -> anyhow::Result<()> {
+    apply_we_inner(we_id, screens, config, false).await
+}
+
+async fn apply_we_inner(
+    we_id: &str,
+    screens: &[String],
+    config: &Config,
+    restoring: bool,
+) -> anyhow::Result<()> {
     if !config.features.steam {
         anyhow::bail!("Steam feature is disabled");
     }
@@ -128,6 +172,48 @@ pub async fn apply_we(we_id: &str, screens: &[String], config: &Config) -> anyho
 
     kill_wallpaper_procs().await;
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    if config.wants_external_render() {
+        // Skip WE rendering; external program handles painting.
+        save_state(&config.cache_dir(), "we", "", we_id).await;
+        let config_clone = config.clone();
+        let item_dir_clone = item_dir.clone();
+        let we_id_str = we_id.to_string();
+        tokio::spawn(async move {
+            let preview = find_we_preview(&item_dir_clone).await;
+            let preview_str = preview
+                .as_ref()
+                .and_then(|p| p.to_str())
+                .unwrap_or("")
+                .to_string();
+            if let Some(ref preview_path) = preview {
+                let wd_cache = config_clone.cache_dir().join("wallpaper");
+                let _ = tokio::fs::create_dir_all(&wd_cache).await;
+                let _ = tokio::fs::copy(preview_path, wd_cache.join("current.jpg")).await;
+                run_matugen(&preview_str, &config_clone).await;
+                run_reloads(&config_clone).await;
+            }
+            run_external_apply(
+                &config_clone,
+                "we",
+                &item_dir_clone.display().to_string(),
+                &preview_str,
+            )
+            .await;
+            run_post_processing(
+                &config_clone,
+                "we",
+                &we_id_str,
+                &item_dir_clone.display().to_string(),
+                &preview_str,
+                restoring,
+            )
+            .await;
+            info!("post-apply tasks done for WE: {we_id_str}");
+        });
+        info!("applied WE wallpaper (external mode)");
+        return Ok(());
+    }
 
     let project_path = item_dir.join("project.json");
     let (we_type, we_file) = if project_path.exists() {
@@ -202,14 +288,27 @@ pub async fn apply_we(we_id: &str, screens: &[String], config: &Config) -> anyho
     let item_dir = item_dir.clone();
     let we_id = we_id.to_string();
     tokio::spawn(async move {
-        if let Some(preview) = find_we_preview(&item_dir).await {
+        let preview = find_we_preview(&item_dir).await;
+        let preview_str = preview
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        if let Some(ref preview_path) = preview {
             let wd_cache = config.cache_dir().join("wallpaper");
             let _ = tokio::fs::create_dir_all(&wd_cache).await;
-            let _ = tokio::fs::copy(&preview, wd_cache.join("current.jpg")).await;
-            let preview_str = preview.display().to_string();
+            let _ = tokio::fs::copy(preview_path, wd_cache.join("current.jpg")).await;
             run_matugen(&preview_str, &config).await;
             run_reloads(&config).await;
         }
+        run_post_processing(
+            &config,
+            "we",
+            &we_id,
+            &item_dir.display().to_string(),
+            &preview_str,
+            restoring,
+        )
+        .await;
         info!("post-apply tasks done for WE: {we_id}");
     });
 
@@ -232,7 +331,7 @@ pub async fn restore(config: &Config) -> anyhow::Result<String> {
             if path.is_empty() {
                 anyhow::bail!("no path in state");
             }
-            apply_static(path, &[], config).await?;
+            apply_static_inner(path, &[], config, true).await?;
             Ok(path.to_string())
         }
         "video" => {
@@ -240,7 +339,7 @@ pub async fn restore(config: &Config) -> anyhow::Result<String> {
             if path.is_empty() {
                 anyhow::bail!("no path in state");
             }
-            apply_video(path, &[], config).await?;
+            apply_video_inner(path, &[], config, true).await?;
             Ok(path.to_string())
         }
         "we" => {
@@ -248,7 +347,7 @@ pub async fn restore(config: &Config) -> anyhow::Result<String> {
             if we_id.is_empty() {
                 anyhow::bail!("no we_id in state");
             }
-            apply_we(we_id, &[], config).await?;
+            apply_we_inner(we_id, &[], config, true).await?;
             Ok(we_id.to_string())
         }
         _ => anyhow::bail!("unknown wallpaper type: {wp_type}"),
@@ -535,6 +634,70 @@ async fn run_sh(cmd: &str) -> anyhow::Result<()> {
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn basename(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn substitute_placeholders(template: &str, wp_type: &str, name: &str, path: &str, thumb: &str) -> String {
+    template
+        .replace("%type%", wp_type)
+        .replace("%name%", name)
+        .replace("%path%", path)
+        .replace("%thumb%", thumb)
+}
+
+async fn run_detached(cmd: &str) {
+    let wrapped = format!(
+        "nohup setsid sh -c {} </dev/null >/dev/null 2>&1 &",
+        shell_quote(cmd)
+    );
+    if let Err(e) = run_sh(&wrapped).await {
+        warn!("failed to spawn detached command: {e}");
+    }
+}
+
+async fn run_external_apply(config: &Config, wp_type: &str, path: &str, thumb: &str) {
+    let cmd = match config.external_wallpaper_command.as_deref() {
+        Some(s) if !s.is_empty() => s,
+        _ => return,
+    };
+    let name = basename(path);
+    let resolved = substitute_placeholders(cmd, wp_type, &name, path, thumb);
+    info!("running external wallpaper command: {resolved}");
+    run_detached(&resolved).await;
+}
+
+async fn run_post_processing(
+    config: &Config,
+    wp_type: &str,
+    name: &str,
+    path: &str,
+    thumb: &str,
+    restoring: bool,
+) {
+    if restoring && !config.post_process_on_restore {
+        return;
+    }
+    if config.post_processing.is_empty() {
+        return;
+    }
+    for entry in &config.post_processing {
+        if !entry.matches(wp_type) {
+            continue;
+        }
+        let cmd = entry.command();
+        if cmd.is_empty() {
+            continue;
+        }
+        let resolved = substitute_placeholders(cmd, wp_type, name, path, thumb);
+        info!("running post-processing ({wp_type}): {resolved}");
+        run_detached(&resolved).await;
+    }
 }
 
 async fn get_screen_args() -> String {

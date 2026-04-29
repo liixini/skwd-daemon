@@ -509,9 +509,13 @@ async fn run_watcher_loop(
                 cache::rebuild(&config, db.clone(), state.cache_state.clone(), tx.clone()).await;
                 auto_optimize_if_enabled(&config, db, tx.clone(), state.optimize_state.clone()).await;
 
-                match apply::restore(&config).await {
-                    Ok(name) => info!("auto-restored wallpaper: {name}"),
-                    Err(e) => info!("no wallpaper to restore: {e}"),
+                if config.restore_on_startup {
+                    match apply::restore(&config).await {
+                        Ok(name) => info!("auto-restored wallpaper: {name}"),
+                        Err(e) => info!("no wallpaper to restore: {e}"),
+                    }
+                } else {
+                    info!("startup restore disabled by config");
                 }
             }
         }

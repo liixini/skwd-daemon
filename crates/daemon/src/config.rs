@@ -36,10 +36,16 @@ pub struct Config {
     pub default_matugen_config: Option<String>,
     #[serde(default, rename = "externalMatugenCommand")]
     pub external_matugen_command: Option<String>,
+    #[serde(default, rename = "externalWallpaperCommand")]
+    pub external_wallpaper_command: Option<String>,
+    #[serde(default, rename = "pickOnlyMode")]
+    pub pick_only_mode: bool,
     #[serde(default, rename = "postProcessing")]
-    pub post_processing: Vec<String>,
+    pub post_processing: Vec<PostProcessEntry>,
     #[serde(default, rename = "postProcessOnRestore")]
     pub post_process_on_restore: bool,
+    #[serde(default = "default_true", rename = "restoreOnStartup")]
+    pub restore_on_startup: bool,
     #[serde(default)]
     pub notifications: NotificationsConfig,
 }
@@ -145,6 +151,43 @@ pub struct SteamConfig {
     pub api_key: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum PostProcessEntry {
+    Plain(String),
+    Detailed {
+        #[serde(default)]
+        command: String,
+        #[serde(default = "default_post_process_type", rename = "type")]
+        wp_type: String,
+    },
+}
+
+fn default_post_process_type() -> String {
+    "all".to_string()
+}
+
+impl PostProcessEntry {
+    pub fn command(&self) -> &str {
+        match self {
+            PostProcessEntry::Plain(s) => s,
+            PostProcessEntry::Detailed { command, .. } => command,
+        }
+    }
+
+    pub fn wp_type(&self) -> &str {
+        match self {
+            PostProcessEntry::Plain(_) => "all",
+            PostProcessEntry::Detailed { wp_type, .. } => wp_type,
+        }
+    }
+
+    pub fn matches(&self, applied_type: &str) -> bool {
+        let t = self.wp_type();
+        t == "all" || t == applied_type
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Integration {
     #[serde(default)]
@@ -228,6 +271,15 @@ impl Config {
 
     pub fn scripts_dir(&self) -> PathBuf {
         resolve_path(self.paths.scripts.as_deref()).unwrap_or_else(|| config_dir().join("scripts"))
+    }
+
+    pub fn wants_external_render(&self) -> bool {
+        self.pick_only_mode
+            || self
+                .external_wallpaper_command
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
     }
 
     pub fn matugen_scheme(&self) -> &str {
