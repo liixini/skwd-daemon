@@ -24,6 +24,7 @@ pub struct ThumbResult {
     pub thumb_sm_path: String,
     pub hue: u16,
     pub sat: u16,
+    pub richness: u16,
 }
 
 pub async fn generate_static(src: &Path, thumb_path: &Path, thumb_sm_path: &Path) -> anyhow::Result<ThumbResult> {
@@ -56,13 +57,14 @@ pub async fn generate_static(src: &Path, thumb_path: &Path, thumb_sm_path: &Path
     tokio::fs::rename(&tmp_thumb, thumb_path).await?;
 
     generate_small_thumb(thumb_path, thumb_sm_path).await?;
-    let (hue, sat) = extract_hue_sat_from_file(thumb_path).await;
+    let (hue, sat, richness) = extract_hue_sat_from_file(thumb_path).await;
 
     Ok(ThumbResult {
         thumb_path: thumb_path.display().to_string(),
         thumb_sm_path: thumb_sm_path.display().to_string(),
         hue,
         sat,
+        richness,
     })
 }
 
@@ -102,17 +104,18 @@ pub async fn generate_video(
     tokio::fs::rename(&tmp_thumb, thumb_path).await?;
 
     generate_small_thumb(thumb_path, thumb_sm_path).await?;
-    let (hue, sat) = extract_hue_sat_from_file(thumb_path).await;
+    let (hue, sat, richness) = extract_hue_sat_from_file(thumb_path).await;
 
     Ok(ThumbResult {
         thumb_path: thumb_path.display().to_string(),
         thumb_sm_path: thumb_sm_path.display().to_string(),
         hue,
         sat,
+        richness,
     })
 }
 
-pub async fn generate_small_and_colors(thumb_path: &Path, thumb_sm_path: &Path) -> anyhow::Result<(u16, u16)> {
+pub async fn generate_small_and_colors(thumb_path: &Path, thumb_sm_path: &Path) -> anyhow::Result<(u16, u16, u16)> {
     generate_small_thumb(thumb_path, thumb_sm_path).await?;
     Ok(extract_hue_sat_from_file(thumb_path).await)
 }
@@ -146,56 +149,122 @@ async fn generate_small_thumb(thumb_path: &Path, thumb_sm_path: &Path) -> anyhow
     Ok(())
 }
 
-async fn extract_hue_sat_from_file(path: &Path) -> (u16, u16) {
+async fn extract_hue_sat_from_file(path: &Path) -> (u16, u16, u16) {
     let path = path.to_path_buf();
-    match tokio::task::spawn_blocking(move || -> anyhow::Result<(u16, u16)> {
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<(u16, u16, u16)> {
         let img = image::open(&path)?;
         Ok(extract_hue_sat(&img))
     })
     .await
     {
         Ok(Ok(hs)) => hs,
-        Ok(Err(_)) | Err(_) => (0, 0),
+        Ok(Err(_)) | Err(_) => (0, 0, 0),
     }
 }
 
+
 #[must_use]
-pub fn extract_hue_sat(img: &DynamicImage) -> (u16, u16) {
+pub fn extract_hue_sat(img: &DynamicImage) -> (u16, u16, u16) {
     let rgba = img.to_rgba8();
-    let (tr, tg, tb, cnt) = rgba.pixels().fold((0u64, 0u64, 0u64, 0u64), |(r, g, b, c), px| {
-        (r + u64::from(px[0]), g + u64::from(px[1]), b + u64::from(px[2]), c + 1)
-    });
-    if cnt == 0 {
-        return (0, 0);
+    
+    
+    let mut counts = [0u64; 13];
+    let mut meaningful = 0u64;
+
+    for px in rgba.pixels() {
+        let r = f64::from(px[0]) / 255.0;
+        let g = f64::from(px[1]) / 255.0;
+        let b = f64::from(px[2]) / 255.0;
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let delta = max - min;
+        let lightness = (max + min) / 2.0;
+
+        
+        if !(0.06..=0.94).contains(&lightness) {
+            continue;
+        }
+
+        let sat = if delta < 1e-6 {
+            0.0
+        } else {
+            delta / (1.0 - (2.0f64).mul_add(lightness, -1.0).abs())
+        };
+
+        
+        if sat < 0.18 {
+            counts[12] += 1;
+            meaningful += 1;
+            continue;
+        }
+
+        let hue = if (max - r).abs() < 1e-6 {
+            60.0 * (((g - b) / delta) % 6.0)
+        } else if (max - g).abs() < 1e-6 {
+            60.0f64.mul_add((b - r) / delta, 120.0)
+        } else {
+            60.0f64.mul_add((r - g) / delta, 240.0)
+        };
+        let hue = if hue < 0.0 { hue + 360.0 } else { hue };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let hue_u = (hue.round() as u16) % 360;
+
+        
+        let bucket = hue_to_bucket_idx(hue_u);
+        counts[bucket] += 1;
+        meaningful += 1;
     }
-    let r = (tr / cnt) as f64 / 255.0;
-    let g = (tg / cnt) as f64 / 255.0;
-    let b = (tb / cnt) as f64 / 255.0;
 
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let delta = max - min;
+    if meaningful == 0 {
+        return (0, 0, 0);
+    }
 
-    let hue = if delta < 1e-6 {
-        0.0
-    } else if (max - r).abs() < 1e-6 {
-        60.0 * (((g - b) / delta) % 6.0)
-    } else if (max - g).abs() < 1e-6 {
-        60.0 * (((b - r) / delta) + 2.0)
+    
+    let (mut best_idx, mut best_count) = (0usize, 0u64);
+    for (i, &c) in counts.iter().enumerate().take(12) {
+        if c > best_count {
+            best_count = c;
+            best_idx = i;
+        }
+    }
+
+    
+    let chromatic_mass: u64 = counts[..12].iter().sum();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
+    let richness: u16 = if chromatic_mass == 0 {
+        0
     } else {
-        60.0 * (((r - g) / delta) + 4.0)
+        let total = chromatic_mass as f64;
+        let mut sumsq = 0.0_f64;
+        for &c in &counts[..12] {
+            if c == 0 { continue; }
+            let p = c as f64 / total;
+            sumsq += p * p;
+        }
+        if sumsq > 0.0 {
+            ((1.0 / sumsq) * 100.0).round().clamp(0.0, 1500.0) as u16
+        } else {
+            0
+        }
     };
-    let hue = if hue < 0.0 { hue + 360.0 } else { hue };
 
-    let lightness = (max + min) / 2.0;
-    let sat = if delta < 1e-6 {
-        0.0
-    } else {
-        delta / (1.0 - (2.0 * lightness - 1.0).abs())
+    
+    if chromatic_mass * 100 < meaningful * 5 {
+        return (0, 0, richness);
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
+    let coverage = ((best_count as f64 / meaningful as f64) * 100.0).round() as u16;
+
+    
+    let hue_for_bucket: u16 = match best_idx {
+        0 => 10,
+        10 => 307,
+        11 => 337,
+        n => 25 + (n as u16 - 1) * 30 + 15,
     };
-
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    (hue.round() as u16, (sat * 100.0).round() as u16)
+    
+    (hue_for_bucket, coverage.clamp(10, 100), richness)
 }
 
 #[must_use]
@@ -203,10 +272,21 @@ pub fn hue_bucket(hue: u16, sat: u16) -> u16 {
     if sat < 10 {
         return 99;
     }
-    if !(25..340).contains(&hue) {
+    hue_to_bucket_idx(hue) as u16
+}
+
+
+fn hue_to_bucket_idx(hue: u16) -> usize {
+    if hue >= 355 || hue < 25 {
         return 0;
     }
-    ((hue.wrapping_sub(25)) / 30) + 1
+    if hue >= 320 {
+        return 11;
+    }
+    if hue >= 295 {
+        return 10;
+    }
+    ((hue - 25) / 30 + 1) as usize
 }
 
 #[allow(dead_code)]

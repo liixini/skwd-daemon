@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use anyhow::bail;
 
 use crate::config::Config;
 use crate::db;
-use crate::server::{SharedState, broadcast_event, make_event};
+use crate::server::{SharedState, make_event};
 use crate::util::BatchJobState;
 use crate::wall::thumb;
 
@@ -61,32 +61,21 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             Response::ok(req.id, serde_json::json!({"ok": true}))
         }
 
-        "consolidate" => {
-            let config = state.config.read().await.clone();
-            if !config.ollama.consolidate_enabled {
-                return Response::err(req.id, -32000, "tag consolidation is disabled".to_string());
+        "retag_one" => {
+            let key = req.str_param("key", "").to_string();
+            if key.is_empty() {
+                return Response::err(req.id, 1, "missing 'key' parameter");
             }
+            let config = state.config.read().await.clone();
             let db = state.db_shared.clone();
             let tx = event_tx.clone();
+            let key_for_task = key.clone();
             tokio::spawn(async move {
-                let ollama_url = &config.ollama.url;
-                let model = if config.ollama.consolidation_model.is_empty() {
-                    &config.ollama.model
-                } else {
-                    &config.ollama.consolidation_model
-                };
-                let _ = broadcast_event(
-                    &tx,
-                    "skwd.wall.analysis.progress",
-                    serde_json::json!({ "running": true, "lastLog": "Consolidating tags..." }),
-                );
-                match consolidate_tags(ollama_url, model, &db).await {
-                    Ok(()) => info!("tag consolidation complete"),
-                    Err(e) => warn!("tag consolidation failed: {e}"),
+                if let Err(e) = retag_one(&config, db, tx, &key_for_task).await {
+                    warn!("retag_one failed for {key_for_task}: {e}");
                 }
-                let _ = broadcast_event(&tx, "skwd.wall.analysis.complete", serde_json::json!({}));
             });
-            Response::ok(req.id, serde_json::json!({"started": true}))
+            Response::ok(req.id, serde_json::json!({"started": true, "key": key}))
         }
 
         _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
@@ -107,11 +96,45 @@ pub struct AnalysisState {
 
 
 const OLLAMA_PROMPT: &str = "\
-First line: dominant color from [red, orange, yellow, lime, green, teal, cyan, sky blue, blue, indigo, violet, pink, neutral] and saturation 0-100. Format: COLOR|NUMBER
-Color tips: dark blue/navy=indigo, brown/sepia/earth=orange, purple=violet, light blue=sky blue. Use neutral ONLY for pure grayscale.
-Second line: 8-12 comma-separated single-word tags for what you see.
-Third line: what weather would this wallpaper be a good fit for? Pick from: clear, sunny, cloudy, rainy, snowy, stormy, foggy, windy. Comma-separated, all that apply.
-Three lines only, nothing else.";
+You are tagging an image for a wallpaper browser where the user filters a large collection by what they want to look at right now.
+
+OUTPUT EXACTLY THREE LINES, NOTHING ELSE.
+
+LINE 1 — dominant color and saturation
+Format: COLOR|NUMBER (e.g. teal|62)
+Color from this list: red, orange, yellow, lime, green, teal, cyan, sky blue, blue, indigo, violet, pink, neutral
+Mapping hints: dark blue / navy → indigo, brown / sepia / earth tones → orange, purple → violet, light blue → sky blue. Use 'neutral' ONLY for pure grayscale.
+Saturation: 0 (grayscale) to 100 (very vivid).
+
+LINE 2 — 8 to 12 lowercase comma-separated tags
+Cover the dimensions below WHEN APPLICABLE. Skip a dimension if it doesn't fit.
+  - subject: the main thing depicted (forest, mountain, city, woman, dragon, spaceship, cat, building, road, tree, flower, ship, robot, road, person, character)
+  - style: visual treatment (anime, illustration, photo, painting, render, 3d, pixelart, sketch, abstract, minimalist, cyberpunk, vaporwave, fantasy, scifi, horror, retro, realistic, surreal)
+  - mood: emotional feel (peaceful, melancholy, ominous, epic, dreamy, vibrant, lonely, intimate, energetic, mysterious, cozy, somber, hopeful, eerie)
+  - lighting / time: when applicable (sunset, sunrise, night, twilight, golden, neon, moonlit, overcast, dramatic)
+  - setting: when applicable (indoor, outdoor, underwater, space, urban, rural, forest, desert, beach, mountain, futuristic, medieval, ancient, post-apocalyptic, abandoned)
+  - notable details: when present (fog, snow, rain, fire, water, reflection, silhouette, closeup, panorama)
+Tag rules:
+  - lowercase only, single English word per tag (use a hyphen for unavoidable two-word concepts: post-apocalyptic, sci-fi)
+  - no duplicates, no color words (line 1 covers color), no generic filler ('image', 'wallpaper', 'background', 'scene', 'view')
+  - if the image is in anime, manga, or Japanese-cartoon visual style, ALWAYS include 'anime'
+  - prefer concrete and searchable over generic ('cyberpunk' over 'futuristic-stuff', 'sunset' over 'orange-light')
+
+Quality tags — these augment the metric-based sort modes so users can filter for them.
+ALWAYS evaluate each independently and include the matching tag(s):
+  - 'minimalist' — sparse composition, lots of negative space, single subject on a flat/simple background, very few visual elements. NOT just low color count; also requires compositional simplicity.
+  - 'colourful' — five or more distinct, well-distributed colors throughout the image (not just one accent color in a sea of black). Multi-hue artwork, rainbow palettes, busy illustrations qualify.
+  - 'vibrant' — saturated, high-energy, eye-catching colors regardless of how many. Neon scenes, fully-saturated cartoons, vivid sunsets qualify; pastel and muted images do NOT.
+A wallpaper can have multiple of these (a vivid abstract can be both colourful and vibrant); pick whichever genuinely apply.
+
+Examples:
+  forest at sunset, photo → trees, forest, sunset, golden, peaceful, outdoor, photo, nature, vibrant
+  anime girl in a neon city at night → anime, character, city, neon, night, cyberpunk, illustration, vibrant, colourful
+  abstract gradient → abstract, gradient, minimalist, dreamy, smooth, render
+  solid black wallpaper with one red sphere → minimalist, sphere, render, dramatic
+
+LINE 3 — weather fit
+Which weather conditions would this wallpaper match? Comma-separated subset of: clear, sunny, cloudy, rainy, snowy, stormy, foggy, windy.";
 
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 const DEFAULT_OLLAMA_MODEL: &str = "llava:latest";
@@ -156,12 +179,6 @@ pub async fn start(
     } else {
         config.ollama.model.clone()
     };
-    let consolidation_model = if config.ollama.consolidation_model.is_empty() {
-        ollama_model.clone()
-    } else {
-        config.ollama.consolidation_model.clone()
-    };
-
     {
         let mut s = state.lock().await;
         s.batch.running = true;
@@ -216,17 +233,20 @@ pub async fn start(
 
     let total_thumbs = thumbs.len();
 
-    let mut queue = Vec::new();
+    
+    let mut queue: Vec<(String, String, bool)> = Vec::new();
     for path in &thumbs {
         let key = thumb_to_key(path);
-        if failed_keys.contains(&key) {
-            continue;
-        }
         let has_tags = existing_tags.contains(&key);
         let has_colors = existing_colors.contains(&key);
-        if !has_tags || !has_colors {
-            queue.push((path.clone(), key));
+        let was_failed = failed_keys.contains(&key);
+        if !has_tags || !has_colors || was_failed {
+            queue.push((path.clone(), key, was_failed));
         }
+    }
+    let retry_count = queue.iter().filter(|(_, _, f)| *f).count();
+    if retry_count > 0 {
+        info!("retrying {retry_count} previously-failed items");
     }
 
     {
@@ -255,7 +275,7 @@ pub async fn start(
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
 
-    for (i, (path, key)) in queue.iter().enumerate() {
+    for (i, (path, key, was_failed)) in queue.iter().enumerate() {
         {
             let s = state.lock().await;
             if s.batch.cancel {
@@ -286,6 +306,12 @@ pub async fn start(
                     Some(sat),
                     Some(&weather_json),
                 );
+                
+                
+                let _ = conn.execute(
+                    "UPDATE meta SET analysis_error = NULL WHERE key = ?1",
+                    rusqlite::params![key],
+                );
                 drop(conn);
 
                 let _ = event_tx.send(make_event(
@@ -298,6 +324,9 @@ pub async fn start(
                 let mut s = state.lock().await;
                 s.tagged_count += 1;
                 s.colored_count += 1;
+                if *was_failed && s.failed_count > 0 {
+                    s.failed_count -= 1;
+                }
             }
             Err(e) => {
                 warn!("analysis failed for {}: {e}", key);
@@ -308,7 +337,9 @@ pub async fn start(
                     rusqlite::params![err_msg, &ollama_model, key],
                 );
                 let mut s = state.lock().await;
-                s.failed_count += 1;
+                if !*was_failed {
+                    s.failed_count += 1;
+                }
             }
         }
 
@@ -324,19 +355,6 @@ pub async fn start(
         }
 
         broadcast_progress(&event_tx, &state).await;
-    }
-
-    if config.ollama.consolidate_enabled {
-        {
-            let mut s = state.lock().await;
-            s.last_log = "Consolidating tags...".into();
-            s.eta.clear();
-        }
-        broadcast_progress(&event_tx, &state).await;
-
-        if let Err(e) = consolidate_tags(&ollama_url, &consolidation_model, &db).await {
-            warn!("tag consolidation failed: {e}");
-        }
     }
 
     {
@@ -365,176 +383,81 @@ pub async fn regenerate(db: &Arc<Mutex<Connection>>) {
 }
 
 
-pub async fn consolidate_tags(ollama_url: &str, model: &str, db: &Arc<Mutex<Connection>>) -> anyhow::Result<()> {
-    let all_tags: Vec<String> = {
-        let conn = db.lock().await;
-        let mut stmt = conn
-            .prepare("SELECT tags FROM meta WHERE tags IS NOT NULL")
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let tag_set: HashSet<String> = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .flat_map(|raw| serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default())
-            .collect();
-        let mut v: Vec<String> = tag_set.into_iter().collect();
-        v.sort();
-        v
+pub async fn retag_one(
+    config: &Config,
+    db: Arc<Mutex<Connection>>,
+    event_tx: broadcast::Sender<String>,
+    key: &str,
+) -> anyhow::Result<()> {
+    let ollama_url = if config.ollama.url.is_empty() {
+        DEFAULT_OLLAMA_URL.to_string()
+    } else {
+        config.ollama.url.clone()
+    };
+    let ollama_model = if config.ollama.model.is_empty() {
+        DEFAULT_OLLAMA_MODEL.to_string()
+    } else {
+        config.ollama.model.clone()
     };
 
-    if all_tags.len() <= 1 {
-        return Ok(());
-    }
-
-    const CHUNK_SIZE: usize = 200;
-    let mut remap: HashMap<String, String> = HashMap::new();
+    let thumb_path: Option<String> = {
+        let conn = db.lock().await;
+        conn.query_row(
+            "SELECT thumb FROM meta WHERE key = ?1",
+            rusqlite::params![key],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    };
+    let thumb_path = thumb_path
+        .ok_or_else(|| anyhow::anyhow!("no thumb path for key {key}"))?;
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        .timeout(std::time::Duration::from_secs(120))
         .build()?;
 
-    for (ci, chunk) in all_tags.chunks(CHUNK_SIZE).enumerate() {
-        info!(
-            "consolidation chunk {}/{}: {} tags",
-            ci + 1,
-            all_tags.len().div_ceil(CHUNK_SIZE),
-            chunk.len()
-        );
+    info!("retagging {key} from {thumb_path}");
 
-        let groups = match consolidate_chunk(ollama_url, model, chunk, &client).await {
-            Ok(g) => g,
-            Err(e) => {
-                warn!("consolidation chunk {} failed, skipping: {e}", ci + 1);
-                continue;
-            }
-        };
+    match analyze_one(&thumb_path, &ollama_url, &ollama_model, &client).await {
+        Ok((hue, sat, tags, colors_json, weather)) => {
+            let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into());
+            let weather_json = serde_json::to_string(&weather).unwrap_or_else(|_| "[]".into());
+            let conn = db.lock().await;
+            let _ = db::update_analysis(
+                &conn,
+                key,
+                Some(&tags_json),
+                Some(&colors_json),
+                Some(&ollama_model),
+                Some(hue),
+                Some(sat),
+                Some(&weather_json),
+            );
+            let _ = conn.execute(
+                "UPDATE meta SET analysis_error = NULL, tags_raw = ?1 WHERE key = ?2",
+                rusqlite::params![tags_json, key],
+            );
+            drop(conn);
 
-        for (canonical, members) in &groups {
-            let canon = canonical.to_lowercase();
-            for member in members {
-                let m = member.to_lowercase();
-                if m != canon {
-                    remap.insert(m, canon.clone());
-                }
-            }
+            let _ = event_tx.send(make_event(
+                "skwd.wall.analysis.item",
+                serde_json::json!({
+                    "key": key, "tags": tags, "hue": hue, "sat": sat, "weather": weather,
+                }),
+            ));
+            Ok(())
+        }
+        Err(e) => {
+            let conn = db.lock().await;
+            let err_msg: String = e.to_string().chars().take(200).collect();
+            let _ = conn.execute(
+                "UPDATE meta SET analysis_error = ?1 WHERE key = ?2",
+                rusqlite::params![err_msg, key],
+            );
+            Err(e)
         }
     }
-
-    if remap.is_empty() {
-        return Ok(());
-    }
-
-    info!("consolidating {} synonym mappings", remap.len());
-
-    let conn = db.lock().await;
-    let mut stmt = conn
-        .prepare(
-            "SELECT key, tags FROM meta \
-             WHERE tags IS NOT NULL \
-             AND (tags_raw IS NULL OR tags = tags_raw)",
-        )
-        .map_err(|e| anyhow::anyhow!(e))?;
-
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-        .map_err(|e| anyhow::anyhow!(e))?
-        .filter_map(std::result::Result::ok)
-        .collect();
-    drop(stmt);
-
-    let mut updated = 0usize;
-    for (key, raw_tags) in &rows {
-        if let Ok(tags) = serde_json::from_str::<Vec<String>>(raw_tags) {
-            let mut seen = HashSet::new();
-            let mut new_tags = Vec::new();
-            let mut changed = false;
-            for tag in &tags {
-                let mapped = remap.get(tag.as_str()).unwrap_or(tag).clone();
-                if mapped != *tag {
-                    changed = true;
-                }
-                if seen.insert(mapped.clone()) {
-                    new_tags.push(mapped);
-                }
-            }
-            if new_tags.len() != tags.len() {
-                changed = true;
-            }
-
-            if changed {
-                let new_json = serde_json::to_string(&new_tags).unwrap_or_else(|_| raw_tags.clone());
-                let _ = conn.execute(
-                    "UPDATE meta SET tags = ?1, tags_raw = COALESCE(tags_raw, ?2) WHERE key = ?3",
-                    rusqlite::params![new_json, raw_tags, key],
-                );
-                updated += 1;
-            }
-        }
-    }
-
-    info!(
-        "tag consolidation: updated {updated} unconsolidated entries ({} skipped)",
-        rows.len().saturating_sub(updated)
-    );
-    Ok(())
-}
-
-async fn consolidate_chunk(
-    ollama_url: &str,
-    model: &str,
-    tags: &[String],
-    client: &reqwest::Client,
-) -> anyhow::Result<HashMap<String, Vec<String>>> {
-    let tag_list = tags.join(", ");
-    let prompt = format!(
-        "Here is a list of tags used to describe wallpapers:\n{tag_list}\n\n\
-         Group tags that mean the same thing or are very similar (synonyms, plurals, \
-         spelling variants). For each group pick the single best canonical tag.\n\
-         Return ONLY a JSON object where each key is the canonical tag and the value \
-         is an array of all tags in that group (including the canonical one). \
-         Tags that have no synonyms should be omitted. Example:\n\
-         {{\"mountain\":[\"mountain\",\"mountains\",\"peak\"],\"peaceful\":[\"peaceful\",\"serene\",\"calm\"]}}\n\
-         JSON only, nothing else."
-    );
-
-    let body = serde_json::json!({
-        "model": model,
-        "prompt": prompt,
-        "stream": false,
-        "options": { "num_ctx": 8192 },
-    });
-
-    let resp = client
-        .post(format!("{ollama_url}/api/generate"))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("ollama consolidate request: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        bail!("ollama consolidate failed (HTTP {status}): {text}");
-    }
-
-    let resp_json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("parse consolidation response: {e}"))?;
-
-    if let Some(err_msg) = resp_json.get("error").and_then(|v| v.as_str()) {
-        bail!("ollama consolidation error: {err_msg}");
-    }
-
-    let response_text = resp_json.get("response").and_then(|v| v.as_str()).unwrap_or("").trim();
-
-    let json_str = extract_json_block(response_text);
-
-    let groups: HashMap<String, Vec<String>> = serde_json::from_str(&json_str)
-        .map_err(|e| anyhow::anyhow!("parse consolidation JSON: {e} — raw: {json_str}"))?;
-
-    Ok(groups)
 }
 
 
@@ -713,15 +636,6 @@ fn color_to_hue(name: &str) -> i64 {
             .find(|(alias, _)| n.contains(alias) || alias.contains(n.as_str()))
             .map_or(99, |(_, hue)| *hue),
     }
-}
-
-fn extract_json_block(text: &str) -> String {
-    if let Some(start) = text.find('{')
-        && let Some(end) = text.rfind('}')
-    {
-        return text[start..=end].to_string();
-    }
-    text.to_string()
 }
 
 fn format_eta(seconds: f64) -> String {

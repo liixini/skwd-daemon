@@ -13,18 +13,27 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             ui.toggle();
             let running = ui.is_running();
             drop(ui);
+            let config = state.config.read().await.clone();
+            if running {
+                apply::on_wall_show(&config).await;
+            } else {
+                apply::on_wall_hide().await;
+            }
             let _ = broadcast_event(event_tx, "skwd.wall.toggle", serde_json::json!({"visible": running}));
             Response::ok(req.id, serde_json::json!({"toggled": true, "visible": running}))
         }
 
         "show" => {
             state.ui.lock().await.launch();
+            let config = state.config.read().await.clone();
+            apply::on_wall_show(&config).await;
             let _ = broadcast_event(event_tx, "skwd.wall.show", serde_json::json!({}));
             Response::ok(req.id, serde_json::json!({"ok": true}))
         }
 
         "hide" => {
             state.ui.lock().await.kill();
+            apply::on_wall_hide().await;
             let _ = broadcast_event(event_tx, "skwd.wall.hide", serde_json::json!({}));
             Response::ok(req.id, serde_json::json!({"ok": true}))
         }
@@ -68,6 +77,35 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
                 .unwrap_or_default();
+            let neighbors: Vec<String> = req
+                .params
+                .get("neighbors")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+
+            let outputs_audio: std::collections::HashMap<String, bool> = req
+                .params
+                .get("outputs_audio")
+                .and_then(|v| v.as_object())
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let outputs_volume: std::collections::HashMap<String, u32> = req
+                .params
+                .get("outputs_volume")
+                .and_then(|v| v.as_object())
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| {
+                            v.as_u64().map(|n| (k.clone(), (n as u32).min(100)))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
             let config = state.config.read().await.clone();
 
@@ -76,13 +114,13 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                     if path.is_empty() {
                         return Response::err(req.id, 1, "missing 'path' parameter");
                     }
-                    apply::apply_static(path, &outputs, &config).await
+                    apply::apply_static(path, &outputs, &neighbors, &config).await
                 }
                 "video" => {
                     if path.is_empty() {
                         return Response::err(req.id, 1, "missing 'path' parameter");
                     }
-                    apply::apply_video(path, &outputs, &config).await
+                    apply::apply_video(path, &outputs, &neighbors, &outputs_audio, &outputs_volume, &config).await
                 }
                 "we" => {
                     if we_id.is_empty() {
@@ -94,7 +132,7 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                         .and_then(|v| v.as_array())
                         .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
                         .unwrap_or_default();
-                    apply::apply_we(we_id, &screens, &config).await
+                    apply::apply_we(we_id, &screens, &outputs_audio, &outputs_volume, &config).await
                 }
                 _ => Err(anyhow::anyhow!("unknown type: {wp_type}")),
             };
@@ -107,15 +145,34 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                         we_id.to_string()
                     };
                     *state.current_wallpaper.lock().await = Some(name.clone());
+
+                    
+                    let key: String = if !we_id.is_empty() {
+                        we_id.to_string()
+                    } else {
+                        name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_string()
+                    };
+                    if !key.is_empty() {
+                        let conn = state.db.lock().await;
+                        let _ = crate::db::bump_apply_count(&conn, &key);
+                        drop(conn);
+                    }
+
                     let _ = broadcast_event(
                         event_tx,
                         "skwd.wall.applied",
-                        serde_json::json!({"type": wp_type, "name": &name, "path": path, "we_id": we_id}),
+                        serde_json::json!({"type": wp_type, "name": &name, "path": path, "we_id": we_id, "key": key}),
                     );
                     Response::ok(req.id, serde_json::json!({"applied": name}))
                 }
                 Err(e) => Response::err(req.id, 4, format!("{e}")),
             }
+        }
+
+        "preheat" => {
+            let path = req.str_param("path", "");
+            apply::preheat(path);
+            Response::ok(req.id, serde_json::json!({"ok": true}))
         }
 
         "restore" => {
@@ -148,6 +205,15 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             tokio::spawn(async move {
                 cache::rebuild(&config, db.clone(), cache_state, tx.clone()).await;
                 crate::server::auto_optimize_if_enabled(&config, db, tx, optimize_state).await;
+            });
+            Response::ok(req.id, serde_json::json!({"started": true}))
+        }
+
+        "recompute_colors" => {
+            let db = state.db_shared.clone();
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                cache::recompute_colors(db, tx).await;
             });
             Response::ok(req.id, serde_json::json!({"started": true}))
         }
@@ -274,6 +340,23 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             Response::ok(req.id, serde_json::json!({"deleted": name}))
         }
 
+        "outputs" => {
+            let cfg = state.config.read().await.clone();
+            let map = apply::read_outputs_state(&cfg.cache_dir()).await;
+            Response::ok(req.id, serde_json::json!({"outputs": map}))
+        }
+
+        "set_audio" => {
+            let mute = req.params.get("mute").and_then(|v| v.as_bool());
+            let volume = req
+                .params
+                .get("volume")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.min(100) as u32);
+            apply::set_audio(mute, volume).await;
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+
         "suppress" => {
             let name = req.str_param("name", "");
             if !name.is_empty() {
@@ -358,6 +441,8 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                     };
                     let cfg = config.read().await.clone();
 
+                    let empty_audio: std::collections::HashMap<String, bool> = Default::default();
+                    let empty_vol: std::collections::HashMap<String, u32> = Default::default();
                     let result = match wp_type.as_str() {
                         "video" => {
                             let path = if video_file.is_empty() {
@@ -366,17 +451,17 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                                 std::path::PathBuf::from(&video_file)
                             };
                             let path_str = path.display().to_string();
-                            apply::apply_video(&path_str, &[], &cfg).await
+                            apply::apply_video(&path_str, &[], &[], &empty_audio, &empty_vol, &cfg).await
                                 .map(|()| ("video", path_str))
                         }
                         "we" => {
-                            apply::apply_we(&we_id, &[], &cfg).await
+                            apply::apply_we(&we_id, &[], &empty_audio, &empty_vol, &cfg).await
                                 .map(|()| ("we", we_id.clone()))
                         }
                         _ => {
                             let path = cfg.wallpaper_dir().join(&name);
                             let path_str = path.display().to_string();
-                            apply::apply_static(&path_str, &[], &cfg).await
+                            apply::apply_static(&path_str, &[], &[], &cfg).await
                                 .map(|()| ("static", path_str))
                         }
                     };

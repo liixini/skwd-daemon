@@ -115,47 +115,35 @@ fn resolve_shell_qml() -> PathBuf {
 }
 
 fn resolve_bar_qml() -> PathBuf {
-    if let Ok(p) = std::env::var("SKWD_BAR_QML") {
+    resolve_dev_or_system("skwd-bar", "SKWD_BAR_QML")
+}
+
+
+fn resolve_dev_or_system(name: &str, env_var: &str) -> PathBuf {
+    if let Ok(p) = std::env::var(env_var) {
         return PathBuf::from(p);
     }
-    let sibling = PathBuf::from("../skwd-bar/shell.qml");
+    let umbrella = PathBuf::from(format!("../skwd-shell/{name}/shell.qml"));
+    if umbrella.exists() {
+        return std::fs::canonicalize(&umbrella).unwrap_or(umbrella);
+    }
+    let sibling = PathBuf::from(format!("../{name}/shell.qml"));
     if sibling.exists() {
         return std::fs::canonicalize(&sibling).unwrap_or(sibling);
     }
-    PathBuf::from("/usr/share/skwd-bar/shell.qml")
+    PathBuf::from(format!("/usr/share/{name}/shell.qml"))
 }
 
 fn resolve_launch_qml() -> PathBuf {
-    if let Ok(p) = std::env::var("SKWD_LAUNCH_QML") {
-        return PathBuf::from(p);
-    }
-    let sibling = PathBuf::from("../skwd-launch/shell.qml");
-    if sibling.exists() {
-        return std::fs::canonicalize(&sibling).unwrap_or(sibling);
-    }
-    PathBuf::from("/usr/share/skwd-launch/shell.qml")
+    resolve_dev_or_system("skwd-launch", "SKWD_LAUNCH_QML")
 }
 
 fn resolve_switch_qml() -> PathBuf {
-    if let Ok(p) = std::env::var("SKWD_SWITCH_QML") {
-        return PathBuf::from(p);
-    }
-    let sibling = PathBuf::from("../skwd-switch/shell.qml");
-    if sibling.exists() {
-        return std::fs::canonicalize(&sibling).unwrap_or(sibling);
-    }
-    PathBuf::from("/usr/share/skwd-switch/shell.qml")
+    resolve_dev_or_system("skwd-switch", "SKWD_SWITCH_QML")
 }
 
 fn resolve_notification_qml() -> PathBuf {
-    if let Ok(p) = std::env::var("SKWD_NOTIFICATION_QML") {
-        return PathBuf::from(p);
-    }
-    let sibling = PathBuf::from("../skwd-notification/shell.qml");
-    if sibling.exists() {
-        return std::fs::canonicalize(&sibling).unwrap_or(sibling);
-    }
-    PathBuf::from("/usr/share/skwd-notification/shell.qml")
+    resolve_dev_or_system("skwd-notification", "SKWD_NOTIFICATION_QML")
 }
 
 async fn fdo_notifications_owned() -> bool {
@@ -534,6 +522,7 @@ async fn handle_client(
     let mut lines = reader.lines();
 
     let subscriptions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let wall_was_shown = std::sync::atomic::AtomicBool::new(false);
 
     let writer_clone = writer.clone();
     let subs_clone = subscriptions.clone();
@@ -597,6 +586,19 @@ async fn handle_client(
         };
 
         debug!(method = %req.method, id = req.id, "<- request");
+        match req.method.as_str() {
+            "wall.show" => {
+                wall_was_shown.store(true, std::sync::atomic::Ordering::Release);
+            }
+            "wall.hide" => {
+                wall_was_shown.store(false, std::sync::atomic::Ordering::Release);
+            }
+            "wall.toggle" => {
+                let cur = wall_was_shown.load(std::sync::atomic::Ordering::Acquire);
+                wall_was_shown.store(!cur, std::sync::atomic::Ordering::Release);
+            }
+            _ => {}
+        }
         let event_tx = event_tx.clone();
         let subscriptions = subscriptions.clone();
         let state = state.clone();
@@ -609,6 +611,14 @@ async fn handle_client(
     }
 
     event_forwarder.abort();
+    if wall_was_shown.load(std::sync::atomic::Ordering::Acquire) {
+        let was_long_lived = !subscriptions.lock().await.is_empty();
+        if was_long_lived {
+            info!("client disconnected with wall picker open; cleaning up");
+            crate::wall::apply::on_wall_hide().await;
+            state.ui.lock().await.kill();
+        }
+    }
     info!("client disconnected");
     Ok(())
 }
@@ -731,6 +741,12 @@ async fn dispatch_request(
     subscriptions: &Arc<Mutex<Vec<String>>>,
     state: &SharedState,
 ) -> Response {
+    if req.method == "paper.ready" {
+        if let Some(pid) = req.params.get("pid").and_then(|v| v.as_u64()) {
+            wall::apply::signal_paper_ready(pid as u32).await;
+        }
+        return Response::ok(req.id, serde_json::json!({"ok": true}));
+    }
     if req.method.starts_with("wall.") {
         return wall::dispatch(req, event_tx, state).await;
     }

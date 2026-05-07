@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/daemon", "crates/cli", "crates/proto"]
+members = ["crates/daemon", "crates/cli", "crates/proto", "crates/paper"]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,7 +24,6 @@ base64 = "0.22"
 anyhow = "1"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
-# ── Workspace-wide lints ──────────────────────────────
 [workspace.lints.rust]
 unsafe_code = "forbid"
 unused_must_use = "deny"
@@ -56,7 +55,7 @@ or_fun_call = "warn"
 map_unwrap_or = "warn"
 # Nursery (stable & useful)
 redundant_else = "warn"
-# Allow — too noisy or inapplicable for this project
+# Allow
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"

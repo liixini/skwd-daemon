@@ -4,7 +4,7 @@ use serde::Deserialize;
 use tracing::info;
 
 #[derive(Debug, Clone, Deserialize, Default)]
-#[allow(dead_code)] // Fields deserialized from JSON config, read by QML clients
+#[allow(dead_code)]
 pub struct Config {
     #[serde(default)]
     pub compositor: String,
@@ -48,6 +48,67 @@ pub struct Config {
     pub restore_on_startup: bool,
     #[serde(default)]
     pub notifications: NotificationsConfig,
+    #[serde(default)]
+    pub transition: TransitionConfig,
+    #[serde(default)]
+    pub display: DisplayConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FillMode {
+    #[default]
+    Fill,
+    Fit,
+    Stretch,
+    Center,
+    Tile,
+}
+
+impl FillMode {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            FillMode::Fill => "fill",
+            FillMode::Fit => "fit",
+            FillMode::Stretch => "stretch",
+            FillMode::Center => "center",
+            FillMode::Tile => "tile",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DisplayConfig {
+    #[serde(default, rename = "fillMode")]
+    pub fill_mode: FillMode,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransitionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_transition_shader")]
+    pub shader: String,
+    #[serde(default = "default_transition_duration_ms", rename = "durationMs")]
+    pub duration_ms: u64,
+}
+
+impl Default for TransitionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            shader: default_transition_shader(),
+            duration_ms: default_transition_duration_ms(),
+        }
+    }
+}
+
+fn default_transition_shader() -> String {
+    "random".to_string()
+}
+
+fn default_transition_duration_ms() -> u64 {
+    600
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
@@ -128,9 +189,13 @@ pub struct OllamaConfig {
     pub url: String,
     #[serde(default)]
     pub model: String,
+    
+    
     #[serde(default, rename = "consolidationModel")]
+    #[allow(dead_code)]
     pub consolidation_model: String,
     #[serde(default = "default_true", rename = "consolidateEnabled")]
+    #[allow(dead_code)]
     pub consolidate_enabled: bool,
 }
 

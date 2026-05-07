@@ -37,6 +37,7 @@ struct CacheEntry {
     mtime: i64,
     hue: i64,
     sat: i64,
+    richness: i64,
 }
 
 fn commit_and_broadcast(
@@ -46,13 +47,13 @@ fn commit_and_broadcast(
 ) {
     if let Err(err) = db::upsert_cache_entry(
         conn, &e.key, &e.wp_type, &e.name, &e.thumb, &e.thumb_sm,
-        &e.video_file, &e.we_id, e.mtime, e.hue, e.sat,
+        &e.video_file, &e.we_id, e.mtime, e.hue, e.sat, e.richness,
     ) {
         warn!("db upsert failed for {}: {err}", e.name);
     }
     let _ = broadcast_item_event(
         tx, &e.key, &e.wp_type, &e.name, &e.thumb,
-        &e.video_file, &e.we_id, e.mtime, e.hue, e.sat,
+        &e.video_file, &e.we_id, e.mtime, e.hue, e.sat, e.richness,
     );
 }
 
@@ -240,6 +241,7 @@ pub async fn rebuild(
                         mtime: item.mtime,
                         hue: i64::from(thumb::hue_bucket(tr.hue, tr.sat)),
                         sat: i64::from(tr.sat),
+                        richness: i64::from(tr.richness),
                     };
                     let conn = db.lock().await;
                     commit_and_broadcast(&conn, &event_tx, &entry);
@@ -352,20 +354,20 @@ pub async fn process_single(
             }
             drop(conn);
 
-            let (hue, sat) = if !thumb_sm_path.exists() {
+            let (hue, sat, richness) = if !thumb_sm_path.exists() {
                 thumb::generate_small_and_colors(&thumb_path, &thumb_sm_path)
                     .await
-                    .unwrap_or((0, 0))
+                    .unwrap_or((0, 0, 0))
             } else {
                 let tp = thumb_path.clone();
-                tokio::task::spawn_blocking(move || -> Option<(u16, u16)> {
+                tokio::task::spawn_blocking(move || -> Option<(u16, u16, u16)> {
                     let img = image::open(&tp).ok()?;
                     Some(thumb::extract_hue_sat(&img))
                 })
                 .await
                 .ok()
                 .flatten()
-                .unwrap_or((0, 0))
+                .unwrap_or((0, 0, 0))
             };
             let video_file = if wp_type == "video" {
                 src.display().to_string()
@@ -384,6 +386,7 @@ pub async fn process_single(
                 mtime: src_mtime,
                 hue: i64::from(thumb::hue_bucket(hue, sat)),
                 sat: i64::from(sat),
+                richness: i64::from(richness),
             };
             let conn = db.lock().await;
             commit_and_broadcast(&conn, event_tx, &entry);
@@ -418,6 +421,7 @@ pub async fn process_single(
                 mtime: item.mtime,
                 hue: i64::from(thumb::hue_bucket(tr.hue, tr.sat)),
                 sat: i64::from(tr.sat),
+                richness: i64::from(tr.richness),
             };
             let conn = db.lock().await;
             commit_and_broadcast(&conn, event_tx, &entry);
@@ -487,6 +491,7 @@ pub async fn process_we_single(
                 mtime,
                 hue: i64::from(thumb::hue_bucket(tr.hue, tr.sat)),
                 sat: i64::from(tr.sat),
+                richness: i64::from(tr.richness),
             };
             let conn = db.lock().await;
             commit_and_broadcast(&conn, event_tx, &entry);
@@ -498,6 +503,77 @@ pub async fn process_we_single(
 }
 
 #[allow(dead_code)]
+
+
+pub async fn recompute_colors(
+    db: Arc<Mutex<Connection>>,
+    event_tx: broadcast::Sender<String>,
+) -> usize {
+    use crate::server::{broadcast_event, make_event};
+
+    let rows: Vec<(String, String)> = {
+        let conn = db.lock().await;
+        let Ok(mut stmt) =
+            conn.prepare("SELECT key, thumb FROM meta WHERE thumb IS NOT NULL AND thumb != ''")
+        else {
+            return 0;
+        };
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map(|it| it.filter_map(std::result::Result::ok).collect())
+        .unwrap_or_default()
+    };
+
+    let total = rows.len();
+    let mut updated = 0usize;
+
+    let _ = broadcast_event(
+        &event_tx,
+        "skwd.wall.recompute_colors.progress",
+        serde_json::json!({"progress": 0, "total": total}),
+    );
+
+    for (i, (key, thumb_path)) in rows.iter().enumerate() {
+        let tp = thumb_path.clone();
+        let result = tokio::task::spawn_blocking(move || -> Option<(u16, u16, u16)> {
+            let img = image::open(&tp).ok()?;
+            Some(thumb::extract_hue_sat(&img))
+        })
+        .await
+        .ok()
+        .flatten();
+
+        if let Some((hue, sat, richness)) = result {
+            let bucket = thumb::hue_bucket(hue, sat);
+            let conn = db.lock().await;
+            let _ = conn.execute(
+                "UPDATE meta SET hue = ?1, sat = ?2, richness = ?3 WHERE key = ?4",
+                rusqlite::params![i64::from(bucket), i64::from(sat), i64::from(richness), key],
+            );
+            drop(conn);
+            updated += 1;
+        }
+
+        
+        if (i + 1) % 50 == 0 || i + 1 == total {
+            let _ = broadcast_event(
+                &event_tx,
+                "skwd.wall.recompute_colors.progress",
+                serde_json::json!({"progress": i + 1, "total": total}),
+            );
+        }
+    }
+
+    info!("recompute_colors: re-extracted {updated}/{total} entries");
+    let _ = broadcast_event(
+        &event_tx,
+        "skwd.wall.recompute_colors.complete",
+        serde_json::json!({"updated": updated, "total": total}),
+    );
+    updated
+}
+
 pub async fn clean_stale(config: &Config, db: Arc<Mutex<Connection>>) {
     let conn = db.lock().await;
     let Ok(entries) = db::get_cache_entries(&conn) else {
@@ -683,6 +759,7 @@ fn broadcast_item_event(
     mtime: i64,
     hue: i64,
     sat: i64,
+    richness: i64,
 ) -> Result<usize, broadcast::error::SendError<String>> {
     let evt = skwd_proto::Event {
         event: "skwd.wall.cached".to_string(),
@@ -696,6 +773,7 @@ fn broadcast_item_event(
             "mtime": mtime,
             "hue": hue,
             "sat": sat,
+            "richness": richness,
         }),
     };
     let json = serde_json::to_string(&evt).unwrap_or_default();

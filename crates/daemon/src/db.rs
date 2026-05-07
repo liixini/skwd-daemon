@@ -104,6 +104,12 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 
     let _ = conn.execute("ALTER TABLE meta ADD COLUMN weather TEXT", []);
 
+    
+    let _ = conn.execute("ALTER TABLE meta ADD COLUMN richness INTEGER DEFAULT 0", []);
+
+    
+    let _ = conn.execute("ALTER TABLE meta ADD COLUMN apply_count INTEGER DEFAULT 0", []);
+
     Ok(())
 }
 
@@ -193,9 +199,9 @@ pub fn random_pick(
 
 pub fn list_wallpapers(conn: &Connection, favourite_only: bool) -> rusqlite::Result<Vec<serde_json::Value>> {
     let sql = if favourite_only {
-        "SELECT key, name, type, thumb, thumb_sm, favourite, hue, sat, tags, colors, matugen, video_file, we_id, analyzed_by, filesize, width, height, mtime, weather FROM meta WHERE favourite = 1 ORDER BY name"
+        "SELECT key, name, type, thumb, thumb_sm, favourite, hue, sat, tags, colors, matugen, video_file, we_id, analyzed_by, filesize, width, height, mtime, weather, richness, apply_count FROM meta WHERE favourite = 1 ORDER BY name"
     } else {
-        "SELECT key, name, type, thumb, thumb_sm, favourite, hue, sat, tags, colors, matugen, video_file, we_id, analyzed_by, filesize, width, height, mtime, weather FROM meta ORDER BY name"
+        "SELECT key, name, type, thumb, thumb_sm, favourite, hue, sat, tags, colors, matugen, video_file, we_id, analyzed_by, filesize, width, height, mtime, weather, richness, apply_count FROM meta ORDER BY name"
     };
 
     let mut stmt = conn.prepare(sql)?;
@@ -220,6 +226,8 @@ pub fn list_wallpapers(conn: &Connection, favourite_only: bool) -> rusqlite::Res
             "height": row.get::<_, Option<i64>>(16)?,
             "mtime": row.get::<_, Option<i64>>(17)?,
             "weather": row.get::<_, Option<String>>(18)?,
+            "richness": row.get::<_, Option<i64>>(19)?,
+            "apply_count": row.get::<_, Option<i64>>(20)?,
         }))
     })?;
 
@@ -239,17 +247,26 @@ pub fn upsert_cache_entry(
     mtime: i64,
     hue: i64,
     sat: i64,
+    richness: i64,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO meta(key, type, name, thumb, thumb_sm, video_file, we_id, mtime, hue, sat)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO meta(key, type, name, thumb, thumb_sm, video_file, we_id, mtime, hue, sat, richness)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(key) DO UPDATE SET
            type=excluded.type, name=excluded.name, thumb=excluded.thumb,
            thumb_sm=excluded.thumb_sm, video_file=excluded.video_file,
-           we_id=excluded.we_id, mtime=excluded.mtime, hue=excluded.hue, sat=excluded.sat",
-        params![key, wp_type, name, thumb, thumb_sm, video_file, we_id, mtime, hue, sat],
+           we_id=excluded.we_id, mtime=excluded.mtime, hue=excluded.hue, sat=excluded.sat,
+           richness=excluded.richness",
+        params![key, wp_type, name, thumb, thumb_sm, video_file, we_id, mtime, hue, sat, richness],
     )?;
     Ok(())
+}
+
+pub fn bump_apply_count(conn: &Connection, key: &str) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE meta SET apply_count = COALESCE(apply_count, 0) + 1 WHERE key = ?1",
+        params![key],
+    )
 }
 
 pub fn set_favourite(conn: &Connection, key: &str, favourite: bool) -> rusqlite::Result<bool> {
