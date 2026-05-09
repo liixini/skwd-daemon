@@ -8,6 +8,7 @@ url='https://github.com/liixini/skwd-daemon'
 license=('MIT')
 makedepends=('cargo' 'gcc' 'clang' 'pkgconf' 'ffmpeg' 'alsa-lib')
 depends=('gcc-libs' 'imagemagick' 'ffmpeg' 'alsa-lib')
+options=('!debug' '!lto')
 optdepends=(
   'ollama: local LLM for automated wallpaper tagging'
   'steamcmd: Steam Workshop Wallpaper Engine downloads'
