@@ -31,12 +31,17 @@
               ffmpeg
               alsa-lib
               imagemagick
+              wayland
+              wayland-protocols
+              libGL
             ];
 
             runtimeDependencies = with pkgs; [
               ffmpeg
               imagemagick
               alsa-lib
+              wayland
+              libGL
             ];
 
             postInstall = ''

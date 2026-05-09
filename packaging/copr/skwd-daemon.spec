@@ -22,6 +22,10 @@ BuildRequires:  pkgconfig(libavformat)
 BuildRequires:  pkgconfig(libavutil)
 BuildRequires:  pkgconfig(libswscale)
 BuildRequires:  pkgconfig(alsa)
+BuildRequires:  pkgconfig(wayland-client)
+BuildRequires:  pkgconfig(wayland-protocols)
+BuildRequires:  pkgconfig(wayland-egl)
+BuildRequires:  pkgconfig(egl)
 
 Requires:       ImageMagick
 Requires:       /usr/bin/ffmpeg
