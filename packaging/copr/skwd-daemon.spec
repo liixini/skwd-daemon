@@ -34,8 +34,7 @@ Requires:       ImageMagick
 Requires:       /usr/bin/ffmpeg
 Requires:       /usr/bin/ffprobe
 
-Recommends:     ollama
-
+Suggests:       ollama
 Suggests:       steamcmd
 Suggests:       linux-wallpaperengine
 
