@@ -24,6 +24,8 @@ BuildRequires:  pkgconfig(libswscale)
 BuildRequires:  pkgconfig(alsa)
 
 Requires:       ImageMagick
+Requires:       /usr/bin/ffmpeg
+Requires:       /usr/bin/ffprobe
 
 Recommends:     ollama
 
