@@ -33,6 +33,7 @@ build() {
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   export CFLAGS="${CFLAGS//-flto*([^ ])/}"
+  export LIBCLANG_PATH=/usr/lib
   cargo build --frozen --release
 }
 
