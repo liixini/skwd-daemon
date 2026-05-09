@@ -18,8 +18,11 @@ BuildRequires:  pkgconfig
 BuildRequires:  systemd-rpm-macros
 BuildRequires:  clang-devel
 BuildRequires:  pkgconfig(libavcodec)
+BuildRequires:  pkgconfig(libavdevice)
+BuildRequires:  pkgconfig(libavfilter)
 BuildRequires:  pkgconfig(libavformat)
 BuildRequires:  pkgconfig(libavutil)
+BuildRequires:  pkgconfig(libswresample)
 BuildRequires:  pkgconfig(libswscale)
 BuildRequires:  pkgconfig(alsa)
 BuildRequires:  pkgconfig(wayland-client)
