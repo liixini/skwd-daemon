@@ -11,6 +11,19 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
+
+fn outputs_state_lock() -> &'static AsyncMutex<()> {
+    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| AsyncMutex::new(()))
+}
+
+async fn write_outputs_state_atomic(state_path: &Path, contents: &str) {
+    let tmp = state_path.with_extension("json.tmp");
+    if tokio::fs::write(&tmp, contents).await.is_err() {
+        return;
+    }
+    let _ = tokio::fs::rename(&tmp, state_path).await;
+}
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
@@ -34,10 +47,6 @@ impl PaperFleet {
         self.steady = new_steady;
     }
 
-    fn add_transitions(&mut self, mut new: Vec<Child>) {
-        self.transitions.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
-        self.transitions.append(&mut new);
-    }
 }
 
 fn fleet() -> &'static AsyncMutex<PaperFleet> {
@@ -73,6 +82,30 @@ fn video_persist_papers() -> &'static AsyncMutex<HashMap<String, PersistPaper>> 
 fn steady_image_papers() -> &'static AsyncMutex<HashMap<String, PersistPaper>> {
     static S: OnceLock<AsyncMutex<HashMap<String, PersistPaper>>> = OnceLock::new();
     S.get_or_init(|| AsyncMutex::new(HashMap::new()))
+}
+
+struct TransitionOverlayHandle {
+    pid: u32,
+    kill_tx: tokio::sync::oneshot::Sender<()>,
+}
+
+fn transition_overlays() -> &'static AsyncMutex<HashMap<String, TransitionOverlayHandle>> {
+    static T: OnceLock<AsyncMutex<HashMap<String, TransitionOverlayHandle>>> = OnceLock::new();
+    T.get_or_init(|| AsyncMutex::new(HashMap::new()))
+}
+
+async fn drop_transition_overlays_for(targets: &[String]) {
+    let star_mode = targets.iter().any(|o| o == "*");
+    let mut map = transition_overlays().lock().await;
+    let handles: Vec<TransitionOverlayHandle> = if star_mode {
+        map.drain().map(|(_, v)| v).collect()
+    } else {
+        targets.iter().filter_map(|o| map.remove(o)).collect()
+    };
+    drop(map);
+    for h in handles {
+        let _ = h.kill_tx.send(());
+    }
 }
 
 pub async fn drop_steady_image_paper() {
@@ -241,6 +274,81 @@ async fn spawn_steady_image_paper(
     Ok(())
 }
 
+async fn spawn_transition_overlay(
+    bin: &str,
+    output: &str,
+    from_path: &str,
+    to_path: &str,
+    shader: &str,
+    duration_ms: u64,
+    thumbs: &[String],
+    fill_mode: crate::config::FillMode,
+) -> std::io::Result<()> {
+    let from_path = crate::wall::optimized::optimized_or(from_path);
+    let to_path = crate::wall::optimized::optimized_or(to_path);
+    let mut args: Vec<String> = vec![
+        "--transition-from".to_string(),
+        from_path,
+        "--shader".to_string(),
+        shader.to_string(),
+        "--duration-ms".to_string(),
+        duration_ms.to_string(),
+        "--fill-mode".to_string(),
+        fill_mode.as_arg().to_string(),
+        "--layer".to_string(),
+        "bottom".to_string(),
+    ];
+    if !thumbs.is_empty() {
+        args.push("--thumbs".to_string());
+        args.push(thumbs.join(","));
+    }
+    args.push(output.to_string());
+    args.push(to_path);
+
+    let mut cmd = Command::new(bin);
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(paper_stderr());
+    cmd.as_std_mut().process_group(0);
+    cmd.kill_on_drop(false);
+    let mut child = cmd.spawn()?;
+    let pid = match child.id() {
+        Some(p) => p,
+        None => return Err(std::io::Error::other("transition overlay: missing pid")),
+    };
+    let notify = Arc::new(Notify::new());
+    ready_registry().lock().await.insert(pid, notify.clone());
+    let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+    let output_owned = output.to_string();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = child.wait() => {}
+            _ = kill_rx => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+        }
+        let mut map = transition_overlays().lock().await;
+        if let Some(h) = map.get(&output_owned)
+            && h.pid == pid
+        {
+            map.remove(&output_owned);
+        }
+    });
+    if let Some(prev) = transition_overlays()
+        .lock()
+        .await
+        .insert(output.to_string(), TransitionOverlayHandle { pid, kill_tx })
+    {
+        let _ = prev.kill_tx.send(());
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(2500), notify.notified()).await;
+    ready_registry().lock().await.remove(&pid);
+    info!(pid, output = %output, "transition overlay: spawned");
+    Ok(())
+}
+
 async fn ensure_steady_image_paper(
     bin: &str,
     outputs: &[String],
@@ -305,23 +413,6 @@ async fn persist_alive_outputs(target_outs: &[String]) -> HashSet<String> {
     alive
 }
 
-async fn await_ready_for_pid(pid: u32, timeout_ms: u64) -> bool {
-    let notify = Arc::new(Notify::new());
-    {
-        let mut reg = ready_registry().lock().await;
-        reg.insert(pid, notify.clone());
-    }
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms),
-        notify.notified(),
-    )
-    .await
-    .is_ok();
-    let mut reg = ready_registry().lock().await;
-    reg.remove(&pid);
-    result
-}
-
 async fn video_persist_pid_for(output: &str) -> Option<u32> {
     let mut map = video_persist_papers().lock().await;
     let p = map.get_mut(output)?;
@@ -339,6 +430,7 @@ async fn try_send_video_persist(output: &str, to_path: &str, mute: bool) -> bool
         map.remove(output);
         return false;
     }
+    let to_path = crate::wall::optimized::optimized_or(to_path);
     let cmd = serde_json::json!({"path": to_path, "mute": mute});
     let line = format!("{}\n", cmd);
     if let Err(e) = p.stdin.write_all(line.as_bytes()).await {
@@ -365,12 +457,13 @@ async fn spawn_video_persist_paper(
     mpv_opts: &str,
     fill_mode: crate::config::FillMode,
 ) -> std::io::Result<Option<u32>> {
+    let file_path = crate::wall::optimized::optimized_or(file_path);
     let args: Vec<String> = vec![
         "--persist".to_string(),
         "--fill-mode".to_string(),
         fill_mode.as_arg().to_string(),
         output.to_string(),
-        file_path.to_string(),
+        file_path,
         "-o".to_string(),
         mpv_opts.to_string(),
     ];
@@ -405,64 +498,95 @@ pub async fn drop_persist_paper() {
     }
 }
 
-async fn drop_persist_papers_for(targets: &[String]) {
-    let mut map = persist_papers().lock().await;
-    if targets.iter().any(|o| o == "*") {
-        for (_, mut p) in map.drain() {
-            let _ = p.child.start_kill();
-        }
+async fn await_dead_papers(dead: Vec<Child>) {
+    if dead.is_empty() {
         return;
     }
-    for out in targets {
-        if let Some(mut p) = map.remove(out) {
-            let _ = p.child.start_kill();
-        }
+    let mut set = JoinSet::new();
+    for mut c in dead {
+        set.spawn(async move {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), c.wait()).await;
+        });
     }
+    while set.join_next().await.is_some() {}
+}
+
+async fn drop_persist_papers_for(targets: &[String]) {
+    let dead: Vec<Child> = {
+        let mut map = persist_papers().lock().await;
+        let mut dead: Vec<Child> = Vec::new();
+        if targets.iter().any(|o| o == "*") {
+            for (_, mut p) in map.drain() {
+                let _ = p.child.start_kill();
+                dead.push(p.child);
+            }
+        } else {
+            if let Some(mut p) = map.remove("*") {
+                let _ = p.child.start_kill();
+                dead.push(p.child);
+            }
+            for out in targets {
+                if let Some(mut p) = map.remove(out) {
+                    let _ = p.child.start_kill();
+                    dead.push(p.child);
+                }
+            }
+        }
+        dead
+    };
+    await_dead_papers(dead).await;
 }
 
 async fn drop_video_persist_papers_for(targets: &[String]) {
-    let mut map = video_persist_papers().lock().await;
-    if targets.iter().any(|o| o == "*") {
-        for (_, mut p) in map.drain() {
-            let _ = p.child.start_kill();
+    let dead: Vec<Child> = {
+        let mut map = video_persist_papers().lock().await;
+        let mut dead: Vec<Child> = Vec::new();
+        if targets.iter().any(|o| o == "*") {
+            for (_, mut p) in map.drain() {
+                let _ = p.child.start_kill();
+                dead.push(p.child);
+            }
+        } else {
+            if let Some(mut p) = map.remove("*") {
+                let _ = p.child.start_kill();
+                dead.push(p.child);
+            }
+            for out in targets {
+                if let Some(mut p) = map.remove(out) {
+                    let _ = p.child.start_kill();
+                    dead.push(p.child);
+                }
+            }
         }
-        return;
-    }
-    for out in targets {
-        if let Some(mut p) = map.remove(out) {
-            let _ = p.child.start_kill();
-        }
-    }
+        dead
+    };
+    await_dead_papers(dead).await;
 }
 
 async fn drop_steady_image_papers_for(targets: &[String]) {
-    let mut map = steady_image_papers().lock().await;
-    if targets.iter().any(|o| o == "*") {
-        for (_, mut p) in map.drain() {
-            let _ = p.child.start_kill();
-        }
-        return;
-    }
-    for out in targets {
-        if let Some(mut p) = map.remove(out) {
-            let _ = p.child.start_kill();
-        }
-    }
-}
-
-async fn prune_persist_papers(targets: &[String]) {
-    let star_mode = targets.iter().any(|o| o == "*");
-    let mut map = persist_papers().lock().await;
-    if star_mode {
-        let to_drop: Vec<String> = map.keys().filter(|k| *k != "*").cloned().collect();
-        for k in to_drop {
-            if let Some(mut p) = map.remove(&k) {
+    let dead: Vec<Child> = {
+        let mut map = steady_image_papers().lock().await;
+        let mut dead: Vec<Child> = Vec::new();
+        if targets.iter().any(|o| o == "*") {
+            for (_, mut p) in map.drain() {
                 let _ = p.child.start_kill();
+                dead.push(p.child);
+            }
+        } else {
+            if let Some(mut p) = map.remove("*") {
+                let _ = p.child.start_kill();
+                dead.push(p.child);
+            }
+            for out in targets {
+                if let Some(mut p) = map.remove(out) {
+                    let _ = p.child.start_kill();
+                    dead.push(p.child);
+                }
             }
         }
-    } else if let Some(mut p) = map.remove("*") {
-        let _ = p.child.start_kill();
-    }
+        dead
+    };
+    await_dead_papers(dead).await;
 }
 
 async fn prune_steady_image_papers(targets: &[String]) {
@@ -499,6 +623,7 @@ async fn try_send_persist(
         map.remove(output);
         return false;
     }
+    let to_path = crate::wall::optimized::optimized_or(to_path);
     let mut cmd = serde_json::json!({
         "to": to_path,
         "shader": shader,
@@ -542,9 +667,11 @@ async fn spawn_persist_paper(
     mute: bool,
     volume: u32,
 ) -> std::io::Result<()> {
+    let from_path = crate::wall::optimized::optimized_or(from_path);
+    let to_path = crate::wall::optimized::optimized_or(to_path);
     let mut args: Vec<String> = vec![
         "--transition-from".to_string(),
-        from_path.to_string(),
+        from_path,
         "--shader".to_string(),
         shader.to_string(),
         "--duration-ms".to_string(),
@@ -562,7 +689,7 @@ async fn spawn_persist_paper(
         args.push(thumbs.join(","));
     }
     args.push(output.to_string());
-    args.push(to_path.to_string());
+    args.push(to_path);
 
     let mut cmd = Command::new(bin);
     cmd.args(&args)
@@ -684,15 +811,17 @@ pub async fn apply_static(
     path: &str,
     outputs: &[String],
     neighbors: &[String],
+    all_screens: &[String],
     config: &Config,
 ) -> anyhow::Result<()> {
-    apply_static_inner(path, outputs, neighbors, config, false).await
+    apply_static_inner(path, outputs, neighbors, all_screens, config, false).await
 }
 
 async fn apply_static_inner(
     path: &str,
     outputs: &[String],
     neighbors: &[String],
+    all_screens: &[String],
     config: &Config,
     restoring: bool,
 ) -> anyhow::Result<()> {
@@ -731,12 +860,28 @@ async fn apply_static_inner(
         fleet().lock().await.replace_steady(Vec::new());
         run_sh(&format!("plasma-apply-wallpaperimage {}", shell_quote(path))).await?;
     } else {
+        let still_bin = paper_still_bin();
         let bin = paper_bin();
         let target_outs: Vec<String> = if outputs.is_empty() {
             vec!["*".to_string()]
         } else {
             outputs.to_vec()
         };
+        let target_is_wildcard = target_outs.iter().any(|o| o == "*");
+
+        let pre_state = read_outputs_state(&config.cache_dir()).await;
+        let prev_wildcard_static: Option<String> = if !target_is_wildcard {
+            pre_state
+                .get("*")
+                .and_then(|v| v.as_object())
+                .filter(|m| {
+                    m.get("type").and_then(|t| t.as_str()) == Some("static")
+                })
+                .and_then(|m| m.get("path").and_then(|p| p.as_str()).map(String::from))
+        } else {
+            None
+        };
+
         rebuild_scene_we(
             config,
             &target_outs,
@@ -746,6 +891,39 @@ async fn apply_static_inner(
         .await
         .ok();
         drop_video_persist_papers_for(&target_outs).await;
+        drop_persist_papers_for(&target_outs).await;
+        drop_transition_overlays_for(&target_outs).await;
+
+        if let Some(prev_path) = prev_wildcard_static.as_deref()
+            && !all_screens.is_empty()
+        {
+            let target_set: std::collections::HashSet<&str> =
+                target_outs.iter().map(String::as_str).collect();
+            let carry_over: Vec<String> = all_screens
+                .iter()
+                .filter(|s| !target_set.contains(s.as_str()))
+                .cloned()
+                .collect();
+            if !carry_over.is_empty() {
+                info!(
+                    carry_over = ?carry_over,
+                    prev = %prev_path,
+                    "static apply: carrying wildcard image to un-targeted monitors"
+                );
+                for out in &carry_over {
+                    if let Err(e) = spawn_steady_image_paper(
+                        &still_bin,
+                        out,
+                        prev_path,
+                        config.display.fill_mode,
+                    )
+                    .await
+                    {
+                        warn!(error = %e, output = %out, "carry-over steady spawn failed");
+                    }
+                }
+            }
+        }
 
         let prev_for_transition = if restoring || !config.transition.enabled {
             None
@@ -756,111 +934,39 @@ async fn apply_static_inner(
                 .map(|p| p.to_string())
         };
 
-        let persist_eligible = !restoring
-            && config.transition.enabled
-            && prev_for_transition.is_some();
-
-        if persist_eligible {
-            let prev = prev_for_transition.as_deref().unwrap();
-            let thumbs = pick_thumbs(neighbors, &config.wallpaper_dir(), &[prev, path], 20).await;
-            let shader = config.transition.shader.clone();
-            let duration_ms = config.transition.duration_ms;
-
-            prune_persist_papers(&target_outs).await;
-
-            let mut all_ok = true;
-            let mut any_reused = false;
-            let mut any_spawned = false;
-            for out in &target_outs {
-                if try_send_persist(out, path, &shader, duration_ms, &thumbs, None, None).await {
-                    any_reused = true;
-                    continue;
-                }
-                match spawn_persist_paper(&bin, out, prev, path, &shader, duration_ms, &thumbs, config.display.fill_mode, true, 0)
-                    .await
-                {
-                    Ok(()) => any_spawned = true,
-                    Err(e) => {
-                        warn!(error = %e, output = %out, "persist: spawn failed");
-                        all_ok = false;
-                        break;
-                    }
-                }
-            }
-
-            if all_ok {
-                let prev_steady = std::mem::take(&mut fleet().lock().await.steady);
-                for mut c in prev_steady {
-                    let _ = c.start_kill();
-                }
-                drop_steady_image_papers_for(&target_outs).await;
-                if prev_was_we {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    kill_legacy_video_procs().await;
-                }
-                let current_dir = config.cache_dir().join("wallpaper");
-                let _ = tokio::fs::create_dir_all(&current_dir).await;
-                let wall_jpg = current_dir.join("current.jpg");
-                let _ = tokio::fs::copy(path, &wall_jpg).await;
-                save_state(&config.cache_dir(), "static", path, "").await;
-                save_outputs_state(&config.cache_dir(), &target_outs, "static", path, "", &HashMap::new()).await;
-                let path_owned = path.to_string();
-                let config_clone = config.clone();
-                tokio::spawn(async move {
-                    let _ = matugen_handle.await;
-                    run_post_processing(&config_clone, "static", &basename(&path_owned), &path_owned, &path_owned, restoring).await;
-                    info!("post-apply tasks done for static (persist): {path_owned}");
-                });
-                info!(
-                    total_ms = apply_total.elapsed().as_millis() as u64,
-                    lock_wait_ms,
-                    reused = any_reused,
-                    spawned = any_spawned,
-                    outputs = target_outs.len(),
-                    "applied static wallpaper (persist)"
-                );
-                return Ok(());
-            } else {
-                drop_persist_paper().await;
-                warn!("persist: partial failure, falling back to legacy");
-            }
-        }
-
-        let mut cold_persist_spawned = false;
         if let Some(prev) = prev_for_transition.as_deref() {
-            let thumbs = pick_thumbs(neighbors, &config.wallpaper_dir(), &[prev, path], 20).await;
+            let thumbs =
+                pick_thumbs(neighbors, &config.wallpaper_dir(), &[prev, path], 20).await;
             let shader = config.transition.shader.clone();
             let dur_ms = config.transition.duration_ms;
             for out in &target_outs {
-                match spawn_persist_paper(
-                    &bin, out, prev, path, &shader, dur_ms, &thumbs, config.display.fill_mode, true, 0,
+                if let Err(e) = spawn_transition_overlay(
+                    &bin,
+                    out,
+                    prev,
+                    path,
+                    &shader,
+                    dur_ms,
+                    &thumbs,
+                    config.display.fill_mode,
                 )
                 .await
                 {
-                    Ok(()) => cold_persist_spawned = true,
-                    Err(e) => warn!(error = %e, output = %out, "static cold persist spawn failed"),
+                    warn!(error = %e, output = %out, "transition overlay spawn failed");
                 }
             }
         }
 
-        if cold_persist_spawned {
-            drop_steady_image_papers_for(&target_outs).await;
-            let prev_steady = std::mem::take(&mut fleet().lock().await.steady);
-            for mut c in prev_steady {
-                let _ = c.start_kill();
-            }
-            info!("apply_static legacy: cold-spawned persist transition_paper");
-        } else {
-            ensure_steady_image_paper(&bin, &target_outs, path, config.display.fill_mode).await;
-            let prev_steady = std::mem::take(&mut fleet().lock().await.steady);
-            for mut c in prev_steady {
-                let _ = c.start_kill();
-            }
-            info!("apply_static legacy: steady_image_paper only (no transition)");
+        ensure_steady_image_paper(&still_bin, &target_outs, path, config.display.fill_mode).await;
+        let prev_steady = std::mem::take(&mut fleet().lock().await.steady);
+        for mut c in prev_steady {
+            let _ = c.start_kill();
         }
+
         if prev_was_we {
             kill_legacy_video_procs().await;
         }
+        info!("apply_static: skwd-paper-still + bottom-layer transition");
     }
 
     let current_dir = config.cache_dir().join("wallpaper");
@@ -869,7 +975,13 @@ async fn apply_static_inner(
     let _ = tokio::fs::copy(path, &wall_jpg).await;
 
     save_state(&config.cache_dir(), "static", path, "").await;
+    let prev_outputs_state = read_outputs_state(&config.cache_dir()).await;
     save_outputs_state(&config.cache_dir(), outputs, "static", path, "", &HashMap::new()).await;
+    if !outputs.is_empty() && !outputs.iter().any(|o| o == "*") {
+        mute_wildcard_if_present(config).await;
+    }
+    preserve_group_audio(config, &prev_outputs_state).await;
+    enforce_audio_dedup(config).await;
 
     let path = path.to_string();
     let config = config.clone();
@@ -891,10 +1003,12 @@ pub async fn apply_video(
     path: &str,
     outputs: &[String],
     neighbors: &[String],
+    all_screens: &[String],
     outputs_audio: &HashMap<String, bool>,
     outputs_volume: &HashMap<String, u32>,
     config: &Config,
 ) -> anyhow::Result<()> {
+    let _ = all_screens;
     apply_video_inner(path, outputs, neighbors, outputs_audio, outputs_volume, config, false).await
 }
 
@@ -1009,11 +1123,12 @@ async fn apply_video_inner(
             && !restoring
             && prev_image.as_deref().filter(|p| Path::new(p).exists()).is_some();
 
+        let restore_via_transition = restoring && !thumb_str.is_empty();
         let mut video_persist_ok = !restoring;
         let mut cold_video_pids: Vec<u32> = Vec::new();
         if transition_handles {
             drop_video_persist_papers_for(&target_outs).await;
-        } else {
+        } else if !restore_via_transition {
             for out in &target_outs {
                 if !video_alive.contains(out) {
                     let mpv_opts = build_mpv_opts(mute_for(out), volume_for(out));
@@ -1033,12 +1148,14 @@ async fn apply_video_inner(
             }
         }
 
-        let to_image = if !restoring && config.transition.enabled {
+        let to_image = if (config.transition.enabled && !restoring) || restore_via_transition {
             Some(path.to_string())
         } else {
             None
         };
-        let prev_for_transition = if restoring || !config.transition.enabled {
+        let prev_for_transition = if restore_via_transition {
+            Some(thumb_str.clone())
+        } else if !config.transition.enabled || restoring {
             None
         } else {
             prev_image
@@ -1083,7 +1200,7 @@ async fn apply_video_inner(
             && let (Some(prev), Some(new_img)) = (prev_for_transition.as_deref(), to_image.as_deref()) {
             let thumbs = pick_thumbs(neighbors, &config.wallpaper_dir(), &[prev, new_img], 20).await;
             let shader = config.transition.shader.clone();
-            let dur_ms = config.transition.duration_ms;
+            let dur_ms = if restore_via_transition { 1 } else { config.transition.duration_ms };
             for out in &target_outs {
                 let m = mute_for(out);
                 match spawn_persist_paper(
@@ -1104,7 +1221,7 @@ async fn apply_video_inner(
             !transitions.is_empty() || image_persist_handled_transition || cold_persist_spawned;
         let scheduled_transitions: Vec<Child> = std::mem::take(&mut transitions);
 
-        if video_persist_ok {
+        if video_persist_ok || restore_via_transition {
             let prev_steady = std::mem::take(&mut fleet().lock().await.steady);
             for mut c in prev_steady {
                 let _ = c.start_kill();
@@ -1284,7 +1401,13 @@ async fn apply_video_inner(
     }
 
     save_state(&config.cache_dir(), "video", path, "").await;
+    let prev_outputs_state = read_outputs_state(&config.cache_dir()).await;
     save_outputs_state(&config.cache_dir(), outputs, "video", path, "", &dedup_mute).await;
+    if !outputs.is_empty() && !outputs.iter().any(|o| o == "*") {
+        mute_wildcard_if_present(config).await;
+    }
+    preserve_group_audio(config, &prev_outputs_state).await;
+    enforce_audio_dedup(config).await;
 
     let path = path.to_string();
     let config = config.clone();
@@ -1498,7 +1621,13 @@ async fn apply_we_inner(
     }
 
     save_state(&config.cache_dir(), "we", &preview_str, we_id).await;
+    let prev_outputs_state = read_outputs_state(&config.cache_dir()).await;
     save_outputs_state(&config.cache_dir(), screens, "we", &preview_str, we_id, &dedup_mute).await;
+    if !screens.is_empty() && !screens.iter().any(|o| o == "*") {
+        mute_wildcard_if_present(config).await;
+    }
+    preserve_group_audio(config, &prev_outputs_state).await;
+    enforce_audio_dedup(config).await;
 
     let config = config.clone();
     let item_dir = item_dir.clone();
@@ -1533,6 +1662,8 @@ pub async fn restore(config: &Config) -> anyhow::Result<String> {
     if !map.is_empty() {
         let mut groups: std::collections::HashMap<(String, String, String), Vec<String>> =
             std::collections::HashMap::new();
+        let mut audio_by_output: HashMap<String, bool> = HashMap::new();
+        let mut volume_by_output: HashMap<String, u32> = HashMap::new();
         for (output, entry) in &map {
             let wp_type = entry
                 .get("type")
@@ -1549,6 +1680,12 @@ pub async fn restore(config: &Config) -> anyhow::Result<String> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            if let Some(m) = entry.get("mute").and_then(|v| v.as_bool()) {
+                audio_by_output.insert(output.clone(), m);
+            }
+            if let Some(v) = entry.get("volume").and_then(|v| v.as_u64()) {
+                volume_by_output.insert(output.clone(), v.min(100) as u32);
+            }
             groups
                 .entry((wp_type, path, we_id))
                 .or_default()
@@ -1560,19 +1697,27 @@ pub async fn restore(config: &Config) -> anyhow::Result<String> {
             let outputs_arg: Vec<String> = if outs.iter().any(|o| o == "*") {
                 Vec::new()
             } else {
-                outs
+                outs.clone()
             };
+            let audio_arg: HashMap<String, bool> = outs
+                .iter()
+                .filter_map(|o| audio_by_output.get(o).map(|&v| (o.clone(), v)))
+                .collect();
+            let volume_arg: HashMap<String, u32> = outs
+                .iter()
+                .filter_map(|o| volume_by_output.get(o).map(|&v| (o.clone(), v)))
+                .collect();
             last_id = match wp_type.as_str() {
                 "static" if !path.is_empty() => {
-                    apply_static_inner(&path, &outputs_arg, &[], config, true).await?;
+                    apply_static_inner(&path, &outputs_arg, &[], &[], config, true).await?;
                     path
                 }
                 "video" if !path.is_empty() => {
-                    apply_video_inner(&path, &outputs_arg, &[], &HashMap::new(), &HashMap::new(), config, true).await?;
+                    apply_video_inner(&path, &outputs_arg, &[], &audio_arg, &volume_arg, config, true).await?;
                     path
                 }
                 "we" if !we_id.is_empty() => {
-                    apply_we_inner(&we_id, &outputs_arg, &HashMap::new(), &HashMap::new(), config, true).await?;
+                    apply_we_inner(&we_id, &outputs_arg, &audio_arg, &volume_arg, config, true).await?;
                     we_id
                 }
                 _ => continue,
@@ -1597,7 +1742,7 @@ pub async fn restore(config: &Config) -> anyhow::Result<String> {
             if path.is_empty() {
                 anyhow::bail!("no path in state");
             }
-            apply_static_inner(path, &[], &[], config, true).await?;
+            apply_static_inner(path, &[], &[], &[], config, true).await?;
             Ok(path.to_string())
         }
         "video" => {
@@ -1620,16 +1765,79 @@ pub async fn restore(config: &Config) -> anyhow::Result<String> {
     }
 }
 
-pub async fn retheme(config: &Config, scheme: Option<&str>, mode: Option<&str>) -> anyhow::Result<()> {
+pub async fn retheme(
+    config: &Config,
+    scheme: Option<&str>,
+    mode: Option<&str>,
+    color_index: Option<u32>,
+) -> anyhow::Result<()> {
     let current_jpg = config.cache_dir().join("wallpaper/current.jpg");
     if !current_jpg.exists() {
         anyhow::bail!("no current wallpaper image to retheme");
     }
     let image_path = current_jpg.display().to_string();
-    run_matugen_with(&image_path, config, scheme, mode).await;
+    run_matugen_with(&image_path, config, scheme, mode, color_index).await;
     run_reloads(config).await;
     info!("retheme completed for {image_path}");
     Ok(())
+}
+
+pub async fn theme_preview(
+    config: &Config,
+    scheme: &str,
+    mode: &str,
+    color_index: u32,
+) -> anyhow::Result<serde_json::Value> {
+    let current_jpg = config.cache_dir().join("wallpaper/current.jpg");
+    if !current_jpg.exists() {
+        anyhow::bail!("no current wallpaper image for preview");
+    }
+    let out = Command::new("matugen")
+        .arg("--dry-run")
+        .arg("-j")
+        .arg("hex")
+        .arg("image")
+        .arg("-t")
+        .arg(scheme)
+        .arg("-m")
+        .arg(mode)
+        .arg("--source-color-index")
+        .arg(color_index.to_string())
+        .arg(current_jpg.display().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !out.status.success() {
+        let err_msg = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "matugen preview failed: status {} stderr={}",
+            out.status,
+            err_msg.trim()
+        );
+    }
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    let pick = |key: &str| -> String {
+        json.get("colors")
+            .and_then(|c| c.get(key))
+            .and_then(|e| e.get("default"))
+            .and_then(|d| d.get("color"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    Ok(serde_json::json!({
+        "scheme": scheme,
+        "mode": mode,
+        "color_index": color_index,
+        "primary": pick("primary"),
+        "secondary": pick("secondary"),
+        "tertiary": pick("tertiary"),
+        "surface": pick("surface"),
+        "background": pick("background"),
+        "on_surface": pick("on_surface"),
+    }))
 }
 
 
@@ -1711,20 +1919,35 @@ async fn run_matugen(image_path: &str, config: &Config) {
     let config_path = generate_matugen_config(config).await;
     let scheme = config.matugen_scheme();
     let mode = config.matugen_mode();
-    run_matugen_inner(image_path, config, &config_path, scheme, mode).await;
+    let color_index = config.matugen_color_index();
+    run_matugen_inner(image_path, config, &config_path, scheme, mode, color_index).await;
 }
 
-async fn run_matugen_with(image_path: &str, config: &Config, scheme: Option<&str>, mode: Option<&str>) {
+async fn run_matugen_with(
+    image_path: &str,
+    config: &Config,
+    scheme: Option<&str>,
+    mode: Option<&str>,
+    color_index: Option<u32>,
+) {
     if !config.features.matugen {
         return;
     }
     let config_path = generate_matugen_config(config).await;
     let scheme = scheme.unwrap_or_else(|| config.matugen_scheme());
     let mode = mode.unwrap_or_else(|| config.matugen_mode());
-    run_matugen_inner(image_path, config, &config_path, scheme, mode).await;
+    let color_index = color_index.unwrap_or_else(|| config.matugen_color_index());
+    run_matugen_inner(image_path, config, &config_path, scheme, mode, color_index).await;
 }
 
-async fn run_matugen_inner(image_path: &str, config: &Config, config_path: &Path, scheme: &str, mode: &str) {
+async fn run_matugen_inner(
+    image_path: &str,
+    config: &Config,
+    config_path: &Path,
+    scheme: &str,
+    mode: &str,
+    color_index: u32,
+) {
     let status = Command::new("matugen")
         .arg("-c")
         .arg(&config_path)
@@ -1734,7 +1957,7 @@ async fn run_matugen_inner(image_path: &str, config: &Config, config_path: &Path
         .arg("-m")
         .arg(mode)
         .arg("--source-color-index")
-        .arg("0")
+        .arg(color_index.to_string())
         .arg(image_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1798,7 +2021,13 @@ async fn find_we_preview(item_dir: &Path) -> Option<PathBuf> {
 }
 
 
-pub async fn set_audio(mute: Option<bool>, volume: Option<u32>) {
+pub async fn set_audio_for(
+    config: &Config,
+    mute: Option<bool>,
+    volume: Option<u32>,
+    outputs: Option<Vec<String>>,
+) {
+    let cache_dir = config.cache_dir();
     let mut payload = serde_json::Map::new();
     payload.insert("to".into(), serde_json::json!(""));
     if let Some(m) = mute {
@@ -1809,10 +2038,17 @@ pub async fn set_audio(mute: Option<bool>, volume: Option<u32>) {
     }
     let line = format!("{}\n", serde_json::Value::Object(payload));
 
+    let filter: Option<HashSet<String>> = outputs.map(|v| v.into_iter().collect());
+
     {
         let mut map = persist_papers().lock().await;
-        let outputs: Vec<String> = map.keys().cloned().collect();
-        for out in outputs {
+        let keys: Vec<String> = map.keys().cloned().collect();
+        for out in keys {
+            if let Some(ref f) = filter
+                && !f.contains(&out)
+            {
+                continue;
+            }
             if let Some(p) = map.get_mut(&out)
                 && p.stdin.write_all(line.as_bytes()).await.is_err()
             {
@@ -1825,8 +2061,13 @@ pub async fn set_audio(mute: Option<bool>, volume: Option<u32>) {
     }
     {
         let mut map = video_persist_papers().lock().await;
-        let outputs: Vec<String> = map.keys().cloned().collect();
-        for out in outputs {
+        let keys: Vec<String> = map.keys().cloned().collect();
+        for out in keys {
+            if let Some(ref f) = filter
+                && !f.contains(&out)
+            {
+                continue;
+            }
             if let Some(p) = map.get_mut(&out)
                 && p.stdin.write_all(line.as_bytes()).await.is_err()
             {
@@ -1837,6 +2078,345 @@ pub async fn set_audio(mute: Option<bool>, volume: Option<u32>) {
             }
         }
     }
+
+    if mute.is_some() || volume.is_some() {
+        update_outputs_state_audio(&cache_dir, &filter, mute, volume).await;
+
+        let we_affected = we_outputs_in_filter(&cache_dir, &filter).await;
+        if we_affected {
+            let global_volume = volume.unwrap_or_else(|| config.volume());
+            let _ = rebuild_scene_we(
+                config,
+                &[],
+                &std::collections::BTreeMap::new(),
+                global_volume,
+            )
+            .await;
+        }
+    }
+
+    enforce_audio_dedup(config).await;
+}
+
+async fn preserve_group_audio(config: &Config, prev_state: &serde_json::Value) {
+    let mut prev_audible: HashSet<(String, String, String)> = HashSet::new();
+    if let Some(obj) = prev_state.as_object() {
+        for (_, entry) in obj {
+            let muted = entry
+                .get("mute")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if muted {
+                continue;
+            }
+            let t = entry
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if t != "video" && t != "we" {
+                continue;
+            }
+            let path = entry
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let we_id = entry
+                .get("we_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            prev_audible.insert((t, path, we_id));
+        }
+    }
+
+    if prev_audible.is_empty() {
+        return;
+    }
+
+    let cache_dir = config.cache_dir();
+    let current = read_outputs_state(&cache_dir).await;
+    let map = match current.as_object() {
+        Some(m) => m.clone(),
+        None => return,
+    };
+
+    let mut current_groups: HashMap<(String, String, String), Vec<(String, bool)>> = HashMap::new();
+    for (out, entry) in &map {
+        let t = entry
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if t != "video" && t != "we" {
+            continue;
+        }
+        let path = entry
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let we_id = entry
+            .get("we_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let muted = entry
+            .get("mute")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        current_groups
+            .entry((t, path, we_id))
+            .or_default()
+            .push((out.clone(), muted));
+    }
+
+    let mut to_unmute: Vec<String> = Vec::new();
+    for (key, mut outputs) in current_groups {
+        if !prev_audible.contains(&key) {
+            continue;
+        }
+        if outputs.iter().any(|(_, m)| !m) {
+            continue;
+        }
+        outputs.sort_by(|a, b| a.0.cmp(&b.0));
+        if let Some((out, _)) = outputs.first() {
+            to_unmute.push(out.clone());
+        }
+    }
+
+    if to_unmute.is_empty() {
+        return;
+    }
+
+    let payload = serde_json::json!({"to": "", "mute": false});
+    let line = format!("{}\n", payload);
+    let unmute_set: HashSet<String> = to_unmute.iter().cloned().collect();
+
+    {
+        let mut map_p = persist_papers().lock().await;
+        let keys: Vec<String> = map_p.keys().cloned().collect();
+        for out in keys {
+            if !unmute_set.contains(&out) {
+                continue;
+            }
+            if let Some(p) = map_p.get_mut(&out) {
+                let _ = p.stdin.write_all(line.as_bytes()).await;
+                let _ = p.stdin.flush().await;
+            }
+        }
+    }
+    {
+        let mut map_p = video_persist_papers().lock().await;
+        let keys: Vec<String> = map_p.keys().cloned().collect();
+        for out in keys {
+            if !unmute_set.contains(&out) {
+                continue;
+            }
+            if let Some(p) = map_p.get_mut(&out) {
+                let _ = p.stdin.write_all(line.as_bytes()).await;
+                let _ = p.stdin.flush().await;
+            }
+        }
+    }
+
+    let filter = Some(unmute_set.clone());
+    update_outputs_state_audio(&cache_dir, &filter, Some(false), None).await;
+
+    let any_we = to_unmute.iter().any(|out| {
+        map.get(out)
+            .and_then(|e| e.get("type"))
+            .and_then(|v| v.as_str())
+            == Some("we")
+    });
+    if any_we {
+        let _ = rebuild_scene_we(
+            config,
+            &[],
+            &std::collections::BTreeMap::new(),
+            config.volume(),
+        )
+        .await;
+    }
+}
+
+pub async fn enforce_audio_dedup(config: &Config) {
+    let cache_dir = config.cache_dir();
+    let state = read_outputs_state(&cache_dir).await;
+    let map = match state.as_object() {
+        Some(m) => m.clone(),
+        None => return,
+    };
+
+    let mut groups: HashMap<(String, String, String), Vec<String>> = HashMap::new();
+    for (out, entry) in &map {
+        let t = entry
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if t != "video" && t != "we" {
+            continue;
+        }
+        let path = entry
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let we_id = entry
+            .get("we_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        groups
+            .entry((t, path, we_id))
+            .or_default()
+            .push(out.clone());
+    }
+
+    let mut to_mute: Vec<String> = Vec::new();
+    for (_, mut outputs) in groups {
+        outputs.sort();
+        let mut found_primary = false;
+        for out in &outputs {
+            let muted = map
+                .get(out)
+                .and_then(|e| e.get("mute"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if !muted {
+                if !found_primary {
+                    found_primary = true;
+                } else {
+                    to_mute.push(out.clone());
+                }
+            }
+        }
+    }
+
+    if to_mute.is_empty() {
+        return;
+    }
+
+    let payload = serde_json::json!({"to": "", "mute": true});
+    let line = format!("{}\n", payload);
+    let mute_set: HashSet<String> = to_mute.iter().cloned().collect();
+
+    {
+        let mut map_p = persist_papers().lock().await;
+        let keys: Vec<String> = map_p.keys().cloned().collect();
+        for out in keys {
+            if !mute_set.contains(&out) {
+                continue;
+            }
+            if let Some(p) = map_p.get_mut(&out) {
+                let _ = p.stdin.write_all(line.as_bytes()).await;
+                let _ = p.stdin.flush().await;
+            }
+        }
+    }
+    {
+        let mut map_p = video_persist_papers().lock().await;
+        let keys: Vec<String> = map_p.keys().cloned().collect();
+        for out in keys {
+            if !mute_set.contains(&out) {
+                continue;
+            }
+            if let Some(p) = map_p.get_mut(&out) {
+                let _ = p.stdin.write_all(line.as_bytes()).await;
+                let _ = p.stdin.flush().await;
+            }
+        }
+    }
+
+    let filter = Some(mute_set.clone());
+    update_outputs_state_audio(&cache_dir, &filter, Some(true), None).await;
+
+    let any_we = to_mute.iter().any(|out| {
+        map.get(out)
+            .and_then(|e| e.get("type"))
+            .and_then(|v| v.as_str())
+            == Some("we")
+    });
+    if any_we {
+        let _ = rebuild_scene_we(
+            config,
+            &[],
+            &std::collections::BTreeMap::new(),
+            config.volume(),
+        )
+        .await;
+    }
+}
+
+async fn mute_wildcard_if_present(config: &Config) {
+    let state = read_outputs_state(&config.cache_dir()).await;
+    let has_star = state
+        .as_object()
+        .map(|m| m.contains_key("*"))
+        .unwrap_or(false);
+    if !has_star {
+        return;
+    }
+    set_audio_for(config, Some(true), None, Some(vec!["*".to_string()])).await;
+}
+
+async fn we_outputs_in_filter(cache_dir: &Path, filter: &Option<HashSet<String>>) -> bool {
+    let existing = read_outputs_state(cache_dir).await;
+    let Some(obj) = existing.as_object() else {
+        return false;
+    };
+    for (out, entry) in obj {
+        if let Some(f) = filter.as_ref()
+            && !f.contains(out)
+        {
+            continue;
+        }
+        if entry.get("type").and_then(|v| v.as_str()) == Some("we") {
+            return true;
+        }
+    }
+    false
+}
+
+async fn update_outputs_state_audio(
+    cache_dir: &Path,
+    filter: &Option<HashSet<String>>,
+    mute: Option<bool>,
+    volume: Option<u32>,
+) {
+    let _guard = outputs_state_lock().lock().await;
+    let state_path = cache_dir.join("outputs.json");
+    let existing: serde_json::Value = match tokio::fs::read_to_string(&state_path).await {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({})),
+        Err(_) => serde_json::json!({}),
+    };
+    let mut map = match existing {
+        serde_json::Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+
+    let keys: Vec<String> = map.keys().cloned().collect();
+    for k in keys {
+        if let Some(f) = filter.as_ref()
+            && !f.contains(&k)
+        {
+            continue;
+        }
+        if let Some(entry) = map.get_mut(&k) {
+            if let Some(m) = mute {
+                entry["mute"] = serde_json::json!(m);
+            }
+            if let Some(v) = volume {
+                entry["volume"] = serde_json::json!(v);
+            }
+        }
+    }
+
+    let contents =
+        serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_default();
+    write_outputs_state_atomic(&state_path, &contents).await;
 }
 
 async fn linux_we_running() -> bool {
@@ -1974,7 +2554,6 @@ pub async fn kill_orphan_paper_procs() {
 
 fn paper_bin() -> String {
     std::env::var("SKWD_PAPER_BIN").unwrap_or_else(|_| {
-        // Try sibling binary in the same directory as this daemon
         if let Ok(exe) = std::env::current_exe()
             && let Some(dir) = exe.parent()
         {
@@ -1984,6 +2563,20 @@ fn paper_bin() -> String {
             }
         }
         "skwd-paper".to_string()
+    })
+}
+
+fn paper_still_bin() -> String {
+    std::env::var("SKWD_PAPER_STILL_BIN").unwrap_or_else(|_| {
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            let local = dir.join("skwd-paper-still");
+            if local.exists() {
+                return local.display().to_string();
+            }
+        }
+        "skwd-paper-still".to_string()
     })
 }
 
@@ -2138,6 +2731,7 @@ async fn save_outputs_state(
     we_id: &str,
     mute_map: &HashMap<String, bool>,
 ) {
+    let _guard = outputs_state_lock().lock().await;
     let state_path = cache_dir.join("outputs.json");
     let _ = tokio::fs::create_dir_all(cache_dir).await;
     let existing: serde_json::Value = match tokio::fs::read_to_string(&state_path).await {
@@ -2157,6 +2751,8 @@ async fn save_outputs_state(
 
     if keys == ["*"] {
         map.clear();
+    } else {
+        map.remove("*");
     }
     for k in keys {
         let mut entry = serde_json::json!({"type": wp_type});
@@ -2171,11 +2767,9 @@ async fn save_outputs_state(
         map.insert(k, entry);
     }
 
-    let _ = tokio::fs::write(
-        &state_path,
-        serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_default(),
-    )
-    .await;
+    let contents =
+        serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_default();
+    write_outputs_state_atomic(&state_path, &contents).await;
 }
 
 async fn compute_audio_dedup(
@@ -2243,6 +2837,7 @@ async fn compute_audio_dedup(
 }
 
 pub async fn read_outputs_state(cache_dir: &Path) -> serde_json::Value {
+    let _guard = outputs_state_lock().lock().await;
     let state_path = cache_dir.join("outputs.json");
     match tokio::fs::read_to_string(&state_path).await {
         Ok(text) => serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({})),
@@ -2335,85 +2930,3 @@ async fn run_post_processing(
     }
 }
 
-async fn get_screen_args() -> String {
-    if let Ok(output) = Command::new("wlr-randr")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        && output.status.success()
-    {
-        let text = String::from_utf8_lossy(&output.stdout);
-        let names: Vec<&str> = text
-            .lines()
-            .filter(|l| !l.starts_with(' ') && !l.is_empty())
-            .filter_map(|l| l.split_whitespace().next())
-            .collect();
-        if !names.is_empty() {
-            return names
-                .iter()
-                .map(|n| format!(" --screen-root {} --scaling fill", shell_quote(n)))
-                .collect::<String>();
-        }
-    }
-
-    if let Ok(output) = Command::new("hyprctl")
-        .arg("monitors")
-        .arg("-j")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        && output.status.success()
-        && let Ok(monitors) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
-    {
-        let names: Vec<&str> = monitors
-            .iter()
-            .filter_map(|m| m.get("name").and_then(|v| v.as_str()))
-            .collect();
-        if !names.is_empty() {
-            return names
-                .iter()
-                .map(|n| format!(" --screen-root {} --scaling fill", shell_quote(n)))
-                .collect::<String>();
-        }
-    }
-
-    if let Ok(output) = Command::new("niri")
-        .arg("msg")
-        .arg("outputs")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        && output.status.success()
-    {
-        let text = String::from_utf8_lossy(&output.stdout);
-        let names: Vec<String> = text
-            .lines()
-            .filter_map(|l| {
-                let trimmed = l.trim();
-                if !trimmed.starts_with("Output") {
-                    return None;
-                }
-                if let (Some(open), Some(close)) = (trimmed.rfind('('), trimmed.rfind(')'))
-                    && open < close
-                {
-                    return Some(trimmed[open + 1..close].to_string());
-                }
-                trimmed
-                    .split_whitespace()
-                    .nth(1)
-                    .map(|s| s.trim_matches(|c: char| c == '"' || c == ':').to_string())
-            })
-            .collect();
-        if !names.is_empty() {
-            return names
-                .iter()
-                .map(|n| format!(" --screen-root {} --scaling fill", shell_quote(n)))
-                .collect::<String>();
-        }
-    }
-
-    String::new()
-}

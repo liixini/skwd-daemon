@@ -1,12 +1,12 @@
 [package]
-name = "skwd-paper"
+name = "skwd-paper-still"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "skwd-paper"
+name = "skwd-paper-still"
 path = "src/main.rs"
 
 [dependencies]
@@ -18,25 +18,14 @@ clap = { version = "4", features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
-# Wayland client + layer-shell
+# Wayland client + layer-shell + shm
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 smithay-client-toolkit = { version = "0.19", default-features = false, features = [] }
-wayland-egl = "0.32"
 
-# EGL - static linkage so we get eglGetProcAddress as a plain extern symbol
-khronos-egl = { version = "6", features = ["static"] }
-
-# OpenGL - for offscreen FBO + per-output blit
-gl = "0.14"
-
+# Image decode
 image = { workspace = true }
-
-ffmpeg-the-third = "5"
-
-cpal = "0.16"
-ringbuf = "0.4"
 
 libc = "0.2"
 

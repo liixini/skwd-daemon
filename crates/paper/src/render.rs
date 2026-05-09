@@ -1,12 +1,10 @@
 use anyhow::{Context, Result, anyhow};
-use libmpv2::{
-    Mpv,
-    render::{OpenGLInitParams, RenderContext, RenderParam, RenderParamApiType},
-};
 use std::ffi::{CString, c_void};
 use wayland_client::Proxy;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_egl::WlEglSurface;
+
+use crate::video_source::VideoSource;
 
 type EglInstance = khronos_egl::Instance<khronos_egl::Static>;
 const EGL: EglInstance = khronos_egl::Instance::new(khronos_egl::Static);
@@ -16,14 +14,11 @@ pub struct SharedRenderer {
     egl_config: khronos_egl::Config,
     primary_ctx: khronos_egl::Context,
     primary_pbuffer: khronos_egl::Surface,
-    fbo: u32,
-    fbo_texture: u32,
     pub fbo_w: u32,
     pub fbo_h: u32,
     blit_program: u32,
     quad_vbo: u32,
-    pub render_ctx: RenderContext,
-    _mpv: Mpv,
+    video: VideoSource,
 }
 
 pub struct OutputBlitter {
@@ -44,6 +39,16 @@ impl SharedRenderer {
         file_path: &str,
         mpv_opts: &[(String, String)],
     ) -> Result<Self> {
+        let initial_mute = mpv_opts
+            .iter()
+            .find(|(k, _)| k == "mute")
+            .map(|(_, v)| v == "yes" || v == "true")
+            .unwrap_or(true);
+        let initial_volume: u32 = mpv_opts
+            .iter()
+            .find(|(k, _)| k == "volume")
+            .and_then(|(_, v)| v.parse::<u32>().ok())
+            .unwrap_or(80);
         let egl_display = unsafe { EGL.get_display(wayland_display_ptr) }
             .ok_or_else(|| anyhow!("eglGetDisplay failed"))?;
         EGL.initialize(egl_display)
@@ -108,72 +113,29 @@ impl SharedRenderer {
                 .unwrap_or(std::ptr::null())
         });
 
-        let (fbo, fbo_texture) = create_fbo(fbo_w, fbo_h)?;
         let blit_program = compile_blit_program()?;
         let quad_vbo = create_quad_vbo();
 
-        let mut mpv = Mpv::with_initializer(|init| {
-            init.set_property("vo", "libmpv")?;
-            init.set_property("hwdec", "auto-safe")?;
-            init.set_property("video-sync", "desync")?;
-            init.set_property("profile", "fast")?;
-            init.set_property("vd-lavc-fast", "yes")?;
-            init.set_property("audio-display", "no")?;
-            init.set_property("input-default-bindings", "no")?;
-            init.set_property("input-vo-keyboard", "no")?;
-            init.set_property("input-cursor", "no")?;
-            init.set_property("loop-file", "inf")?;
-            init.set_property("idle", "yes")?;
-            init.set_property("pause", "no")?;
-            init.set_property("keep-open", "always")?;
-            init.set_property("osc", "no")?;
-            init.set_property("osd-bar", "no")?;
-            init.set_property("force-window", "no")?;
-            for (k, v) in mpv_opts {
-                let _ = init.set_property(k.as_str(), v.as_str());
-            }
-            Ok(())
-        })
-        .map_err(|e| anyhow!("mpv init: {e:?}"))?;
-
-        let render_ctx = RenderContext::new(
-            unsafe { mpv.ctx.as_mut() },
-            vec![
-                RenderParam::ApiType(RenderParamApiType::OpenGl),
-                RenderParam::InitParams(OpenGLInitParams {
-                    get_proc_address,
-                    ctx: (),
-                }),
-            ],
-        )
-        .map_err(|e| anyhow!("mpv render_ctx: {e:?}"))?;
-
-        load_file(&mpv, file_path)?;
+        let mut video = VideoSource::new(file_path, fbo_w, fbo_h, initial_mute)
+            .with_context(|| format!("VideoSource for {file_path}"))?;
+        video.set_volume(initial_volume);
+        video.prime_first_frame(2000);
+        video.set_pause(false);
 
         Ok(Self {
             egl_display,
             egl_config,
             primary_ctx,
             primary_pbuffer,
-            fbo,
-            fbo_texture,
             fbo_w,
             fbo_h,
             blit_program,
             quad_vbo,
-            render_ctx,
-            _mpv: mpv,
+            video,
         })
     }
 
     pub fn render_mpv_to_fbo(&mut self) -> bool {
-        let flags = self.render_ctx.update().map(|f| f as u64).unwrap_or(0);
-        let frame_flag = libmpv2::render::mpv_render_update::Frame as u64;
-        let force = std::env::var("SKWD_PAPER_FORCE_RENDER").is_ok();
-        let test_color = std::env::var("SKWD_PAPER_TEST_COLOR").is_ok();
-        if !force && !test_color && (flags & frame_flag) == 0 {
-            return false;
-        }
         if EGL
             .make_current(
                 self.egl_display,
@@ -186,27 +148,9 @@ impl SharedRenderer {
             tracing::warn!("eglMakeCurrent primary failed");
             return false;
         }
-        if test_color {
-            unsafe {
-                gl::BindFramebuffer(gl::FRAMEBUFFER, self.fbo);
-                gl::Viewport(0, 0, self.fbo_w as i32, self.fbo_h as i32);
-                gl::ClearColor(0.9, 0.2, 0.2, 1.0);
-                gl::Clear(gl::COLOR_BUFFER_BIT);
-                gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-            }
-        } else {
-            let res = self.render_ctx.render::<()>(
-                self.fbo as i32,
-                self.fbo_w as i32,
-                self.fbo_h as i32,
-                true,
-            );
-            if let Err(e) = &res {
-                tracing::warn!("mpv render: {:?}", e);
-            }
-        }
+        let new_frame = self.video.render_to_fbo();
         unsafe { gl::Finish() };
-        true
+        new_frame
     }
 
     pub fn blit_to(&self, blitter: &OutputBlitter) {
@@ -222,26 +166,20 @@ impl SharedRenderer {
             tracing::warn!("eglMakeCurrent blitter failed");
             return;
         }
-        let direct_color = std::env::var("SKWD_PAPER_DIRECT_COLOR").is_ok();
         unsafe {
             gl::Viewport(0, 0, blitter.width as i32, blitter.height as i32);
-            if direct_color {
-                gl::ClearColor(0.1, 0.7, 0.2, 1.0); // green
-                gl::Clear(gl::COLOR_BUFFER_BIT);
-            } else {
-                gl::ClearColor(0.0, 0.0, 0.0, 1.0);
-                gl::Clear(gl::COLOR_BUFFER_BIT);
-                gl::UseProgram(self.blit_program);
-                gl::ActiveTexture(gl::TEXTURE0);
-                gl::BindTexture(gl::TEXTURE_2D, self.fbo_texture);
-                gl::BindVertexArray(blitter.vao);
-                gl::DrawArrays(gl::TRIANGLE_STRIP, 0, 4);
-                gl::BindVertexArray(0);
-                gl::BindTexture(gl::TEXTURE_2D, 0);
-                let err = gl::GetError();
-                if err != gl::NO_ERROR {
-                    tracing::warn!(gl_error = err, "blit GL error");
-                }
+            gl::ClearColor(0.0, 0.0, 0.0, 1.0);
+            gl::Clear(gl::COLOR_BUFFER_BIT);
+            gl::UseProgram(self.blit_program);
+            gl::ActiveTexture(gl::TEXTURE0);
+            gl::BindTexture(gl::TEXTURE_2D, self.video.fbo_texture);
+            gl::BindVertexArray(blitter.vao);
+            gl::DrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+            gl::BindVertexArray(0);
+            gl::BindTexture(gl::TEXTURE_2D, 0);
+            let err = gl::GetError();
+            if err != gl::NO_ERROR {
+                tracing::warn!(gl_error = err, "blit GL error");
             }
         }
         if let Err(e) = EGL.swap_buffers(blitter.egl_display, blitter.egl_surface) {
@@ -322,27 +260,51 @@ impl OutputBlitter {
 }
 
 impl SharedRenderer {
-    pub fn load_path(&mut self, path: &str) -> Result<()> {
-        load_file(&self._mpv, path)?;
-        let _ = self._mpv.set_property("pause", "no");
+    pub fn load_path(&mut self, path: &str, mute: bool, volume: u32) -> Result<()> {
+        if EGL
+            .make_current(
+                self.egl_display,
+                Some(self.primary_pbuffer),
+                Some(self.primary_pbuffer),
+                Some(self.primary_ctx),
+            )
+            .is_err()
+        {
+            return Err(anyhow!("eglMakeCurrent for load_path"));
+        }
+        let mut new_video = VideoSource::new(path, self.fbo_w, self.fbo_h, mute)
+            .with_context(|| format!("VideoSource for {path}"))?;
+        new_video.set_volume(volume);
+        new_video.prime_first_frame(2000);
+        new_video.set_pause(false);
+        let old = std::mem::replace(&mut self.video, new_video);
+        unsafe {
+            gl::DeleteFramebuffers(1, &old.fbo);
+            gl::DeleteTextures(1, &old.fbo_texture);
+        }
+        drop(old);
         Ok(())
     }
 
     pub fn set_mute(&mut self, mute: bool) {
-        let _ = self._mpv.set_property("mute", if mute { "yes" } else { "no" });
+        self.video.set_mute(mute);
+    }
+
+    pub fn set_volume(&mut self, vol: u32) {
+        self.video.set_volume(vol);
     }
 
     pub fn unpause_mpv(&mut self) {
-        if let Err(e) = self._mpv.set_property("pause", "no") {
-            tracing::warn!("mpv unpause failed: {e:?}");
-        } else {
-            tracing::info!("mpv unpaused");
-        }
+        self.video.set_pause(false);
     }
 }
 
 impl Drop for SharedRenderer {
     fn drop(&mut self) {
+        unsafe {
+            gl::DeleteFramebuffers(1, &self.video.fbo);
+            gl::DeleteTextures(1, &self.video.fbo_texture);
+        }
         let _ = EGL.make_current(self.egl_display, None, None, None);
         let _ = EGL.destroy_surface(self.egl_display, self.primary_pbuffer);
         let _ = EGL.destroy_context(self.egl_display, self.primary_ctx);
@@ -357,47 +319,8 @@ impl Drop for OutputBlitter {
     }
 }
 
-fn create_fbo(w: u32, h: u32) -> Result<(u32, u32)> {
-    unsafe {
-        let mut tex: u32 = 0;
-        gl::GenTextures(1, &mut tex);
-        gl::BindTexture(gl::TEXTURE_2D, tex);
-        gl::TexImage2D(
-            gl::TEXTURE_2D,
-            0,
-            gl::RGBA8 as i32,
-            w as i32,
-            h as i32,
-            0,
-            gl::RGBA,
-            gl::UNSIGNED_BYTE,
-            std::ptr::null(),
-        );
-        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
-        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
-        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
-        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
-
-        let mut fbo: u32 = 0;
-        gl::GenFramebuffers(1, &mut fbo);
-        gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
-        gl::FramebufferTexture2D(
-            gl::FRAMEBUFFER,
-            gl::COLOR_ATTACHMENT0,
-            gl::TEXTURE_2D,
-            tex,
-            0,
-        );
-        if gl::CheckFramebufferStatus(gl::FRAMEBUFFER) != gl::FRAMEBUFFER_COMPLETE {
-            return Err(anyhow!("FBO incomplete"));
-        }
-        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-        Ok((fbo, tex))
-    }
-}
-
 const VERT_SRC: &[u8] = b"#version 330 core\nlayout(location=0) in vec2 a_pos;\nlayout(location=1) in vec2 a_tex;\nout vec2 v_tex;\nvoid main() { gl_Position = vec4(a_pos, 0.0, 1.0); v_tex = a_tex; }\n\0";
-const FRAG_SRC: &[u8] = b"#version 330 core\nin vec2 v_tex;\nout vec4 frag;\nuniform sampler2D u_tex;\nvoid main() { frag = texture(u_tex, v_tex); }\n\0";
+const FRAG_SRC: &[u8] = b"#version 330 core\nin vec2 v_tex;\nout vec4 frag;\nuniform sampler2D u_tex;\nvoid main() { frag = texture(u_tex, vec2(v_tex.x, 1.0 - v_tex.y)); }\n\0";
 
 fn compile_blit_program() -> Result<u32> {
     unsafe {
@@ -458,27 +381,6 @@ fn create_quad_vbo() -> u32 {
         gl::BindBuffer(gl::ARRAY_BUFFER, 0);
         vbo
     }
-}
-
-fn load_file(mpv: &Mpv, path: &str) -> Result<()> {
-    let cmd = CString::new("loadfile").unwrap();
-    let arg = CString::new(path).map_err(|e| anyhow!("path NUL: {e}"))?;
-    let ptrs: [*const std::os::raw::c_char; 3] = [cmd.as_ptr(), arg.as_ptr(), std::ptr::null()];
-    let rc = unsafe { libmpv2_sys::mpv_command(mpv.ctx.as_ptr(), ptrs.as_ptr().cast_mut()) };
-    if rc < 0 {
-        return Err(anyhow!("mpv_command(loadfile) returned {}", rc));
-    }
-    Ok(())
-}
-
-fn get_proc_address(_ctx: &(), name: &str) -> *mut c_void {
-    let cname = match CString::new(name) {
-        Ok(c) => c,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    EGL.get_proc_address(&cname.to_string_lossy())
-        .map(|p| p as *mut c_void)
-        .unwrap_or(std::ptr::null_mut())
 }
 
 pub fn wayland_display_ptr(surface: &WlSurface) -> Result<*mut c_void> {

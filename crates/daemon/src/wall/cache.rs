@@ -509,7 +509,7 @@ pub async fn recompute_colors(
     db: Arc<Mutex<Connection>>,
     event_tx: broadcast::Sender<String>,
 ) -> usize {
-    use crate::server::{broadcast_event, make_event};
+    use crate::server::broadcast_event;
 
     let rows: Vec<(String, String)> = {
         let conn = db.lock().await;
@@ -574,39 +574,6 @@ pub async fn recompute_colors(
     updated
 }
 
-pub async fn clean_stale(config: &Config, db: Arc<Mutex<Connection>>) {
-    let conn = db.lock().await;
-    let Ok(entries) = db::get_cache_entries(&conn) else {
-        return;
-    };
-
-    let wallpaper_dir = config.wallpaper_dir();
-    let video_dir = config.video_dir();
-    let we_dir = config.we_dir();
-
-    let mut stale_keys = Vec::new();
-    for (cache_key, db_key, _mtime) in &entries {
-        let Some((wp_type, name)) = cache_key.split_once(':') else {
-            continue;
-        };
-        let is_we = we_dir.join(name).exists();
-        let exists = match wp_type {
-            "static" => wallpaper_dir.join(name).exists(),
-            "video" if is_we => true,
-            "video" => video_dir.join(name).exists(),
-            "we" => config.features.steam && is_we,
-            _ => true,
-        };
-        if !exists {
-            stale_keys.push(db_key.clone());
-        }
-    }
-
-    if !stale_keys.is_empty() {
-        let deleted = db::delete_entries(&conn, &stale_keys).unwrap_or(0);
-        info!("removed {deleted} stale cache entries after scan");
-    }
-}
 
 
 use super::{IMAGE_EXTS, VIDEO_EXTS};

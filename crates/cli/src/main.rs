@@ -4,17 +4,26 @@ use skwd_proto::Request;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+mod optimize_videos;
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.is_empty() {
         eprintln!("usage: skwd <namespace> <method> [json-params]");
+        eprintln!("       skwd optimize-videos [DIR_OR_FILE...]");
         eprintln!("examples:");
         eprintln!("  skwd wall toggle");
         eprintln!("  skwd wall apply '{{\"name\":\"sunset.jpg\"}}'");
         eprintln!("  skwd status");
+        eprintln!("  skwd optimize-videos");
         process::exit(1);
+    }
+
+    if args[0] == "optimize-videos" {
+        let code = optimize_videos::run(&args[1..]).await;
+        process::exit(code);
     }
 
     let (method, params) = if args.len() >= 2 {

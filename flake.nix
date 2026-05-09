@@ -18,10 +18,26 @@
             version = "unstable";
             src = ./.;
 
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
 
-            nativeBuildInputs = with pkgs; [ pkg-config ];
-            buildInputs = with pkgs; [ imagemagick ];
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+              rustPlatform.bindgenHook
+            ];
+
+            buildInputs = with pkgs; [
+              ffmpeg
+              alsa-lib
+              imagemagick
+            ];
+
+            runtimeDependencies = with pkgs; [
+              ffmpeg
+              imagemagick
+              alsa-lib
+            ];
 
             postInstall = ''
               install -Dm644 data/skwd-daemon.service $out/lib/systemd/user/skwd-daemon.service

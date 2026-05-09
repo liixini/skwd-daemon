@@ -33,9 +33,12 @@ extern "C" fn sigusr1_handler(_: libc::c_int) {
 
 #[derive(Debug, Deserialize)]
 struct VideoPersistCommand {
-    path: String,
+    #[serde(default, alias = "path")]
+    to: String,
     #[serde(default)]
     mute: Option<bool>,
+    #[serde(default)]
+    volume: Option<u32>,
 }
 
 pub enum OutputTarget {
@@ -153,7 +156,7 @@ pub fn run(
     };
 
     unsafe {
-        libc::signal(libc::SIGUSR1, sigusr1_handler as libc::sighandler_t);
+        libc::signal(libc::SIGUSR1, sigusr1_handler as *const () as libc::sighandler_t);
     }
 
     if persist {
@@ -201,7 +204,7 @@ fn spawn_video_stdin_reader(pending: Arc<Mutex<Option<VideoPersistCommand>>>) {
                     }
                     match serde_json::from_str::<VideoPersistCommand>(trimmed) {
                         Ok(cmd) => {
-                            tracing::info!(path = %cmd.path, "video persist: command received");
+                            tracing::info!(path = %cmd.to, "video persist: command received");
                             *pending.lock().unwrap() = Some(cmd);
                         }
                         Err(e) => {
@@ -345,20 +348,29 @@ impl App {
             tracing::warn!("video persist: command received before renderer init");
             return;
         };
-        let swap_start = std::time::Instant::now();
-        if let Some(m) = cmd.mute {
-            renderer.set_mute(m);
+        if cmd.to.is_empty() {
+            tracing::info!(mute = ?cmd.mute, volume = ?cmd.volume, "legacy persist: audio update");
+            if let Some(m) = cmd.mute {
+                renderer.set_mute(m);
+            }
+            if let Some(v) = cmd.volume {
+                renderer.set_volume(v);
+            }
+            return;
         }
-        match renderer.load_path(&cmd.path) {
+        let swap_start = std::time::Instant::now();
+        let next_mute = cmd.mute.unwrap_or(true);
+        let next_volume = cmd.volume.unwrap_or(80);
+        match renderer.load_path(&cmd.to, next_mute, next_volume) {
             Ok(()) => {
-                self.file_path = cmd.path.clone();
+                self.file_path = cmd.to.clone();
                 self.ready_signaled = false;
                 self.ready_armed = false;
                 self.post_load_blit_count = 0;
-                tracing::info!(path = %cmd.path, swap_ms = swap_start.elapsed().as_millis() as u64, "video persist: loaded");
+                tracing::info!(path = %cmd.to, swap_ms = swap_start.elapsed().as_millis() as u64, "video persist: loaded");
             }
             Err(e) => {
-                tracing::error!(error = %e, path = %cmd.path, "video persist: load_path failed");
+                tracing::error!(error = %e, path = %cmd.to, "video persist: load_path failed");
             }
         }
     }

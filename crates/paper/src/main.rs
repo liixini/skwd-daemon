@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 
+mod audio;
 mod fill_mode;
 mod image_paper;
 mod ipc;
@@ -36,9 +37,20 @@ struct Cli {
     mute: bool,
     #[arg(long = "volume", default_value_t = 80)]
     volume: u32,
+    #[arg(long = "layer", value_enum, default_value_t = LayerArg::Background)]
+    layer: LayerArg,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum LayerArg {
+    Background,
+    Bottom,
 }
 
 fn main() -> Result<()> {
+    unsafe { libc::mallopt(libc::M_ARENA_MAX, 2) };
+    unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, 1024 * 1024) };
+
     use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
     let log_dir = std::env::var("XDG_CACHE_HOME")
@@ -84,7 +96,11 @@ fn main() -> Result<()> {
         } else {
             transition_paper::OutputTarget::Named(cli.output.clone())
         };
-        return transition_paper::run(target, from, &cli.file, &cli.shader, cli.duration_ms, &cli.thumbs, cli.persist, cli.fill_mode, cli.mute, cli.volume);
+        let layer = match cli.layer {
+            LayerArg::Background => transition_paper::SurfaceLayer::Background,
+            LayerArg::Bottom => transition_paper::SurfaceLayer::Bottom,
+        };
+        return transition_paper::run(target, from, &cli.file, &cli.shader, cli.duration_ms, &cli.thumbs, cli.persist, cli.fill_mode, cli.mute, cli.volume, layer);
     }
 
     if mode == "image" {

@@ -83,6 +83,12 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
                 .unwrap_or_default();
+            let all_screens: Vec<String> = req
+                .params
+                .get("screens")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+                .unwrap_or_default();
 
             let outputs_audio: std::collections::HashMap<String, bool> = req
                 .params
@@ -114,13 +120,13 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                     if path.is_empty() {
                         return Response::err(req.id, 1, "missing 'path' parameter");
                     }
-                    apply::apply_static(path, &outputs, &neighbors, &config).await
+                    apply::apply_static(path, &outputs, &neighbors, &all_screens, &config).await
                 }
                 "video" => {
                     if path.is_empty() {
                         return Response::err(req.id, 1, "missing 'path' parameter");
                     }
-                    apply::apply_video(path, &outputs, &neighbors, &outputs_audio, &outputs_volume, &config).await
+                    apply::apply_video(path, &outputs, &neighbors, &all_screens, &outputs_audio, &outputs_volume, &config).await
                 }
                 "we" => {
                     if we_id.is_empty() {
@@ -189,10 +195,45 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
         "retheme" => {
             let scheme = req.params.get("scheme").and_then(|v| v.as_str()).map(String::from);
             let mode = req.params.get("mode").and_then(|v| v.as_str()).map(String::from);
+            let color_index = req
+                .params
+                .get("color_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| (n as u32).min(3));
             let config = state.config.read().await.clone();
-            match apply::retheme(&config, scheme.as_deref(), mode.as_deref()).await {
+            match apply::retheme(&config, scheme.as_deref(), mode.as_deref(), color_index).await {
                 Ok(()) => Response::ok(req.id, serde_json::json!({"rethemed": true})),
                 Err(e) => Response::err(req.id, 6, format!("{e}")),
+            }
+        }
+
+        "theme_preview" => {
+            let scheme = req
+                .params
+                .get("scheme")
+                .and_then(|v| v.as_str())
+                .unwrap_or("scheme-fidelity")
+                .to_string();
+            let mode = req
+                .params
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("dark")
+                .to_string();
+            let color_index = req
+                .params
+                .get("color_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| (n as u32).min(3))
+                .unwrap_or(0);
+            let config = state.config.read().await.clone();
+            tracing::info!(scheme, mode, color_index, "theme_preview");
+            match apply::theme_preview(&config, &scheme, &mode, color_index).await {
+                Ok(palette) => Response::ok(req.id, palette),
+                Err(e) => {
+                    tracing::warn!(error = %e, "theme_preview failed");
+                    Response::err(req.id, 6, format!("{e}"))
+                }
             }
         }
 
@@ -353,7 +394,17 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                 .get("volume")
                 .and_then(|v| v.as_u64())
                 .map(|v| v.min(100) as u32);
-            apply::set_audio(mute, volume).await;
+            let outputs: Option<Vec<String>> = req
+                .params
+                .get("outputs")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|s| s.as_str().map(String::from))
+                        .collect()
+                });
+            let cfg = state.config.read().await.clone();
+            apply::set_audio_for(&cfg, mute, volume, outputs).await;
             Response::ok(req.id, serde_json::json!({"ok": true}))
         }
 
@@ -451,7 +502,7 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                                 std::path::PathBuf::from(&video_file)
                             };
                             let path_str = path.display().to_string();
-                            apply::apply_video(&path_str, &[], &[], &empty_audio, &empty_vol, &cfg).await
+                            apply::apply_video(&path_str, &[], &[], &[], &empty_audio, &empty_vol, &cfg).await
                                 .map(|()| ("video", path_str))
                         }
                         "we" => {
@@ -461,7 +512,7 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                         _ => {
                             let path = cfg.wallpaper_dir().join(&name);
                             let path_str = path.display().to_string();
-                            apply::apply_static(&path_str, &[], &[], &cfg).await
+                            apply::apply_static(&path_str, &[], &[], &[], &cfg).await
                                 .map(|()| ("static", path_str))
                         }
                     };

@@ -16,10 +16,15 @@ BuildRequires:  rust >= 1.85
 BuildRequires:  gcc
 BuildRequires:  pkgconfig
 BuildRequires:  systemd-rpm-macros
+BuildRequires:  clang-devel
+BuildRequires:  pkgconfig(libavcodec)
+BuildRequires:  pkgconfig(libavformat)
+BuildRequires:  pkgconfig(libavutil)
+BuildRequires:  pkgconfig(libswscale)
+BuildRequires:  pkgconfig(alsa)
 
 Requires:       ImageMagick
 
-Recommends:     ffmpeg-free
 Recommends:     ollama
 
 Suggests:       steamcmd
@@ -43,6 +48,8 @@ cargo build --release
 %install
 install -Dpm 0755 target/release/skwd-daemon %{buildroot}%{_bindir}/skwd-daemon
 install -Dpm 0755 target/release/skwd %{buildroot}%{_bindir}/skwd
+install -Dpm 0755 target/release/skwd-paper %{buildroot}%{_bindir}/skwd-paper
+install -Dpm 0755 target/release/skwd-paper-still %{buildroot}%{_bindir}/skwd-paper-still
 install -Dpm 0644 data/skwd-daemon.service %{buildroot}%{_prefix}/lib/systemd/user/skwd-daemon.service
 install -Dpm 0644 LICENSE %{buildroot}%{_datadir}/licenses/%{name}/LICENSE
 
@@ -62,5 +69,7 @@ fi
 %license LICENSE
 %{_bindir}/skwd-daemon
 %{_bindir}/skwd
+%{_bindir}/skwd-paper
+%{_bindir}/skwd-paper-still
 %{_prefix}/lib/systemd/user/skwd-daemon.service
 %{_prefix}/lib/systemd/user-preset/90-skwd-daemon.preset

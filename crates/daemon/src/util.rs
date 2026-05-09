@@ -16,13 +16,6 @@ impl CommandExt for Command {
     }
 }
 
-pub async fn timed_output(cmd: &mut Command, timeout: Duration) -> anyhow::Result<std::process::Output> {
-    match tokio::time::timeout(timeout, cmd.output()).await {
-        Ok(result) => result.map_err(|e| anyhow::anyhow!("command failed: {e}")),
-        Err(_) => anyhow::bail!("command timed out after {}s", timeout.as_secs()),
-    }
-}
-
 pub async fn timed_status(cmd: &mut Command, timeout: Duration) -> anyhow::Result<std::process::ExitStatus> {
     match tokio::time::timeout(timeout, cmd.status()).await {
         Ok(result) => result.map_err(|e| anyhow::anyhow!("command failed: {e}")),

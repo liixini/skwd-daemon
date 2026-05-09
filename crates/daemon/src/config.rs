@@ -205,6 +205,8 @@ pub struct MatugenConfig {
     pub scheme_type: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
+    #[serde(default, rename = "colorIndex")]
+    pub color_index: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -353,6 +355,10 @@ impl Config {
 
     pub fn matugen_mode(&self) -> &str {
         self.matugen.mode.as_deref().unwrap_or("dark")
+    }
+
+    pub fn matugen_color_index(&self) -> u32 {
+        self.matugen.color_index.unwrap_or(0).min(3)
     }
 
     pub fn is_muted(&self) -> bool {

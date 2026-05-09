@@ -2,6 +2,7 @@ pub mod apply;
 pub mod bootstrap;
 pub mod cache;
 pub mod clean_trash;
+pub mod optimized;
 pub mod thumb;
 pub mod watcher;
 pub mod weather;

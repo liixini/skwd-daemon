@@ -1,5 +1,5 @@
 use crate::fill_mode::{FillMode, apply_fill_mode};
-use crate::video_source::{MpvImagePool, VideoSource};
+use crate::video_source::VideoSource;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use smithay_client_toolkit::{
@@ -57,6 +57,12 @@ pub enum OutputTarget {
     Named(String),
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum SurfaceLayer {
+    Background,
+    Bottom,
+}
+
 pub const MAX_THUMBS: usize = 20;
 
 pub fn run(
@@ -70,6 +76,7 @@ pub fn run(
     fill_mode: FillMode,
     initial_mute: bool,
     initial_volume: u32,
+    layer: SurfaceLayer,
 ) -> Result<()> {
     let (chosen_name, chosen_src) = resolve_shader(shader_name);
     let thumb_slice: Vec<String> = if chosen_name == "mosaic-tumble" {
@@ -167,6 +174,8 @@ pub fn run(
         fill_mode,
         initial_mute,
         initial_volume,
+        layer,
+        exit_scheduled: false,
     };
 
     if persist {
@@ -219,6 +228,7 @@ fn spawn_stdin_reader(pending: Arc<Mutex<Option<PersistCommand>>>) {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 enum Pipeline {
     Single,
     Bloom { strength: f32, threshold: f32, radius: f32 },
@@ -233,7 +243,6 @@ struct GlState {
     tex_new: u32,
     video_old: Option<VideoSource>,
     video_new: Option<VideoSource>,
-    image_pool: Option<MpvImagePool>,
     tex_old_fbo: Option<u32>,
     tex_new_fbo: Option<u32>,
     tex_thumbs: Vec<u32>,
@@ -250,6 +259,10 @@ struct GlState {
     loc_blur_radius: i32,
     composite_program: u32,
     loc_composite_strength: i32,
+    fit_program: u32,
+    loc_fit_scale: i32,
+    loc_fit_offset: i32,
+    fit_vao: u32,
 }
 
 struct SurfaceBlitter {
@@ -296,6 +309,8 @@ struct App {
     fill_mode: FillMode,
     initial_mute: bool,
     initial_volume: u32,
+    layer: SurfaceLayer,
+    exit_scheduled: bool,
 }
 
 struct SurfaceState {
@@ -338,10 +353,14 @@ impl App {
         }
 
         let surface = self.compositor_state.create_surface(&self.qh);
+        let wlr_layer = match self.layer {
+            SurfaceLayer::Background => Layer::Background,
+            SurfaceLayer::Bottom => Layer::Bottom,
+        };
         let layer = self.layer_shell.get_layer_surface(
             &surface,
             Some(&output),
-            Layer::Background,
+            wlr_layer,
             "skwd-paper-transition".to_string(),
             &self.qh,
             (),
@@ -512,6 +531,27 @@ impl App {
         let bright_program = compile_program(BRIGHT_EXTRACT_FRAG)?;
         let blur_program = compile_program(GAUSSIAN_BLUR_FRAG)?;
         let composite_program = compile_program(COMPOSITE_BLOOM_FRAG)?;
+        let fit_program = compile_program(FIT_FRAG)?;
+        let mut fit_vao: u32 = 0;
+        unsafe {
+            gl::UseProgram(fit_program);
+            let loc_tex = gl::GetUniformLocation(fit_program, b"u_tex\0".as_ptr().cast());
+            gl::Uniform1i(loc_tex, 0);
+            gl::GenVertexArrays(1, &mut fit_vao);
+            gl::BindVertexArray(fit_vao);
+            gl::BindBuffer(gl::ARRAY_BUFFER, quad_vbo);
+            gl::EnableVertexAttribArray(0);
+            gl::VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, 16, std::ptr::null());
+            gl::EnableVertexAttribArray(1);
+            gl::VertexAttribPointer(1, 2, gl::FLOAT, gl::FALSE, 16, 8 as *const _);
+            gl::BindVertexArray(0);
+        }
+        let loc_fit_scale = unsafe {
+            gl::GetUniformLocation(fit_program, b"u_scale\0".as_ptr().cast())
+        };
+        let loc_fit_offset = unsafe {
+            gl::GetUniformLocation(fit_program, b"u_offset\0".as_ptr().cast())
+        };
 
         unsafe {
             gl::UseProgram(bright_program);
@@ -548,7 +588,6 @@ impl App {
             tex_new,
             video_old,
             video_new,
-            image_pool: None,
             tex_old_fbo: None,
             tex_new_fbo: None,
             tex_thumbs,
@@ -565,6 +604,10 @@ impl App {
             loc_blur_radius,
             composite_program,
             loc_composite_strength,
+            fit_program,
+            loc_fit_scale,
+            loc_fit_offset,
+            fit_vao,
         });
         self.start_time = Some(Instant::now());
         Ok(())
@@ -690,35 +733,6 @@ impl App {
             return Ok(());
         }
         if cmd.to.is_empty() && cmd.warmup.is_some() {
-            if let Some(gl_state) = self.gl_state.as_mut() {
-                let _ = EGL.make_current(
-                    gl_state.egl_display,
-                    Some(gl_state.primary_pbuffer),
-                    Some(gl_state.primary_pbuffer),
-                    Some(gl_state.primary_ctx),
-                );
-                match cmd.warmup {
-                    Some(true) => {
-                        if gl_state.image_pool.is_none() {
-                            match MpvImagePool::new() {
-                                Ok(p) => {
-                                    gl_state.image_pool = Some(p);
-                                    tracing::info!("persist: image_pool warmed up");
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "persist: image_pool warmup failed");
-                                }
-                            }
-                        }
-                    }
-                    Some(false) => {
-                        if gl_state.image_pool.take().is_some() {
-                            tracing::info!("persist: image_pool dropped (cooldown)");
-                        }
-                    }
-                    None => {}
-                }
-            }
             return Ok(());
         }
         tracing::info!(to = %cmd.to, was_active = self.transition_active, "persist: applying (interrupt-allowed)");
@@ -813,16 +827,16 @@ impl App {
             gl_state.video_new = Some(vs);
             (init_ms, prime_ms)
         } else {
-            if gl_state.image_pool.is_none() {
-                gl_state.image_pool =
-                    Some(MpvImagePool::new().context("MpvImagePool init")?);
-            }
             let init_ms = mpv_t.elapsed().as_millis() as u64;
             let prime_t = Instant::now();
-            let pool = gl_state.image_pool.as_mut().unwrap();
-            let (fbo, tex) = pool
-                .decode_to_fbo(&cmd.to, target_w, target_h, 2000)
-                .with_context(|| format!("MpvImagePool decode: {}", cmd.to))?;
+            let (img_w, img_h, img_px) = decode_rgba(&cmd.to)
+                .with_context(|| format!("image decode: {}", cmd.to))?;
+            let native_tex = upload_texture(img_w, img_h, &img_px);
+            let (fbo, tex) = fit_texture_to_fbo(
+                gl_state, native_tex, img_w, img_h,
+                target_w, target_h, self.fill_mode,
+            );
+            unsafe { gl::DeleteTextures(1, &native_tex) };
             let prime_ms = prime_t.elapsed().as_millis() as u64;
             gl_state.tex_new = tex;
             gl_state.tex_new_fbo = Some(fbo);
@@ -893,6 +907,7 @@ impl App {
             swap_ms = swap_start.elapsed().as_millis() as u64,
             "persist: started new transition"
         );
+        unsafe { libc::malloc_trim(0) };
         Ok(())
     }
 
@@ -914,19 +929,10 @@ impl App {
                     Some(gl_state.primary_pbuffer),
                     Some(gl_state.primary_ctx),
                 );
-                if transition_completing {
-                    unsafe {
-                        if let Some(fbo) = gl_state.tex_old_fbo.take() {
-                            gl::DeleteFramebuffers(1, &fbo);
-                        }
-                        if gl_state.tex_old != 0 {
-                            gl::DeleteTextures(1, &gl_state.tex_old);
-                        }
-                    }
-                    gl_state.tex_old = 0;
-                    if let Some(vs) = gl_state.video_new.as_mut() {
-                        vs.set_pause(false);
-                    }
+                if transition_completing
+                    && let Some(vs) = gl_state.video_new.as_mut()
+                {
+                    vs.set_pause(false);
                 }
                 if let Some(vs) = gl_state.video_old.as_mut() {
                     vs.render_to_fbo();
@@ -1087,6 +1093,13 @@ impl App {
         }
         if progress >= 1.0 {
             self.transition_active = false;
+            if !self.persist && !self.exit_scheduled {
+                self.exit_scheduled = true;
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    std::process::exit(0);
+                });
+            }
         }
     }
 }
@@ -1365,6 +1378,109 @@ void main() {
     frag = vec4(result, 1.0);
 }
 ";
+
+const FIT_FRAG: &str = "#version 330 core
+in vec2 v_uv;
+out vec4 frag;
+uniform sampler2D u_tex;
+uniform vec2 u_scale;
+uniform vec2 u_offset;
+void main() {
+    // Flip Y because rendering through an intermediate FBO inverts the texture
+    // memory layout relative to a direct upload that downstream shaders expect.
+    vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+    vec2 src_uv = uv * u_scale + u_offset;
+    if (src_uv.x < 0.0 || src_uv.x > 1.0 || src_uv.y < 0.0 || src_uv.y > 1.0) {
+        frag = vec4(0.0, 0.0, 0.0, 1.0);
+    } else {
+        frag = texture(u_tex, src_uv);
+    }
+}
+";
+
+fn fit_uv_remap(
+    src_w: u32,
+    src_h: u32,
+    target_w: u32,
+    target_h: u32,
+    fill_mode: FillMode,
+) -> ([f32; 2], [f32; 2]) {
+    let sw = src_w.max(1) as f32;
+    let sh = src_h.max(1) as f32;
+    let tw = target_w.max(1) as f32;
+    let th = target_h.max(1) as f32;
+    let s_aspect = sw / sh;
+    let t_aspect = tw / th;
+    match fill_mode {
+        FillMode::Stretch => ([1.0, 1.0], [0.0, 0.0]),
+        FillMode::Fill => {
+            if s_aspect > t_aspect {
+                let s = t_aspect / s_aspect;
+                ([s, 1.0], [(1.0 - s) * 0.5, 0.0])
+            } else {
+                let s = s_aspect / t_aspect;
+                ([1.0, s], [0.0, (1.0 - s) * 0.5])
+            }
+        }
+        FillMode::Fit => {
+            if s_aspect > t_aspect {
+                let s = s_aspect / t_aspect;
+                ([1.0, s], [0.0, (1.0 - s) * 0.5])
+            } else {
+                let s = t_aspect / s_aspect;
+                ([s, 1.0], [(1.0 - s) * 0.5, 0.0])
+            }
+        }
+        FillMode::Center => {
+            let sx = tw / sw;
+            let sy = th / sh;
+            ([sx, sy], [(1.0 - sx) * 0.5, (1.0 - sy) * 0.5])
+        }
+        FillMode::Tile => ([tw / sw, th / sh], [0.0, 0.0]),
+    }
+}
+
+fn fit_texture_to_fbo(
+    gl_state: &GlState,
+    src_tex: u32,
+    src_w: u32,
+    src_h: u32,
+    target_w: u32,
+    target_h: u32,
+    fill_mode: FillMode,
+) -> (u32, u32) {
+    let (scale, offset) = fit_uv_remap(src_w, src_h, target_w, target_h, fill_mode);
+    let (fbo, tex) = create_color_fbo(target_w, target_h);
+    unsafe {
+        let mut prev_fbo: i32 = 0;
+        gl::GetIntegerv(gl::DRAW_FRAMEBUFFER_BINDING, &mut prev_fbo);
+        let mut prev_vp: [i32; 4] = [0; 4];
+        gl::GetIntegerv(gl::VIEWPORT, prev_vp.as_mut_ptr());
+        let mut prev_vao: i32 = 0;
+        gl::GetIntegerv(gl::VERTEX_ARRAY_BINDING, &mut prev_vao);
+
+        gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
+        gl::Viewport(0, 0, target_w as i32, target_h as i32);
+        gl::ClearColor(0.0, 0.0, 0.0, 1.0);
+        gl::Clear(gl::COLOR_BUFFER_BIT);
+        gl::UseProgram(gl_state.fit_program);
+        gl::Uniform2f(gl_state.loc_fit_scale, scale[0], scale[1]);
+        gl::Uniform2f(gl_state.loc_fit_offset, offset[0], offset[1]);
+        gl::ActiveTexture(gl::TEXTURE0);
+        gl::BindTexture(gl::TEXTURE_2D, src_tex);
+        if fill_mode == FillMode::Tile {
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::REPEAT as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::REPEAT as i32);
+        }
+        gl::BindVertexArray(gl_state.fit_vao);
+        gl::DrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+        gl::BindVertexArray(prev_vao as u32);
+
+        gl::BindFramebuffer(gl::FRAMEBUFFER, prev_fbo as u32);
+        gl::Viewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+    }
+    (fbo, tex)
+}
 
 fn upload_texture(w: u32, h: u32, pixels: &[u8]) -> u32 {
     unsafe {
@@ -1850,7 +1966,7 @@ void main() {
     float ring1 = sin((d - front) * 80.0) * exp(-abs(d - front) * 6.0);
     float ring2 = sin((d - front + 0.08) * 80.0) * exp(-abs(d - front + 0.08) * 8.0) * 0.6;
     float ring3 = sin((d - front + 0.16) * 80.0) * exp(-abs(d - front + 0.16) * 10.0) * 0.4;
-    float ripple = (ring1 + ring2 + ring3) * 0.05 * (1.0 - p * 0.5);
+    float ripple = (ring1 + ring2 + ring3) * 0.05 * (1.0 - p);
     vec2 dir = (d > 0.001) ? normalize(c) : vec2(0.0);
     vec2 distorted = v_uv + dir * ripple;
     vec4 a = texture(u_tex_old, distorted);
@@ -2456,6 +2572,7 @@ const float dots = 20.0;
 const vec2 center = vec2(0, 0);
 
 vec4 transition(vec2 uv) {
+  if (u_progress >= 1.0) return texture(u_tex_new, uv);
   bool nextImage = distance(fract(uv * dots), vec2(0.5, 0.5)) < ( u_progress / distance(uv, center));
   return nextImage ? texture(u_tex_new, uv) : texture(u_tex_old, uv);
 }
@@ -2854,16 +2971,6 @@ fn resolve_shader(name: &str) -> (&'static str, &'static str) {
         .unwrap_or(("liquid-ripple", LIQUID_RIPPLE_FRAG))
 }
 
-fn shader_for(name: &str) -> &'static str {
-    resolve_shader(name).1
-}
-
-fn resolve_shader_name(name: &str) -> String {
-    resolve_shader(name).0.to_string()
-}
-
-fn pipeline_for(name: &str) -> Pipeline {
-    match name {
-        _ => Pipeline::Single,
-    }
+fn pipeline_for(_name: &str) -> Pipeline {
+    Pipeline::Single
 }
