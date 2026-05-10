@@ -170,6 +170,14 @@ pub struct FeaturesConfig {
     pub wallhaven: bool,
     #[serde(default, rename = "videoAutoScale")]
     pub video_auto_scale: bool,
+    #[serde(default = "default_true")]
+    pub lyrics: bool,
+    #[serde(default = "default_true")]
+    pub music: bool,
+    #[serde(default = "default_true")]
+    pub analysis: bool,
+    #[serde(default = "default_true")]
+    pub video: bool,
 }
 impl Default for FeaturesConfig {
     fn default() -> Self {
@@ -179,6 +187,10 @@ impl Default for FeaturesConfig {
             steam: false,
             wallhaven: false,
             video_auto_scale: false,
+            lyrics: true,
+            music: true,
+            analysis: true,
+            video: true,
         }
     }
 }
@@ -412,15 +424,52 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
 
+pub fn shell_config_path() -> PathBuf {
+    std::env::var("SKWD_CONFIG").map_or_else(
+        |_| {
+            std::env::var("XDG_CONFIG_HOME")
+                .map_or_else(|_| home().join(".config"), PathBuf::from)
+                .join("skwd")
+                .join("data")
+        },
+        PathBuf::from,
+    )
+    .join("config.json")
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ShellConfig {
+    notifications: Option<NotificationsConfig>,
+}
+
 pub fn load() -> anyhow::Result<Config> {
     let path = config_path();
-    if !path.exists() {
+    let mut cfg = if path.exists() {
+        let text = std::fs::read_to_string(&path)?;
+        let parsed: Config = serde_json::from_str(&text)?;
+        info!("config loaded from {}", path.display());
+        parsed
+    } else {
         info!("no config at {}, using defaults", path.display());
-        return Ok(Config::default());
+        Config::default()
+    };
+
+    let shell_path = shell_config_path();
+    if shell_path.exists() {
+        match std::fs::read_to_string(&shell_path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<ShellConfig>(&t).ok())
+        {
+            Some(shell) => {
+                if let Some(notifs) = shell.notifications {
+                    cfg.notifications = notifs;
+                    info!("notifications config taken from {}", shell_path.display());
+                }
+            }
+            None => info!("shell config at {} unparseable, ignoring", shell_path.display()),
+        }
     }
-    let text = std::fs::read_to_string(&path)?;
-    let cfg: Config = serde_json::from_str(&text)?;
-    info!("config loaded from {}", path.display());
+
     Ok(cfg)
 }
 

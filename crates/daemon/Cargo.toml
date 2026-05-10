@@ -24,6 +24,16 @@ reqwest = { workspace = true }
 base64 = { workspace = true }
 anyhow = { workspace = true }
 zbus = { workspace = true }
+librespot = { version = "0.8", default-features = false, features = ["pulseaudio-backend", "rustls-tls-native-roots", "with-libmdns"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+sha2 = "0.10"
+rand = "0.8"
+url = "2"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+http-body-util = "0.1"
+futures-util = "0.3"
+mpris-server = "0.10"
 
 [lints]
 workspace = true

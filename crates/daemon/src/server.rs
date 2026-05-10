@@ -61,10 +61,15 @@ impl ManagedProcess {
         if self.is_running() {
             return;
         }
+        let _ = std::process::Command::new("pkill")
+            .arg("-f")
+            .arg(format!("quickshell .*{}", self.shell_qml.display()))
+            .status();
         info!("launching {}: quickshell -p {}", self.label, self.shell_qml.display());
         let install_dir = self.shell_qml.parent().unwrap_or(Path::new("/usr/share/skwd-wall"));
         let mut cmd = tokio::process::Command::new("quickshell");
         cmd.arg("-p").arg(&self.shell_qml).env(self.env_key, install_dir);
+        cmd.kill_on_drop(true);
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
@@ -146,6 +151,80 @@ fn resolve_notification_qml() -> PathBuf {
     resolve_dev_or_system("skwd-notification", "SKWD_NOTIFICATION_QML")
 }
 
+fn resolve_music_qml() -> PathBuf {
+    resolve_dev_or_system("skwd-music", "SKWD_MUSIC_QML")
+}
+
+async fn start_music_module(state: &SharedState) {
+    use crate::music::mpris;
+    {
+        let g = state.music.mpris_server.lock().await;
+        if g.is_some() {
+            return;
+        }
+    }
+    let music_state = state.music.clone();
+    let mpris_state = music_state.mpris_state.clone();
+    let cmd_tx = music_state.mpris_cmd_tx.clone();
+    let server = match mpris::launch(mpris_state, cmd_tx).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("music: MPRIS server failed to launch: {e:#}");
+            return;
+        }
+    };
+    info!("music: MPRIS server started at org.mpris.MediaPlayer2.skwd-music");
+
+    let server_for_events = server.clone();
+    let ms_for_events = music_state.clone();
+    tokio::spawn(async move {
+        let mut sub = ms_for_events.event_tx.subscribe();
+        while let Ok(_payload) = sub.recv().await {
+            let _ = mpris::emit_state_update(&server_for_events).await;
+        }
+    });
+
+    let cmd_rx_slot = music_state.mpris_cmd_rx.clone();
+    let player = music_state.player.clone();
+    let ms_for_cmds = music_state.clone();
+    tokio::spawn(async move {
+        let mut rx = match cmd_rx_slot.lock().await.take() {
+            Some(r) => r,
+            None => return,
+        };
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                mpris::MprisCommand::PlayPause => {
+                    let playing = ms_for_cmds.mpris_state.lock().await.playing;
+                    if playing { let _ = player.pause().await; }
+                    else { let _ = player.play().await; }
+                }
+                mpris::MprisCommand::Play => { let _ = player.play().await; }
+                mpris::MprisCommand::Pause => { let _ = player.pause().await; }
+                mpris::MprisCommand::Next => { let _ = player.next().await; }
+                mpris::MprisCommand::Previous => { let _ = player.previous().await; }
+                mpris::MprisCommand::SetVolume(v) => {
+                    let scaled = (v.clamp(0.0, 1.0) * 65535.0) as u16;
+                    let _ = player.set_volume(scaled).await;
+                }
+            }
+        }
+    });
+
+    *state.music.mpris_server.lock().await = Some(server);
+}
+
+async fn stop_music_module(state: &SharedState) {
+    state.music.player.shutdown().await;
+    state.music.session.disconnect().await;
+    let server = state.music.mpris_server.lock().await.take();
+    if let Some(s) = server {
+        let _ = s.release_bus_name().await;
+        info!("music: MPRIS server released");
+        drop(s);
+    }
+}
+
 async fn fdo_notifications_owned() -> bool {
     use zbus::Connection;
     use zbus::fdo::DBusProxy;
@@ -214,6 +293,7 @@ pub struct SharedState {
     pub launcher: Arc<Mutex<ManagedProcess>>,
     pub switch: Arc<Mutex<ManagedProcess>>,
     pub notification: Arc<Mutex<ManagedProcess>>,
+    pub music_proc: Arc<Mutex<ManagedProcess>>,
     pub current_wallpaper: Arc<Mutex<Option<String>>>,
     pub cache_state: Arc<Mutex<CacheState>>,
     pub steam_state: Arc<Mutex<SteamState>>,
@@ -222,6 +302,7 @@ pub struct SharedState {
     pub analysis_state: Arc<Mutex<AnalysisState>>,
     pub suppress_set: SuppressSet,
     pub random_rotation: Arc<Mutex<Option<RandomRotation>>>,
+    pub music: Arc<crate::music::MusicState>,
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -255,6 +336,7 @@ pub async fn run() -> anyhow::Result<()> {
         launcher: Arc::new(Mutex::new(ManagedProcess::new("launcher", "SKWD_LAUNCH_INSTALL", resolve_launch_qml()))),
         switch: Arc::new(Mutex::new(ManagedProcess::new("switch", "SKWD_SWITCH_INSTALL", resolve_switch_qml()))),
         notification: Arc::new(Mutex::new(ManagedProcess::new("notification", "SKWD_NOTIFICATION_INSTALL", resolve_notification_qml()))),
+        music_proc: Arc::new(Mutex::new(ManagedProcess::new("music", "SKWD_MUSIC_INSTALL", resolve_music_qml()))),
         current_wallpaper: Arc::new(Mutex::new(None)),
         cache_state: Arc::new(Mutex::new(CacheState::default())),
         steam_state,
@@ -263,10 +345,43 @@ pub async fn run() -> anyhow::Result<()> {
         analysis_state: Arc::new(Mutex::new(AnalysisState::default())),
         suppress_set: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         random_rotation: Arc::new(Mutex::new(None)),
+        music: Arc::new(crate::music::MusicState::new(event_tx.clone())),
     };
+    state.music.auth.load_from_disk().await;
+
+    if config.features.music {
+        start_music_module(&state).await;
+    }
 
     if should_launch_notification(&config).await {
         state.notification.lock().await.launch();
+    }
+
+    if config.features.music {
+        state.music_proc.lock().await.launch();
+    }
+
+    {
+        let state_for_diff = state.clone();
+        let mut last_music = config.features.music;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                let cur = state_for_diff.config.read().await.features.music;
+                if cur != last_music {
+                    last_music = cur;
+                    if cur {
+                        info!("[modules] music feature enabled, starting");
+                        start_music_module(&state_for_diff).await;
+                        state_for_diff.music_proc.lock().await.launch();
+                    } else {
+                        info!("[modules] music feature disabled, stopping");
+                        state_for_diff.music_proc.lock().await.kill();
+                        stop_music_module(&state_for_diff).await;
+                    }
+                }
+            }
+        });
     }
 
     let _watcher_handle: Option<notify::RecommendedWatcher> = match watcher::start(&config, &state.suppress_set) {
@@ -760,16 +875,31 @@ async fn dispatch_request(
         return dispatch_switch(req, event_tx, state).await;
     }
     if req.method.starts_with("steam.") {
+        if !state.config.read().await.features.steam {
+            return Response::err(req.id, -32601, "steam module is disabled");
+        }
         return steam::dispatch(req, event_tx, state).await;
     }
     if req.method.starts_with("optimize.") || req.method.starts_with("video_convert.") {
         return optimize::dispatch(req, event_tx, state).await;
     }
     if req.method.starts_with("analysis.") {
+        if !state.config.read().await.features.analysis {
+            return Response::err(req.id, -32601, "analysis module is disabled");
+        }
         return analysis::dispatch(req, event_tx, state).await;
     }
     if req.method.starts_with("lyrics.") {
+        if !state.config.read().await.features.lyrics {
+            return Response::err(req.id, -32601, "lyrics module is disabled");
+        }
         return crate::lyrics::dispatch(req, event_tx, state).await;
+    }
+    if req.method.starts_with("music.") {
+        if !state.config.read().await.features.music {
+            return Response::err(req.id, -32601, "music module is disabled");
+        }
+        return crate::music::dispatch(req, event_tx, state).await;
     }
     match req.method.as_str() {
         "subscribe" => {

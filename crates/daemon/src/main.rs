@@ -1,6 +1,7 @@
 mod config;
 mod db;
 mod lyrics;
+mod music;
 mod server;
 mod util;
 mod wall;
@@ -11,6 +12,8 @@ use tracing_subscriber::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let log_dir = std::env::var("XDG_CACHE_HOME")
         .ok()
         .map(std::path::PathBuf::from)
