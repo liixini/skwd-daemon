@@ -128,6 +128,12 @@ fn resolve_dev_or_system(name: &str, env_var: &str) -> PathBuf {
     if let Ok(p) = std::env::var(env_var) {
         return PathBuf::from(p);
     }
+    if let Ok(install) = std::env::var("SKWD_INSTALL") {
+        let p = PathBuf::from(install).join(name).join("shell.qml");
+        if p.exists() {
+            return p;
+        }
+    }
     let umbrella = PathBuf::from(format!("../skwd-shell/{name}/shell.qml"));
     if umbrella.exists() {
         return std::fs::canonicalize(&umbrella).unwrap_or(umbrella);
@@ -135,6 +141,10 @@ fn resolve_dev_or_system(name: &str, env_var: &str) -> PathBuf {
     let sibling = PathBuf::from(format!("../{name}/shell.qml"));
     if sibling.exists() {
         return std::fs::canonicalize(&sibling).unwrap_or(sibling);
+    }
+    let suite_path = PathBuf::from(format!("/usr/share/skwd/{name}/shell.qml"));
+    if suite_path.exists() {
+        return suite_path;
     }
     PathBuf::from(format!("/usr/share/{name}/shell.qml"))
 }
