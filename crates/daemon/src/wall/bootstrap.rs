@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tracing::info;
 
@@ -42,6 +42,8 @@ pub async fn run(config: &Config) {
 
     seed_dir(&data_dir.join("matugen/templates"), &template_dir, false).await;
 
+    seed_shell_config().await;
+
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -49,6 +51,40 @@ pub async fn run(config: &Config) {
         .to_string();
     tokio::fs::write(&marker, timestamp.as_bytes()).await.ok();
     info!("bootstrap: setup complete");
+}
+
+async fn seed_shell_config() {
+    let dst = crate::config::shell_config_path();
+    if dst.exists() {
+        return;
+    }
+
+    let candidates: Vec<PathBuf> = std::env::var("SKWD_INSTALL")
+        .ok()
+        .map(|p| PathBuf::from(p).join("data/config.json.example"))
+        .into_iter()
+        .chain(std::iter::once(PathBuf::from(
+            "/usr/share/skwd/data/config.json.example",
+        )))
+        .collect();
+
+    let Some(src) = candidates.into_iter().find(|p| p.exists()) else {
+        info!("bootstrap: no skwd shell config example found, skipping seed");
+        return;
+    };
+
+    if let Some(parent) = dst.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+
+    match tokio::fs::copy(&src, &dst).await {
+        Ok(_) => info!(
+            "bootstrap: seeded shell config to {} from {}",
+            dst.display(),
+            src.display()
+        ),
+        Err(e) => tracing::warn!("bootstrap: failed to seed shell config: {e}"),
+    }
 }
 
 async fn seed_dir(src_dir: &Path, dst_dir: &Path, executable: bool) {

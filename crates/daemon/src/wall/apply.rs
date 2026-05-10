@@ -846,6 +846,12 @@ async fn apply_static_inner(
         })
     };
 
+    let engine_changed = swap_last_engine(config.paper.engine).await
+        != Some(config.paper.engine);
+    if engine_changed && config.paper.engine != config::PaperEngine::Awww {
+        kill_awww_if_running().await;
+    }
+
     if config.wants_external_render() {
         drop_video_persist_paper().await;
         drop_persist_paper().await;
@@ -897,8 +903,6 @@ async fn apply_static_inner(
         )
         .await
         .ok();
-        drop_video_persist_papers_for(&target_outs).await;
-        drop_persist_papers_for(&target_outs).await;
         drop_transition_overlays_for(&target_outs).await;
 
         if let Some(prev_path) = prev_wildcard_static.as_deref()
@@ -965,6 +969,8 @@ async fn apply_static_inner(
         }
 
         ensure_steady_image_paper(&still_bin, &target_outs, path, config.display.fill_mode).await;
+        drop_video_persist_papers_for(&target_outs).await;
+        drop_persist_papers_for(&target_outs).await;
         let prev_steady = std::mem::take(&mut fleet().lock().await.steady);
         for mut c in prev_steady {
             let _ = c.start_kill();
@@ -1119,7 +1125,6 @@ async fn apply_video_inner(
         )
         .await
         .ok();
-        drop_steady_image_papers_for(&target_outs).await;
 
         let video_alive = video_persist_alive_outputs(&target_outs).await;
         let image_alive = persist_alive_outputs(&target_outs).await;
@@ -1222,6 +1227,10 @@ async fn apply_video_inner(
             if cold_persist_spawned {
                 transition_ready_at = Some(std::time::Instant::now());
             }
+        }
+
+        if video_persist_ok || cold_persist_spawned {
+            drop_steady_image_papers_for(&target_outs).await;
         }
 
         let have_transitions =
@@ -2585,6 +2594,22 @@ fn paper_still_bin() -> String {
         }
         "skwd-paper-still".to_string()
     })
+}
+
+async fn swap_last_engine(new: config::PaperEngine) -> Option<config::PaperEngine> {
+    static LAST: OnceLock<AsyncMutex<Option<config::PaperEngine>>> = OnceLock::new();
+    let cell = LAST.get_or_init(|| AsyncMutex::new(None));
+    let mut guard = cell.lock().await;
+    let prev = *guard;
+    *guard = Some(new);
+    prev
+}
+
+async fn kill_awww_if_running() {
+    if run_sh("awww query >/dev/null 2>&1").await.is_ok() {
+        info!("apply_static: shutting down awww-daemon for non-awww engine");
+        let _ = run_sh("awww kill >/dev/null 2>&1; pkill -x awww-daemon 2>/dev/null; true").await;
+    }
 }
 
 async fn apply_awww(path: &str, outputs: &[String], config: &Config) -> anyhow::Result<()> {
