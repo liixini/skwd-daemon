@@ -52,6 +52,8 @@ pub struct Config {
     pub transition: TransitionConfig,
     #[serde(default)]
     pub display: DisplayConfig,
+    #[serde(default)]
+    pub paper: PaperConfig,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
@@ -110,6 +112,82 @@ fn default_transition_shader() -> String {
 fn default_transition_duration_ms() -> u64 {
     600
 }
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PaperEngine {
+    #[default]
+    #[serde(alias = "skwd-paper", alias = "internal", alias = "skwd_paper")]
+    SkwdPaper,
+    Awww,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PaperConfig {
+    #[serde(default)]
+    pub engine: PaperEngine,
+    #[serde(default)]
+    pub awww: AwwwConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AwwwConfig {
+    #[serde(default = "default_awww_transition_type", rename = "transitionType")]
+    pub transition_type: String,
+    #[serde(default = "default_awww_transition_duration_ms", rename = "transitionDurationMs")]
+    pub transition_duration_ms: u32,
+    #[serde(default = "default_awww_transition_fps", rename = "transitionFps")]
+    pub transition_fps: u32,
+    #[serde(default = "default_awww_transition_step", rename = "transitionStep")]
+    pub transition_step: u32,
+
+    #[serde(default = "default_awww_transition_angle", rename = "transitionAngle")]
+    pub transition_angle: u32,
+    #[serde(default = "default_awww_wave_dim", rename = "transitionWaveWidth")]
+    pub transition_wave_width: u32,
+    #[serde(default = "default_awww_wave_dim", rename = "transitionWaveHeight")]
+    pub transition_wave_height: u32,
+    #[serde(default = "default_awww_transition_pos", rename = "transitionPos")]
+    pub transition_pos: String,
+    #[serde(default = "default_awww_transition_bezier", rename = "transitionBezier")]
+    pub transition_bezier: String,
+    #[serde(default, rename = "invertY")]
+    pub invert_y: bool,
+    #[serde(default = "default_awww_filter")]
+    pub filter: String,
+    #[serde(default = "default_awww_fill_color", rename = "fillColor")]
+    pub fill_color: String,
+}
+
+impl Default for AwwwConfig {
+    fn default() -> Self {
+        Self {
+            transition_type: default_awww_transition_type(),
+            transition_duration_ms: default_awww_transition_duration_ms(),
+            transition_fps: default_awww_transition_fps(),
+            transition_step: default_awww_transition_step(),
+            transition_angle: default_awww_transition_angle(),
+            transition_wave_width: default_awww_wave_dim(),
+            transition_wave_height: default_awww_wave_dim(),
+            transition_pos: default_awww_transition_pos(),
+            transition_bezier: default_awww_transition_bezier(),
+            invert_y: false,
+            filter: default_awww_filter(),
+            fill_color: default_awww_fill_color(),
+        }
+    }
+}
+
+fn default_awww_transition_type() -> String { "wipe".to_string() }
+fn default_awww_transition_duration_ms() -> u32 { 1000 }
+fn default_awww_transition_fps() -> u32 { 60 }
+fn default_awww_transition_step() -> u32 { 90 }
+fn default_awww_transition_angle() -> u32 { 45 }
+fn default_awww_wave_dim() -> u32 { 20 }
+fn default_awww_transition_pos() -> String { "center".to_string() }
+fn default_awww_transition_bezier() -> String { ".54,0,.34,.99".to_string() }
+fn default_awww_filter() -> String { "Lanczos3".to_string() }
+fn default_awww_fill_color() -> String { "000000ff".to_string() }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

@@ -859,6 +859,13 @@ async fn apply_static_inner(
         drop_steady_image_paper().await;
         fleet().lock().await.replace_steady(Vec::new());
         run_sh(&format!("plasma-apply-wallpaperimage {}", shell_quote(path))).await?;
+    } else if config.paper.engine == config::PaperEngine::Awww {
+        drop_video_persist_paper().await;
+        drop_persist_paper().await;
+        drop_transition_overlays_for(&["*".to_string()]).await;
+        drop_steady_image_paper().await;
+        fleet().lock().await.replace_steady(Vec::new());
+        apply_awww(path, outputs, config).await?;
     } else {
         let still_bin = paper_still_bin();
         let bin = paper_bin();
@@ -2578,6 +2585,71 @@ fn paper_still_bin() -> String {
         }
         "skwd-paper-still".to_string()
     })
+}
+
+async fn apply_awww(path: &str, outputs: &[String], config: &Config) -> anyhow::Result<()> {
+    let _ = run_sh("awww query >/dev/null 2>&1 || awww-daemon &").await;
+
+    let s = &config.paper.awww;
+    let resize = match config.display.fill_mode {
+        config::FillMode::Fill | config::FillMode::Tile => "crop",
+        config::FillMode::Fit => "fit",
+        config::FillMode::Stretch => "stretch",
+        config::FillMode::Center => "no",
+    };
+
+    let duration_s = (s.transition_duration_ms as f32) / 1000.0;
+    let mut args = format!(
+        "--transition-type {} --transition-duration {} --transition-fps {} --transition-step {} --resize {} --filter {} --fill-color {}",
+        shell_quote(&s.transition_type),
+        duration_s,
+        s.transition_fps,
+        s.transition_step,
+        resize,
+        shell_quote(&s.filter),
+        shell_quote(&s.fill_color),
+    );
+
+    match s.transition_type.as_str() {
+        "wipe" | "wave" => {
+            args.push_str(&format!(" --transition-angle {}", s.transition_angle));
+        }
+        _ => {}
+    }
+    if s.transition_type == "wave" {
+        args.push_str(&format!(
+            " --transition-wave {},{}",
+            s.transition_wave_width, s.transition_wave_height
+        ));
+    }
+    if matches!(s.transition_type.as_str(), "grow" | "outer") {
+        args.push_str(&format!(" --transition-pos {}", shell_quote(&s.transition_pos)));
+        if s.invert_y {
+            args.push_str(" --invert-y");
+        }
+    }
+    if s.transition_type == "fade" {
+        args.push_str(&format!(" --transition-bezier {}", shell_quote(&s.transition_bezier)));
+    }
+
+    if outputs.is_empty() {
+        let cmd = format!("awww img {} {}", args, shell_quote(path));
+        info!(cmd = %cmd, "apply_static: awww img (all outputs)");
+        run_sh(&cmd).await?;
+    } else {
+        for out in outputs {
+            let cmd = format!(
+                "awww img --outputs {} {} {}",
+                shell_quote(out),
+                args,
+                shell_quote(path),
+            );
+            info!(cmd = %cmd, output = %out, "apply_static: awww img");
+            run_sh(&cmd).await?;
+        }
+    }
+
+    Ok(())
 }
 
 async fn apply_kde_video(path: &str, mute: bool) -> anyhow::Result<()> {
