@@ -165,6 +165,10 @@ fn resolve_music_qml() -> PathBuf {
     resolve_dev_or_system("skwd-music", "SKWD_MUSIC_QML")
 }
 
+fn resolve_power_qml() -> PathBuf {
+    resolve_dev_or_system("skwd-power", "SKWD_POWER_QML")
+}
+
 async fn start_music_module(state: &SharedState) {
     use crate::music::mpris;
     {
@@ -304,6 +308,7 @@ pub struct SharedState {
     pub switch: Arc<Mutex<ManagedProcess>>,
     pub notification: Arc<Mutex<ManagedProcess>>,
     pub music_proc: Arc<Mutex<ManagedProcess>>,
+    pub power: Arc<Mutex<ManagedProcess>>,
     pub current_wallpaper: Arc<Mutex<Option<String>>>,
     pub cache_state: Arc<Mutex<CacheState>>,
     pub steam_state: Arc<Mutex<SteamState>>,
@@ -347,6 +352,7 @@ pub async fn run() -> anyhow::Result<()> {
         switch: Arc::new(Mutex::new(ManagedProcess::new("switch", "SKWD_SWITCH_INSTALL", resolve_switch_qml()))),
         notification: Arc::new(Mutex::new(ManagedProcess::new("notification", "SKWD_NOTIFICATION_INSTALL", resolve_notification_qml()))),
         music_proc: Arc::new(Mutex::new(ManagedProcess::new("music", "SKWD_MUSIC_INSTALL", resolve_music_qml()))),
+        power: Arc::new(Mutex::new(ManagedProcess::new("power", "SKWD_POWER_INSTALL", resolve_power_qml()))),
         current_wallpaper: Arc::new(Mutex::new(None)),
         cache_state: Arc::new(Mutex::new(CacheState::default())),
         steam_state,
@@ -748,6 +754,43 @@ async fn handle_client(
     Ok(())
 }
 
+async fn dispatch_power(
+    req: &Request,
+    event_tx: &broadcast::Sender<String>,
+    state: &SharedState,
+) -> Response {
+    let method = req.method.strip_prefix("power.").unwrap_or(&req.method);
+    match method {
+        "toggle" => {
+            {
+                let mut p = state.power.lock().await;
+                if !p.is_running() {
+                    p.launch();
+                    return Response::ok(req.id, serde_json::json!({"toggled": true, "visible": true}));
+                }
+            }
+            let _ = broadcast_event(event_tx, "skwd.power.toggle", serde_json::json!({}));
+            Response::ok(req.id, serde_json::json!({"toggled": true}))
+        }
+        "show" => {
+            {
+                let mut p = state.power.lock().await;
+                if !p.is_running() {
+                    p.launch();
+                    return Response::ok(req.id, serde_json::json!({"ok": true, "visible": true}));
+                }
+            }
+            let _ = broadcast_event(event_tx, "skwd.power.show", serde_json::json!({}));
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+        "hide" => {
+            let _ = broadcast_event(event_tx, "skwd.power.hide", serde_json::json!({}));
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+        _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
+    }
+}
+
 async fn dispatch_bar(
     req: &Request,
     event_tx: &broadcast::Sender<String>,
@@ -883,6 +926,9 @@ async fn dispatch_request(
     }
     if req.method.starts_with("switch.") {
         return dispatch_switch(req, event_tx, state).await;
+    }
+    if req.method.starts_with("power.") {
+        return dispatch_power(req, event_tx, state).await;
     }
     if req.method.starts_with("steam.") {
         if !state.config.read().await.features.steam {
