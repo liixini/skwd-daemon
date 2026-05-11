@@ -153,6 +153,162 @@ fn resolve_launch_qml() -> PathBuf {
     resolve_dev_or_system("skwd-launch", "SKWD_LAUNCH_QML")
 }
 
+fn resolve_launch_shell_qml() -> PathBuf {
+    if let Ok(p) = std::env::var("SKWD_LAUNCH_SHELL_QML") {
+        return PathBuf::from(p);
+    }
+    let launch_shell_qml = resolve_launch_qml();
+    let candidate = launch_shell_qml
+        .parent()
+        .map(|p| p.join("qml/launcher/LauncherShell.qml"));
+    if let Some(p) = candidate {
+        if p.exists() {
+            return std::fs::canonicalize(&p).unwrap_or(p);
+        }
+    }
+    PathBuf::from("/usr/share/skwd/skwd-launch/qml/launcher/LauncherShell.qml")
+}
+
+fn resolve_bar_shell_qml() -> PathBuf {
+    if let Ok(p) = std::env::var("SKWD_BAR_SHELL_QML") {
+        return PathBuf::from(p);
+    }
+    let bar_qml = resolve_bar_qml();
+    let candidate = bar_qml.parent().map(|p| p.join("qml/bar/BarShell.qml"));
+    if let Some(p) = candidate {
+        if p.exists() {
+            return std::fs::canonicalize(&p).unwrap_or(p);
+        }
+    }
+    PathBuf::from("/usr/share/skwd/skwd-bar/qml/bar/BarShell.qml")
+}
+
+fn resolve_switch_shell_qml() -> PathBuf {
+    if let Ok(p) = std::env::var("SKWD_SWITCH_SHELL_QML") {
+        return PathBuf::from(p);
+    }
+    let switch_qml = resolve_switch_qml();
+    let candidate = switch_qml
+        .parent()
+        .map(|p| p.join("qml/switcher/SwitchShell.qml"));
+    if let Some(p) = candidate {
+        if p.exists() {
+            return std::fs::canonicalize(&p).unwrap_or(p);
+        }
+    }
+    PathBuf::from("/usr/share/skwd/skwd-switch/qml/switcher/SwitchShell.qml")
+}
+
+fn install_dir_of(shell_qml: &Path) -> String {
+    shell_qml
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
+}
+
+async fn build_host_env(config: &Config) -> Vec<(&'static str, String)> {
+    let launch_shell   = resolve_launch_shell_qml();
+    let bar_shell      = resolve_bar_shell_qml();
+    let switch_shell   = resolve_switch_shell_qml();
+    let settings_shell = resolve_settings_shell_qml();
+    let power_shell    = resolve_power_shell_qml();
+
+    let launch_install   = install_dir_of(&resolve_launch_qml());
+    let bar_install      = install_dir_of(&resolve_bar_qml());
+    let switch_install   = install_dir_of(&resolve_switch_qml());
+    let settings_install = install_dir_of(&resolve_settings_qml());
+    let power_install    = install_dir_of(&resolve_power_qml());
+
+    let mut env: Vec<(&'static str, String)> = vec![
+        ("SKWD_LAUNCH_SHELL",     launch_shell.display().to_string()),
+        ("SKWD_BAR_SHELL",        bar_shell.display().to_string()),
+        ("SKWD_SWITCH_SHELL",     switch_shell.display().to_string()),
+        ("SKWD_SETTINGS_SHELL",   settings_shell.display().to_string()),
+        ("SKWD_POWER_SHELL",      power_shell.display().to_string()),
+        ("SKWD_LAUNCH_INSTALL",   launch_install),
+        ("SKWD_BAR_INSTALL",      bar_install),
+        ("SKWD_SWITCH_INSTALL",   switch_install),
+        ("SKWD_SETTINGS_INSTALL", settings_install),
+        ("SKWD_POWER_INSTALL",    power_install),
+    ];
+    if should_launch_notification(config).await {
+        let notification_shell = resolve_notification_shell_qml();
+        let notification_install = install_dir_of(&resolve_notification_qml());
+        env.push(("SKWD_NOTIFICATION_SHELL", notification_shell.display().to_string()));
+        env.push(("SKWD_NOTIFICATION_INSTALL", notification_install));
+    }
+    env
+}
+
+fn resolve_notification_shell_qml() -> PathBuf {
+    if let Ok(p) = std::env::var("SKWD_NOTIFICATION_SHELL_QML") {
+        return PathBuf::from(p);
+    }
+    let notification_qml = resolve_notification_qml();
+    let candidate = notification_qml
+        .parent()
+        .map(|p| p.join("qml/NotificationShell.qml"));
+    if let Some(p) = candidate {
+        if p.exists() {
+            return std::fs::canonicalize(&p).unwrap_or(p);
+        }
+    }
+    PathBuf::from("/usr/share/skwd/skwd-notification/qml/NotificationShell.qml")
+}
+
+fn resolve_power_shell_qml() -> PathBuf {
+    if let Ok(p) = std::env::var("SKWD_POWER_SHELL_QML") {
+        return PathBuf::from(p);
+    }
+    let power_qml = resolve_power_qml();
+    let candidate = power_qml
+        .parent()
+        .map(|p| p.join("qml/power/PowerShell.qml"));
+    if let Some(p) = candidate {
+        if p.exists() {
+            return std::fs::canonicalize(&p).unwrap_or(p);
+        }
+    }
+    PathBuf::from("/usr/share/skwd/skwd-power/qml/power/PowerShell.qml")
+}
+
+fn resolve_settings_shell_qml() -> PathBuf {
+    if let Ok(p) = std::env::var("SKWD_SETTINGS_SHELL_QML") {
+        return PathBuf::from(p);
+    }
+    let settings_qml = resolve_settings_qml();
+    let candidate = settings_qml
+        .parent()
+        .map(|p| p.join("qml/SettingsShell.qml"));
+    if let Some(p) = candidate {
+        if p.exists() {
+            return std::fs::canonicalize(&p).unwrap_or(p);
+        }
+    }
+    PathBuf::from("/usr/share/skwd/skwd-settings/qml/SettingsShell.qml")
+}
+
+fn resolve_host_qml() -> PathBuf {
+    if let Ok(p) = std::env::var("SKWD_HOST_QML") {
+        return PathBuf::from(p);
+    }
+    let local = PathBuf::from("data/host/shell.qml");
+    if local.exists() {
+        return std::fs::canonicalize(&local).unwrap_or(local);
+    }
+    let sibling = PathBuf::from("../skwd-daemon/data/host/shell.qml");
+    if sibling.exists() {
+        return std::fs::canonicalize(&sibling).unwrap_or(sibling);
+    }
+    if let Ok(install) = std::env::var("SKWD_INSTALL") {
+        let p = PathBuf::from(install).join("skwd-daemon/host/shell.qml");
+        if p.exists() {
+            return p;
+        }
+    }
+    PathBuf::from("/usr/share/skwd/skwd-daemon/host/shell.qml")
+}
+
 fn resolve_switch_qml() -> PathBuf {
     resolve_dev_or_system("skwd-switch", "SKWD_SWITCH_QML")
 }
@@ -274,13 +430,13 @@ async fn should_launch_notification(config: &Config) -> bool {
     }
 }
 
-fn switch_fifo_path() -> PathBuf {
+fn host_fifo_path() -> PathBuf {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(format!("{}/skwd/switch-cmd", runtime_dir))
+    PathBuf::from(format!("{}/skwd/host-cmd", runtime_dir))
 }
 
-fn send_switch_cmd(cmd: &str) {
-    let fifo = switch_fifo_path();
+fn send_host_cmd(cmd: &str) {
+    let fifo = host_fifo_path();
     let cmd = format!("{}\n", cmd);
     tokio::spawn(async move {
         match tokio::fs::OpenOptions::new().write(true).open(&fifo).await {
@@ -288,7 +444,7 @@ fn send_switch_cmd(cmd: &str) {
                 let _ = tokio::io::AsyncWriteExt::write_all(&mut f, cmd.as_bytes()).await;
             }
             Err(e) => {
-                warn!("failed to write to switch FIFO: {e}");
+                warn!("failed to write to host FIFO: {e}");
             }
         }
     });
@@ -307,13 +463,8 @@ pub struct SharedState {
     pub db: Arc<Mutex<Connection>>,
     pub db_shared: Arc<Mutex<Connection>>,
     pub ui: Arc<Mutex<ManagedProcess>>,
-    pub bar: Arc<Mutex<ManagedProcess>>,
-    pub launcher: Arc<Mutex<ManagedProcess>>,
-    pub switch: Arc<Mutex<ManagedProcess>>,
-    pub notification: Arc<Mutex<ManagedProcess>>,
+    pub host: Arc<Mutex<ManagedProcess>>,
     pub music_proc: Arc<Mutex<ManagedProcess>>,
-    pub power: Arc<Mutex<ManagedProcess>>,
-    pub settings: Arc<Mutex<ManagedProcess>>,
     pub current_wallpaper: Arc<Mutex<Option<String>>>,
     pub cache_state: Arc<Mutex<CacheState>>,
     pub steam_state: Arc<Mutex<SteamState>>,
@@ -352,13 +503,8 @@ pub async fn run() -> anyhow::Result<()> {
         db: Arc::new(Mutex::new(db::open().expect("failed to open database"))),
         db_shared: Arc::new(Mutex::new(db::open().expect("failed to open shared db"))),
         ui: Arc::new(Mutex::new(ManagedProcess::new("wall-ui", "SKWD_WALL_INSTALL", resolve_shell_qml()))),
-        bar: Arc::new(Mutex::new(ManagedProcess::new("bar", "SKWD_BAR_INSTALL", resolve_bar_qml()))),
-        launcher: Arc::new(Mutex::new(ManagedProcess::new("launcher", "SKWD_LAUNCH_INSTALL", resolve_launch_qml()))),
-        switch: Arc::new(Mutex::new(ManagedProcess::new("switch", "SKWD_SWITCH_INSTALL", resolve_switch_qml()))),
-        notification: Arc::new(Mutex::new(ManagedProcess::new("notification", "SKWD_NOTIFICATION_INSTALL", resolve_notification_qml()))),
+        host: Arc::new(Mutex::new(ManagedProcess::new("host", "SKWD_HOST_INSTALL", resolve_host_qml()))),
         music_proc: Arc::new(Mutex::new(ManagedProcess::new("music", "SKWD_MUSIC_INSTALL", resolve_music_qml()))),
-        power: Arc::new(Mutex::new(ManagedProcess::new("power", "SKWD_POWER_INSTALL", resolve_power_qml()))),
-        settings: Arc::new(Mutex::new(ManagedProcess::new("settings", "SKWD_SETTINGS_INSTALL", resolve_settings_qml()))),
         current_wallpaper: Arc::new(Mutex::new(None)),
         cache_state: Arc::new(Mutex::new(CacheState::default())),
         steam_state,
@@ -375,12 +521,13 @@ pub async fn run() -> anyhow::Result<()> {
         start_music_module(&state).await;
     }
 
-    if should_launch_notification(&config).await {
-        state.notification.lock().await.launch();
-    }
-
     if config.features.music {
         state.music_proc.lock().await.launch();
+    }
+
+    {
+        let extra_env = build_host_env(&config).await;
+        state.host.lock().await.launch_with_env(&extra_env);
     }
 
     {
@@ -766,59 +913,48 @@ async fn dispatch_power(
     state: &SharedState,
 ) -> Response {
     let method = req.method.strip_prefix("power.").unwrap_or(&req.method);
-    match method {
-        "toggle" => {
-            {
-                let mut p = state.power.lock().await;
-                if !p.is_running() {
-                    p.launch();
-                    return Response::ok(req.id, serde_json::json!({"toggled": true, "visible": true}));
-                }
-            }
-            let _ = broadcast_event(event_tx, "skwd.power.toggle", serde_json::json!({}));
-            Response::ok(req.id, serde_json::json!({"toggled": true}))
+    let cmd = match method {
+        "toggle" | "show" | "hide" => method,
+        _ => return Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
+    };
+
+    {
+        let mut host = state.host.lock().await;
+        if !host.is_running() {
+            let config = state.config.read().await.clone();
+            let extra_env = build_host_env(&config).await;
+            host.launch_with_env(&extra_env);
         }
-        "show" => {
-            {
-                let mut p = state.power.lock().await;
-                if !p.is_running() {
-                    p.launch();
-                    return Response::ok(req.id, serde_json::json!({"ok": true, "visible": true}));
-                }
-            }
-            let _ = broadcast_event(event_tx, "skwd.power.show", serde_json::json!({}));
-            Response::ok(req.id, serde_json::json!({"ok": true}))
-        }
-        "hide" => {
-            let _ = broadcast_event(event_tx, "skwd.power.hide", serde_json::json!({}));
-            Response::ok(req.id, serde_json::json!({"ok": true}))
-        }
-        _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
     }
+
+    send_host_cmd(&format!("power.{}", cmd));
+    let _ = broadcast_event(
+        event_tx,
+        &format!("skwd.power.{}", cmd),
+        serde_json::json!({}),
+    );
+    Response::ok(req.id, serde_json::json!({"ok": true}))
 }
 
 async fn dispatch_bar(
     req: &Request,
     event_tx: &broadcast::Sender<String>,
-    state: &SharedState,
+    _state: &SharedState,
 ) -> Response {
     let method = req.method.strip_prefix("bar.").unwrap_or(&req.method);
     match method {
         "toggle" => {
-            let mut bar = state.bar.lock().await;
-            bar.toggle();
-            let running = bar.is_running();
-            drop(bar);
-            let _ = broadcast_event(event_tx, "skwd.bar.toggle", serde_json::json!({"visible": running}));
-            Response::ok(req.id, serde_json::json!({"toggled": true, "visible": running}))
+            send_host_cmd("bar.toggle");
+            let _ = broadcast_event(event_tx, "skwd.bar.toggle", serde_json::json!({}));
+            Response::ok(req.id, serde_json::json!({"ok": true}))
         }
         "show" => {
-            state.bar.lock().await.launch();
+            send_host_cmd("bar.show");
             let _ = broadcast_event(event_tx, "skwd.bar.show", serde_json::json!({}));
             Response::ok(req.id, serde_json::json!({"ok": true}))
         }
         "hide" => {
-            state.bar.lock().await.kill();
+            send_host_cmd("bar.hide");
             let _ = broadcast_event(event_tx, "skwd.bar.hide", serde_json::json!({}));
             Response::ok(req.id, serde_json::json!({"ok": true}))
         }
@@ -909,27 +1045,27 @@ async fn dispatch_launcher(
     state: &SharedState,
 ) -> Response {
     let method = req.method.strip_prefix("launcher.").unwrap_or(&req.method);
-    match method {
-        "toggle" => {
-            let mut launcher = state.launcher.lock().await;
-            launcher.toggle();
-            let running = launcher.is_running();
-            drop(launcher);
-            let _ = broadcast_event(event_tx, "skwd.launcher.toggle", serde_json::json!({"visible": running}));
-            Response::ok(req.id, serde_json::json!({"toggled": true, "visible": running}))
+    let cmd = match method {
+        "toggle" | "show" | "hide" => method,
+        _ => return Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
+    };
+
+    {
+        let mut host = state.host.lock().await;
+        if !host.is_running() {
+            let config = state.config.read().await.clone();
+            let extra_env = build_host_env(&config).await;
+            host.launch_with_env(&extra_env);
         }
-        "show" => {
-            state.launcher.lock().await.launch();
-            let _ = broadcast_event(event_tx, "skwd.launcher.show", serde_json::json!({}));
-            Response::ok(req.id, serde_json::json!({"ok": true}))
-        }
-        "hide" => {
-            state.launcher.lock().await.kill();
-            let _ = broadcast_event(event_tx, "skwd.launcher.hide", serde_json::json!({}));
-            Response::ok(req.id, serde_json::json!({"ok": true}))
-        }
-        _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
     }
+
+    send_host_cmd(&format!("launcher.{}", cmd));
+    let _ = broadcast_event(
+        event_tx,
+        &format!("skwd.launcher.{}", cmd),
+        serde_json::json!({}),
+    );
+    Response::ok(req.id, serde_json::json!({"ok": true}))
 }
 
 async fn dispatch_dev(
@@ -982,81 +1118,43 @@ async fn dispatch_settings(
     state: &SharedState,
 ) -> Response {
     let method = req.method.strip_prefix("settings.").unwrap_or(&req.method);
-    match method {
-        "toggle" => {
-            let mut settings = state.settings.lock().await;
-            settings.toggle();
-            let running = settings.is_running();
-            drop(settings);
-            let _ = broadcast_event(event_tx, "skwd.settings.toggle", serde_json::json!({"visible": running}));
-            Response::ok(req.id, serde_json::json!({"toggled": true, "visible": running}))
+    let cmd = match method {
+        "toggle" | "show" | "hide" => method,
+        _ => return Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
+    };
+
+    {
+        let mut host = state.host.lock().await;
+        if !host.is_running() {
+            let config = state.config.read().await.clone();
+            let extra_env = build_host_env(&config).await;
+            host.launch_with_env(&extra_env);
         }
-        "show" => {
-            state.settings.lock().await.launch();
-            let _ = broadcast_event(event_tx, "skwd.settings.show", serde_json::json!({}));
-            Response::ok(req.id, serde_json::json!({"ok": true}))
-        }
-        "hide" => {
-            state.settings.lock().await.kill();
-            let _ = broadcast_event(event_tx, "skwd.settings.hide", serde_json::json!({}));
-            Response::ok(req.id, serde_json::json!({"ok": true}))
-        }
-        _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
     }
+
+    send_host_cmd(&format!("settings.{}", cmd));
+    let _ = broadcast_event(
+        event_tx,
+        &format!("skwd.settings.{}", cmd),
+        serde_json::json!({}),
+    );
+    Response::ok(req.id, serde_json::json!({"ok": true}))
 }
 
 async fn dispatch_switch(
     req: &Request,
     event_tx: &broadcast::Sender<String>,
-    state: &SharedState,
+    _state: &SharedState,
 ) -> Response {
     let method = req.method.strip_prefix("switch.").unwrap_or(&req.method);
-    match method {
-        "open" => {
-            let mut sw = state.switch.lock().await;
-            if !sw.is_running() {
-                sw.launch();
-            } else {
-                send_switch_cmd("open");
-            }
-            drop(sw);
-            let _ = broadcast_event(event_tx, "skwd.switch.open", serde_json::json!({}));
-            Response::ok(req.id, serde_json::json!({"ok": true}))
-        }
-        "next" => {
-            {
-                let mut sw = state.switch.lock().await;
-                if !sw.is_running() {
-                    sw.launch();
-                    return Response::ok(req.id, serde_json::json!({"ok": true}));
-                }
-            }
-            send_switch_cmd("next");
-            Response::ok(req.id, serde_json::json!({"ok": true}))
-        }
-        "prev" => {
-            send_switch_cmd("prev");
-            Response::ok(req.id, serde_json::json!({"ok": true}))
-        }
-        "confirm" => {
-            send_switch_cmd("confirm");
-            Response::ok(req.id, serde_json::json!({"ok": true}))
-        }
-        "cancel" => {
-            send_switch_cmd("cancel");
-            Response::ok(req.id, serde_json::json!({"ok": true}))
-        }
-        "close" => {
-            send_switch_cmd("close");
-            Response::ok(req.id, serde_json::json!({"ok": true}))
-        }
-        "hide" => {
-            state.switch.lock().await.kill();
-            let _ = broadcast_event(event_tx, "skwd.switch.hide", serde_json::json!({}));
-            Response::ok(req.id, serde_json::json!({"ok": true}))
-        }
-        _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
-    }
+    let cmd = match method {
+        "open" | "next" | "prev" | "confirm" | "cancel" | "close" => method,
+        "hide" => "cancel",
+        _ => return Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
+    };
+    send_host_cmd(&format!("switch.{}", cmd));
+    let _ = broadcast_event(event_tx, &format!("skwd.switch.{}", method), serde_json::json!({}));
+    Response::ok(req.id, serde_json::json!({"ok": true}))
 }
 
 async fn dispatch_request(

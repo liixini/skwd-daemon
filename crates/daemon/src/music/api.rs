@@ -112,10 +112,6 @@ impl ApiClient {
         Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
     }
 
-    pub async fn me(&self) -> Result<Value> {
-        self.get_json(&format!("{}/me", BASE)).await
-    }
-
     pub async fn devices(&self) -> Result<Value> {
         self.get_json(&format!("{}/me/player/devices", BASE)).await
     }

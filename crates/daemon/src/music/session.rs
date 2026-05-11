@@ -13,10 +13,6 @@ impl SessionStore {
         Self::default()
     }
 
-    pub async fn current(&self) -> Option<Session> {
-        self.inner.lock().await.clone()
-    }
-
     pub async fn ensure(&self) -> Result<Session> {
         let mut guard = self.inner.lock().await;
         if let Some(s) = guard.as_ref() {

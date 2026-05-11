@@ -1,7 +1,7 @@
 use anyhow::Result;
 use mpris_server::{
     LoopStatus, Metadata, PlaybackRate, PlaybackStatus, PlayerInterface, Property, RootInterface,
-    Server, Signal, Time, TrackId, Volume,
+    Server, Time, TrackId, Volume,
     zbus::{self, fdo},
 };
 use std::sync::Arc;

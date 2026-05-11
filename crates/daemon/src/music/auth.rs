@@ -73,7 +73,7 @@ impl AuthStore {
     }
 
     pub async fn ensure_fresh(&self, client_id: &str) -> Result<Option<StoredTokens>> {
-        let mut state = self.inner.lock().await;
+        let state = self.inner.lock().await;
         let Some(tokens) = state.tokens.clone() else {
             return Ok(None);
         };
@@ -207,10 +207,6 @@ fn urlencoded(s: &str) -> String {
         }
     }
     out
-}
-
-pub fn redirect_uri() -> &'static str {
-    REDIRECT_URI
 }
 
 pub fn redirect_listen_addr() -> std::net::SocketAddr {

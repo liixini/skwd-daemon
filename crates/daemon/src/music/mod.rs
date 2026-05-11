@@ -1,5 +1,4 @@
 use anyhow::Result;
-use librespot::core::authentication::Credentials;
 use serde_json::{Value, json};
 use skwd_proto::{Request, Response};
 use tokio::sync::broadcast;
