@@ -102,6 +102,11 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 
     let _ = conn.execute("ALTER TABLE meta ADD COLUMN analysis_error TEXT", []);
 
+    let _ = conn.execute(
+        "ALTER TABLE lyrics ADD COLUMN not_found INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+
     let _ = conn.execute("ALTER TABLE meta ADD COLUMN weather TEXT", []);
 
     

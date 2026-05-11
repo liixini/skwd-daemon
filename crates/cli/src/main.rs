@@ -4,6 +4,7 @@ use skwd_proto::Request;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+mod gen_icons;
 mod optimize_videos;
 
 #[tokio::main]
@@ -13,11 +14,13 @@ async fn main() {
     if args.is_empty() {
         eprintln!("usage: skwd <namespace> <method> [json-params]");
         eprintln!("       skwd optimize-videos [DIR_OR_FILE...]");
+        eprintln!("       skwd gen-icons [--font PATH] [--output PATH]");
         eprintln!("examples:");
         eprintln!("  skwd wall toggle");
         eprintln!("  skwd wall apply '{{\"name\":\"sunset.jpg\"}}'");
         eprintln!("  skwd status");
         eprintln!("  skwd optimize-videos");
+        eprintln!("  skwd gen-icons");
         process::exit(1);
     }
 
@@ -26,20 +29,31 @@ async fn main() {
         process::exit(code);
     }
 
+    if args[0] == "gen-icons" {
+        let code = gen_icons::run(&args[1..]);
+        process::exit(code);
+    }
+
     let (method, params) = if args.len() >= 2 {
-        let method = format!("{}.{}", args[0], args[1]);
-        let params = if args.len() >= 3 {
-            match serde_json::from_str(&args[2]) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("invalid JSON params: {e}");
-                    process::exit(1);
+        let mut method_parts: Vec<String> = vec![args[0].clone(), args[1].clone()];
+        let mut params = serde_json::Value::Object(serde_json::Map::new());
+        for a in &args[2..] {
+            let trimmed = a.trim_start();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                match serde_json::from_str::<serde_json::Value>(a) {
+                    Ok(v) => {
+                        params = v;
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("invalid JSON params: {e}");
+                        process::exit(1);
+                    }
                 }
             }
-        } else {
-            serde_json::Value::Object(serde_json::Map::new())
-        };
-        (method, params)
+            method_parts.push(a.clone());
+        }
+        (method_parts.join("."), params)
     } else {
         (args[0].clone(), serde_json::Value::Object(serde_json::Map::new()))
     };

@@ -39,21 +39,29 @@ static MX_TOKEN: std::sync::LazyLock<StdMutex<Option<(String, Instant)>>> =
 
 const MX_TOKEN_TTL_SECS: u64 = 600;
 
-pub fn get_lyrics(conn: &Connection, artist: &str, title: &str) -> Option<LyricsData> {
-    let row: Option<(String, i64)> = conn
+pub enum CachedLyrics {
+    Hit(LyricsData),
+    KnownMiss,
+}
+
+pub fn lookup_lyrics(conn: &Connection, artist: &str, title: &str) -> Option<CachedLyrics> {
+    let row: Option<(String, i64, i64)> = conn
         .query_row(
-            "SELECT data, enhanced FROM lyrics WHERE artist=?1 AND title=?2",
+            "SELECT data, enhanced, not_found FROM lyrics WHERE artist=?1 AND title=?2",
             params![artist, title],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .ok();
 
-    let (data_json, enhanced_int) = row?;
+    let (data_json, enhanced_int, not_found_int) = row?;
+    if not_found_int != 0 {
+        return Some(CachedLyrics::KnownMiss);
+    }
     let lines: Vec<LyricLine> = serde_json::from_str(&data_json).ok()?;
-    Some(LyricsData {
+    Some(CachedLyrics::Hit(LyricsData {
         enhanced: enhanced_int != 0,
         lines,
-    })
+    }))
 }
 
 pub fn upsert_lyrics(
@@ -70,11 +78,27 @@ pub fn upsert_lyrics(
         .as_secs()
         .cast_signed();
     conn.execute(
-        "INSERT INTO lyrics(artist, title, enhanced, data, fetched_at)
-         VALUES(?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO lyrics(artist, title, enhanced, data, fetched_at, not_found)
+         VALUES(?1, ?2, ?3, ?4, ?5, 0)
          ON CONFLICT(artist, title) DO UPDATE SET
-           enhanced=excluded.enhanced, data=excluded.data, fetched_at=excluded.fetched_at",
+           enhanced=excluded.enhanced, data=excluded.data, fetched_at=excluded.fetched_at, not_found=0",
         params![artist, title, i64::from(enhanced), data, now],
+    )?;
+    Ok(())
+}
+
+pub fn mark_not_found(conn: &Connection, artist: &str, title: &str) -> rusqlite::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .cast_signed();
+    conn.execute(
+        "INSERT INTO lyrics(artist, title, enhanced, data, fetched_at, not_found)
+         VALUES(?1, ?2, 0, '[]', ?3, 1)
+         ON CONFLICT(artist, title) DO UPDATE SET
+           data='[]', enhanced=0, fetched_at=excluded.fetched_at, not_found=1",
+        params![artist, title, now],
     )?;
     Ok(())
 }
@@ -753,7 +777,31 @@ pub async fn dispatch(
     let method = req.method.strip_prefix("lyrics.").unwrap_or(&req.method);
 
     match method {
-        "get" => {
+        "peek" => {
+            let artist = req.str_param("artist", "").to_string();
+            let title = req.str_param("title", "").to_string();
+            if artist.is_empty() || title.is_empty() {
+                return Response::err(req.id, -32602, "missing artist or title".to_string());
+            }
+            let db = state.db.lock().await;
+            match lookup_lyrics(&db, &artist, &title) {
+                Some(CachedLyrics::Hit(data)) => Response::ok(
+                    req.id,
+                    serde_json::json!({
+                        "lines": data.lines,
+                        "enhanced": data.enhanced,
+                        "cached": true,
+                    }),
+                ),
+                Some(CachedLyrics::KnownMiss) => Response::ok(
+                    req.id,
+                    serde_json::json!({ "cached": true, "notFound": true }),
+                ),
+                None => Response::ok(req.id, serde_json::json!({ "cacheMiss": true })),
+            }
+        }
+
+        "get" | "fetch" => {
             let artist = req.str_param("artist", "").to_string();
             let title = req.str_param("title", "").to_string();
             if artist.is_empty() || title.is_empty() {
@@ -762,16 +810,31 @@ pub async fn dispatch(
 
             {
                 let db = state.db.lock().await;
-                if let Some(data) = get_lyrics(&db, &artist, &title) {
-                    debug!("lyrics cache hit for {artist} - {title}");
-                    return Response::ok(
-                        req.id,
-                        serde_json::json!({
-                            "lines": data.lines,
-                            "enhanced": data.enhanced,
-                            "cached": true,
-                        }),
-                    );
+                match lookup_lyrics(&db, &artist, &title) {
+                    Some(CachedLyrics::Hit(data)) => {
+                        debug!("lyrics cache hit for {artist} - {title}");
+                        return Response::ok(
+                            req.id,
+                            serde_json::json!({
+                                "lines": data.lines,
+                                "enhanced": data.enhanced,
+                                "cached": true,
+                            }),
+                        );
+                    }
+                    Some(CachedLyrics::KnownMiss) => {
+                        debug!("lyrics known-miss for {artist} - {title}");
+                        return Response::ok(
+                            req.id,
+                            serde_json::json!({
+                                "lines": [],
+                                "enhanced": false,
+                                "cached": true,
+                                "notFound": true,
+                            }),
+                        );
+                    }
+                    None => {}
                 }
             }
 
@@ -822,14 +885,21 @@ pub async fn dispatch(
                         }),
                     )
                 }
-                None => Response::ok(
-                    req.id,
-                    serde_json::json!({
-                        "lines": [],
-                        "enhanced": false,
-                        "notFound": true,
-                    }),
-                ),
+                None => {
+                    let db = state.db.lock().await;
+                    if let Err(e) = mark_not_found(&db, &artist, &title) {
+                        warn!("failed to record lyrics not-found: {e}");
+                    }
+                    Response::ok(
+                        req.id,
+                        serde_json::json!({
+                            "lines": [],
+                            "enhanced": false,
+                            "cached": false,
+                            "notFound": true,
+                        }),
+                    )
+                }
             }
         }
 

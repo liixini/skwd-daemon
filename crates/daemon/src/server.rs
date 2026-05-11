@@ -169,6 +169,10 @@ fn resolve_power_qml() -> PathBuf {
     resolve_dev_or_system("skwd-power", "SKWD_POWER_QML")
 }
 
+fn resolve_settings_qml() -> PathBuf {
+    resolve_dev_or_system("skwd-settings", "SKWD_SETTINGS_QML")
+}
+
 async fn start_music_module(state: &SharedState) {
     use crate::music::mpris;
     {
@@ -309,6 +313,7 @@ pub struct SharedState {
     pub notification: Arc<Mutex<ManagedProcess>>,
     pub music_proc: Arc<Mutex<ManagedProcess>>,
     pub power: Arc<Mutex<ManagedProcess>>,
+    pub settings: Arc<Mutex<ManagedProcess>>,
     pub current_wallpaper: Arc<Mutex<Option<String>>>,
     pub cache_state: Arc<Mutex<CacheState>>,
     pub steam_state: Arc<Mutex<SteamState>>,
@@ -353,6 +358,7 @@ pub async fn run() -> anyhow::Result<()> {
         notification: Arc::new(Mutex::new(ManagedProcess::new("notification", "SKWD_NOTIFICATION_INSTALL", resolve_notification_qml()))),
         music_proc: Arc::new(Mutex::new(ManagedProcess::new("music", "SKWD_MUSIC_INSTALL", resolve_music_qml()))),
         power: Arc::new(Mutex::new(ManagedProcess::new("power", "SKWD_POWER_INSTALL", resolve_power_qml()))),
+        settings: Arc::new(Mutex::new(ManagedProcess::new("settings", "SKWD_SETTINGS_INSTALL", resolve_settings_qml()))),
         current_wallpaper: Arc::new(Mutex::new(None)),
         cache_state: Arc::new(Mutex::new(CacheState::default())),
         steam_state,
@@ -816,8 +822,85 @@ async fn dispatch_bar(
             let _ = broadcast_event(event_tx, "skwd.bar.hide", serde_json::json!({}));
             Response::ok(req.id, serde_json::json!({"ok": true}))
         }
+        "mouseover" => match toggle_shell_path_bool(
+            &["components", "bar", "mouseoverEnabled"],
+            req.params.get("state").and_then(|v| v.as_bool()),
+            true,
+        ) {
+            Ok(new_state) => {
+                let _ = broadcast_event(
+                    event_tx,
+                    "skwd.bar.mouseover",
+                    serde_json::json!({ "enabled": new_state }),
+                );
+                Response::ok(req.id, serde_json::json!({ "enabled": new_state }))
+            }
+            Err(e) => Response::err(req.id, -32603, format!("config update failed: {e}")),
+        },
+        "visualizer.clean" => match toggle_shell_path_bool(
+            &["components", "bar", "music", "cleanVisualizer"],
+            req.params.get("state").and_then(|v| v.as_bool()),
+            false,
+        ) {
+            Ok(new_state) => {
+                let _ = broadcast_event(
+                    event_tx,
+                    "skwd.bar.visualizer.clean",
+                    serde_json::json!({ "enabled": new_state }),
+                );
+                Response::ok(req.id, serde_json::json!({ "enabled": new_state }))
+            }
+            Err(e) => Response::err(req.id, -32603, format!("config update failed: {e}")),
+        },
         _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
     }
+}
+
+fn toggle_shell_path_bool(
+    path: &[&str],
+    explicit: Option<bool>,
+    default_when_missing: bool,
+) -> anyhow::Result<bool> {
+    let cfg_path = crate::config::shell_config_path();
+    if let Some(parent) = cfg_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut root: serde_json::Value = if cfg_path.exists() {
+        let text = std::fs::read_to_string(&cfg_path)?;
+        serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    let current = path
+        .iter()
+        .try_fold(&root, |acc, k| acc.get(*k))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(default_when_missing);
+
+    let next = explicit.unwrap_or(!current);
+
+    let mut node = &mut root;
+    for (i, key) in path.iter().enumerate() {
+        if i == path.len() - 1 {
+            if let serde_json::Value::Object(map) = node {
+                map.insert((*key).to_string(), serde_json::Value::Bool(next));
+            }
+        } else {
+            if !node.is_object() {
+                *node = serde_json::Value::Object(serde_json::Map::new());
+            }
+            let map = node.as_object_mut().unwrap();
+            if !map.contains_key(*key) {
+                map.insert((*key).to_string(), serde_json::json!({}));
+            }
+            node = map.get_mut(*key).unwrap();
+        }
+    }
+
+    let serialized = serde_json::to_string_pretty(&root)?;
+    std::fs::write(&cfg_path, serialized + "\n")?;
+    Ok(next)
 }
 
 async fn dispatch_launcher(
@@ -843,6 +926,79 @@ async fn dispatch_launcher(
         "hide" => {
             state.launcher.lock().await.kill();
             let _ = broadcast_event(event_tx, "skwd.launcher.hide", serde_json::json!({}));
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+        _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
+    }
+}
+
+async fn dispatch_dev(
+    req: &Request,
+    event_tx: &broadcast::Sender<String>,
+) -> Response {
+    let action = req
+        .method
+        .strip_prefix("dev.")
+        .unwrap_or("toggle");
+    let explicit = match action {
+        "enable" | "on"  => Some(true),
+        "disable" | "off" => Some(false),
+        "toggle"          => None,
+        "status"          => Some(read_dev_flag()),
+        other => return Response::err(req.id, -32601, format!("unknown dev action: {other}")),
+    };
+    if action == "status" {
+        return Response::ok(req.id, serde_json::json!({ "enabled": explicit.unwrap_or(false) }));
+    }
+    match toggle_shell_path_bool(&["dev"], explicit, false) {
+        Ok(new_state) => {
+            let _ = broadcast_event(
+                event_tx,
+                "skwd.dev",
+                serde_json::json!({ "enabled": new_state }),
+            );
+            Response::ok(req.id, serde_json::json!({ "enabled": new_state }))
+        }
+        Err(e) => Response::err(req.id, -32603, format!("config update failed: {e}")),
+    }
+}
+
+fn read_dev_flag() -> bool {
+    let cfg_path = crate::config::shell_config_path();
+    if !cfg_path.exists() {
+        return false;
+    }
+    let text = match std::fs::read_to_string(&cfg_path) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let root: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({}));
+    root.get("dev").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+async fn dispatch_settings(
+    req: &Request,
+    event_tx: &broadcast::Sender<String>,
+    state: &SharedState,
+) -> Response {
+    let method = req.method.strip_prefix("settings.").unwrap_or(&req.method);
+    match method {
+        "toggle" => {
+            let mut settings = state.settings.lock().await;
+            settings.toggle();
+            let running = settings.is_running();
+            drop(settings);
+            let _ = broadcast_event(event_tx, "skwd.settings.toggle", serde_json::json!({"visible": running}));
+            Response::ok(req.id, serde_json::json!({"toggled": true, "visible": running}))
+        }
+        "show" => {
+            state.settings.lock().await.launch();
+            let _ = broadcast_event(event_tx, "skwd.settings.show", serde_json::json!({}));
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+        "hide" => {
+            state.settings.lock().await.kill();
+            let _ = broadcast_event(event_tx, "skwd.settings.hide", serde_json::json!({}));
             Response::ok(req.id, serde_json::json!({"ok": true}))
         }
         _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
@@ -923,6 +1079,12 @@ async fn dispatch_request(
     }
     if req.method.starts_with("launcher.") {
         return dispatch_launcher(req, event_tx, state).await;
+    }
+    if req.method.starts_with("settings.") {
+        return dispatch_settings(req, event_tx, state).await;
+    }
+    if req.method.starts_with("dev.") || req.method == "dev" {
+        return dispatch_dev(req, event_tx).await;
     }
     if req.method.starts_with("switch.") {
         return dispatch_switch(req, event_tx, state).await;
