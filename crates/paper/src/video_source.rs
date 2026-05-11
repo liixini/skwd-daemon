@@ -246,8 +246,8 @@ impl VideoSource {
                         self.pending_frame_pts_secs = Some(self.current_decoded_pts_secs());
                     } else {
                         self.pending_frame_pts_secs = None;
-                        break;
                     }
+                    break;
                 }
                 Err(e) => {
                     tracing::warn!("VideoSource decode: {e:?}");
