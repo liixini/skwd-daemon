@@ -5,7 +5,7 @@ import QtQuick
 ShellRoot {
   id: host
 
-  readonly property string fifoPath: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/skwd/host-cmd"
+  readonly property string socketPath: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/skwd/daemon.sock"
   readonly property string launcherShellPath:     Quickshell.env("SKWD_LAUNCH_SHELL")
   readonly property string barShellPath:          Quickshell.env("SKWD_BAR_SHELL")
   readonly property string switchShellPath:       Quickshell.env("SKWD_SWITCH_SHELL")
@@ -137,54 +137,65 @@ ShellRoot {
     else powerLoader._pendingShow = false
   }
 
-  function _dispatch(cmd) {
-    if (!cmd) return
-    switch (cmd) {
-    case "launcher.toggle": _launcherToggle(); break
-    case "launcher.show":   _launcherShow();   break
-    case "launcher.hide":   _launcherHide();   break
-    case "bar.show":        _barShow();        break
-    case "bar.hide":        _barHide();        break
-    case "bar.toggle":      _barToggle();      break
-    case "switch.open":     _switchOpen();     break
-    case "switch.next":     _switchNext();     break
-    case "switch.prev":     _switchPrev();     break
-    case "switch.confirm":  _switchConfirm();  break
-    case "switch.cancel":   _switchCancel();   break
-    case "switch.close":    _switchClose();    break
-    case "settings.toggle": _settingsToggle(); break
-    case "settings.show":   _settingsShow();   break
-    case "settings.hide":   _settingsHide();   break
-    case "power.toggle":    _powerToggle();    break
-    case "power.show":      _powerShow();      break
-    case "power.hide":      _powerHide();      break
+  function _dispatch(ev) {
+    if (!ev) return
+    switch (ev) {
+    case "skwd.launcher.toggle": _launcherToggle(); break
+    case "skwd.launcher.show":   _launcherShow();   break
+    case "skwd.launcher.hide":   _launcherHide();   break
+    case "skwd.bar.show":        _barShow();        break
+    case "skwd.bar.hide":        _barHide();        break
+    case "skwd.bar.toggle":      _barToggle();      break
+    case "skwd.switch.open":     _switchOpen();     break
+    case "skwd.switch.next":     _switchNext();     break
+    case "skwd.switch.prev":     _switchPrev();     break
+    case "skwd.switch.confirm":  _switchConfirm();  break
+    case "skwd.switch.cancel":   _switchCancel();   break
+    case "skwd.switch.hide":     _switchCancel();   break
+    case "skwd.switch.close":    _switchClose();    break
+    case "skwd.settings.toggle": _settingsToggle(); break
+    case "skwd.settings.show":   _settingsShow();   break
+    case "skwd.settings.hide":   _settingsHide();   break
+    case "skwd.power.toggle":    _powerToggle();    break
+    case "skwd.power.show":      _powerShow();      break
+    case "skwd.power.hide":      _powerHide();      break
     }
   }
 
-  Process {
-    id: _fifoSetup
-    command: ["sh", "-c",
-      "FIFO=" + JSON.stringify(host.fifoPath) + "; " +
-      "mkdir -p \"$(dirname \"$FIFO\")\"; " +
-      "fuser -k \"$FIFO\" 2>/dev/null; sleep 0.1; " +
-      "rm -f \"$FIFO\"; mkfifo -m 600 \"$FIFO\""]
-    running: true
-    onExited: _fifoReader.running = true
-  }
+  property var _socket: Socket {
+    path: host.socketPath
+    connected: false
 
-  Process {
-    id: _fifoReader
-    running: false
-    command: ["sh", "-c", "trap 'exit 0' TERM HUP INT; while true; do cat " + JSON.stringify(host.fifoPath) + "; done"]
-    stdout: SplitParser {
-      onRead: line => host._dispatch(line.trim())
+    parser: SplitParser {
+      onRead: line => {
+        var trimmed = (line || "").trim()
+        if (!trimmed) return
+        var msg
+        try { msg = JSON.parse(trimmed) } catch (e) { return }
+        if (msg && msg.event) host._dispatch(msg.event)
+      }
     }
-    onExited: _restartTimer.start()
+
+    onConnectionStateChanged: {
+      if (connected) {
+        var sub = JSON.stringify({
+          method: "subscribe",
+          params: { events: ["skwd.bar.", "skwd.launcher.", "skwd.switch.", "skwd.settings.", "skwd.power."] },
+          id: 1
+        })
+        write(sub + "\n")
+        flush()
+      } else {
+        _reconnectTimer.restart()
+      }
+    }
   }
 
-  Timer {
-    id: _restartTimer
+  property var _reconnectTimer: Timer {
     interval: 1000
-    onTriggered: _fifoReader.running = true
+    repeat: false
+    onTriggered: { if (!host._socket.connected) host._socket.connected = true }
   }
+
+  Component.onCompleted: { host._socket.connected = true }
 }

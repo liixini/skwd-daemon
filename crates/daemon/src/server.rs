@@ -430,26 +430,6 @@ async fn should_launch_notification(config: &Config) -> bool {
     }
 }
 
-fn host_fifo_path() -> PathBuf {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(format!("{}/skwd/host-cmd", runtime_dir))
-}
-
-fn send_host_cmd(cmd: &str) {
-    let fifo = host_fifo_path();
-    let cmd = format!("{}\n", cmd);
-    tokio::spawn(async move {
-        match tokio::fs::OpenOptions::new().write(true).open(&fifo).await {
-            Ok(mut f) => {
-                let _ = tokio::io::AsyncWriteExt::write_all(&mut f, cmd.as_bytes()).await;
-            }
-            Err(e) => {
-                warn!("failed to write to host FIFO: {e}");
-            }
-        }
-    });
-}
-
 pub struct RandomRotation {
     pub handle: tokio::task::JoinHandle<()>,
     pub interval_secs: u64,
@@ -927,7 +907,6 @@ async fn dispatch_power(
         }
     }
 
-    send_host_cmd(&format!("power.{}", cmd));
     let _ = broadcast_event(
         event_tx,
         &format!("skwd.power.{}", cmd),
@@ -944,17 +923,14 @@ async fn dispatch_bar(
     let method = req.method.strip_prefix("bar.").unwrap_or(&req.method);
     match method {
         "toggle" => {
-            send_host_cmd("bar.toggle");
             let _ = broadcast_event(event_tx, "skwd.bar.toggle", serde_json::json!({}));
             Response::ok(req.id, serde_json::json!({"ok": true}))
         }
         "show" => {
-            send_host_cmd("bar.show");
             let _ = broadcast_event(event_tx, "skwd.bar.show", serde_json::json!({}));
             Response::ok(req.id, serde_json::json!({"ok": true}))
         }
         "hide" => {
-            send_host_cmd("bar.hide");
             let _ = broadcast_event(event_tx, "skwd.bar.hide", serde_json::json!({}));
             Response::ok(req.id, serde_json::json!({"ok": true}))
         }
@@ -1059,7 +1035,6 @@ async fn dispatch_launcher(
         }
     }
 
-    send_host_cmd(&format!("launcher.{}", cmd));
     let _ = broadcast_event(
         event_tx,
         &format!("skwd.launcher.{}", cmd),
@@ -1132,7 +1107,6 @@ async fn dispatch_settings(
         }
     }
 
-    send_host_cmd(&format!("settings.{}", cmd));
     let _ = broadcast_event(
         event_tx,
         &format!("skwd.settings.{}", cmd),
@@ -1147,12 +1121,10 @@ async fn dispatch_switch(
     _state: &SharedState,
 ) -> Response {
     let method = req.method.strip_prefix("switch.").unwrap_or(&req.method);
-    let cmd = match method {
-        "open" | "next" | "prev" | "confirm" | "cancel" | "close" => method,
-        "hide" => "cancel",
+    match method {
+        "open" | "next" | "prev" | "confirm" | "cancel" | "close" | "hide" => {}
         _ => return Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
     };
-    send_host_cmd(&format!("switch.{}", cmd));
     let _ = broadcast_event(event_tx, &format!("skwd.switch.{}", method), serde_json::json!({}));
     Response::ok(req.id, serde_json::json!({"ok": true}))
 }
