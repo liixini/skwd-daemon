@@ -578,8 +578,25 @@ pub async fn run() -> anyhow::Result<()> {
                 match crate::config::load() {
                     Ok(new_cfg) => {
                         info!("[config] reloaded from {}", config_path.display());
+                        let prev_engine = state.config.read().await.paper.engine;
+                        let new_engine = new_cfg.paper.engine;
                         *state.config.write().await = new_cfg;
                         let _ = broadcast_event(&tx, "skwd.wall.config_changed", serde_json::json!({}));
+
+                        if prev_engine != new_engine {
+                            info!(
+                                "[config] paper.engine changed: {:?} -> {:?}, re-applying static wallpapers",
+                                prev_engine, new_engine
+                            );
+                            let cfg_snapshot = state.config.read().await.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    crate::wall::apply::reapply_statics_for_engine_change(&cfg_snapshot).await
+                                {
+                                    warn!("[config] engine-change re-apply failed: {e}");
+                                }
+                            });
+                        }
                     }
                     Err(e) => {
                         warn!("[config] reload failed: {e}");

@@ -1781,6 +1781,36 @@ pub async fn restore(config: &Config) -> anyhow::Result<String> {
     }
 }
 
+pub async fn reapply_statics_for_engine_change(config: &Config) -> anyhow::Result<()> {
+    let outputs_state = read_outputs_state(&config.cache_dir()).await;
+    let map = outputs_state.as_object().cloned().unwrap_or_default();
+    if map.is_empty() {
+        return Ok(());
+    }
+
+    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+    for (output, entry) in &map {
+        let wp_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        if wp_type != "static" || path.is_empty() {
+            continue;
+        }
+        groups.entry(path.to_string()).or_default().push(output.clone());
+    }
+
+    for (path, outs) in groups {
+        let outputs_arg: Vec<String> = if outs.iter().any(|o| o == "*") {
+            Vec::new()
+        } else {
+            outs
+        };
+        if let Err(e) = apply_static_inner(&path, &outputs_arg, &[], &[], config, true).await {
+            warn!("engine-change re-apply failed for {path}: {e}");
+        }
+    }
+    Ok(())
+}
+
 pub async fn retheme(
     config: &Config,
     scheme: Option<&str>,
