@@ -13,10 +13,38 @@ ShellRoot {
   readonly property string settingsShellPath:     Quickshell.env("SKWD_SETTINGS_SHELL")
   readonly property string powerShellPath:        Quickshell.env("SKWD_POWER_SHELL")
 
+  readonly property string _configPath: (Quickshell.env("SKWD_CONFIG")
+    || ((Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config")) + "/skwd"))
+    + "/data/config.json"
+
+  property var _programs: ({})
+  readonly property bool progLaunchEnabled:       _programs.launch       !== false
+  readonly property bool progBarEnabled:          _programs.bar          !== false
+  readonly property bool progSwitchEnabled:       _programs["switch"]    !== false
+  readonly property bool progNotificationEnabled: _programs.notification !== false
+  readonly property bool progPowerEnabled:        _programs.power        !== false
+
+  property var _configFile: FileView {
+    path: host._configPath
+    preload: true
+    watchChanges: true
+    onLoaded: host._reparseConfig()
+    onFileChanged: { reload(); host._reparseConfig() }
+  }
+
+  function _reparseConfig() {
+    var raw = _configFile.text() || ""
+    if (!raw) return
+    try {
+      var parsed = JSON.parse(raw)
+      host._programs = (parsed && typeof parsed.programs === "object" && parsed.programs !== null) ? parsed.programs : ({})
+    } catch (e) {}
+  }
+
   LazyLoader {
     id: launcherLoader
     source: host.launcherShellPath.length > 0 ? "file://" + host.launcherShellPath : ""
-    activeAsync: host.launcherShellPath.length > 0
+    activeAsync: host.launcherShellPath.length > 0 && host.progLaunchEnabled
     onItemChanged: if (item) { item.showing = launcherLoader._pendingShow; launcherLoader._pendingShow = false }
     property bool _pendingShow: false
   }
@@ -24,19 +52,19 @@ ShellRoot {
   LazyLoader {
     id: barLoader
     source: host.barShellPath.length > 0 ? "file://" + host.barShellPath : ""
-    activeAsync: host.barShellPath.length > 0
+    activeAsync: host.barShellPath.length > 0 && host.progBarEnabled
   }
 
   LazyLoader {
     id: switchLoader
     source: host.switchShellPath.length > 0 ? "file://" + host.switchShellPath : ""
-    activeAsync: host.switchShellPath.length > 0
+    activeAsync: host.switchShellPath.length > 0 && host.progSwitchEnabled
   }
 
   LazyLoader {
     id: notificationLoader
     source: host.notificationShellPath.length > 0 ? "file://" + host.notificationShellPath : ""
-    activeAsync: host.notificationShellPath.length > 0
+    activeAsync: host.notificationShellPath.length > 0 && host.progNotificationEnabled
   }
 
   LazyLoader {
@@ -51,18 +79,20 @@ ShellRoot {
   LazyLoader {
     id: powerLoader
     source: host.powerShellPath.length > 0 ? "file://" + host.powerShellPath : ""
-    activeAsync: powerLoader._wantActive
+    activeAsync: powerLoader._wantActive && host.progPowerEnabled
     onItemChanged: if (item) { item.showing = powerLoader._pendingShow; powerLoader._pendingShow = false }
     property bool _wantActive: false
     property bool _pendingShow: false
   }
 
   function _launcherToggle() {
+    if (!host.progLaunchEnabled) return
     if (launcherLoader.item) launcherLoader.item.showing = !launcherLoader.item.showing
     else launcherLoader._pendingShow = !launcherLoader._pendingShow
   }
 
   function _launcherShow() {
+    if (!host.progLaunchEnabled) return
     if (launcherLoader.item) launcherLoader.item.showing = true
     else launcherLoader._pendingShow = true
   }
@@ -72,11 +102,11 @@ ShellRoot {
     else launcherLoader._pendingShow = false
   }
 
-  function _barShow()   { if (barLoader.item) barLoader.item.showBar()   }
+  function _barShow()   { if (host.progBarEnabled && barLoader.item) barLoader.item.showBar()   }
   function _barHide()   { if (barLoader.item) barLoader.item.hideBar()   }
-  function _barToggle() { if (barLoader.item) barLoader.item.toggleBar() }
+  function _barToggle() { if (host.progBarEnabled && barLoader.item) barLoader.item.toggleBar() }
 
-  function _switchOpen()    { if (switchLoader.item) switchLoader.item.open()           }
+  function _switchOpen()    { if (host.progSwitchEnabled && switchLoader.item) switchLoader.item.open() }
   function _switchNext()    { if (switchLoader.item) switchLoader.item.next()           }
   function _switchPrev()    { if (switchLoader.item) switchLoader.item.prev()           }
   function _switchConfirm() { if (switchLoader.item) switchLoader.item.confirm()        }
@@ -112,6 +142,7 @@ ShellRoot {
 
   function _powerToggle() {
     if (host.powerShellPath.length === 0) return
+    if (!host.progPowerEnabled) return
     if (!powerLoader._wantActive) {
       powerLoader._pendingShow = true
       powerLoader._wantActive = true
@@ -123,6 +154,7 @@ ShellRoot {
 
   function _powerShow() {
     if (host.powerShellPath.length === 0) return
+    if (!host.progPowerEnabled) return
     if (!powerLoader._wantActive) {
       powerLoader._pendingShow = true
       powerLoader._wantActive = true
