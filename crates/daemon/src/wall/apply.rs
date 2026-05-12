@@ -131,6 +131,9 @@ async fn broadcast_warmup(warmup: bool) {
 }
 
 pub async fn on_wall_show(config: &Config) {
+    if config.paper.engine != config::PaperEngine::SkwdPaper {
+        return;
+    }
     let prev = match read_prev_transition_image(&config.cache_dir()).await {
         Some(p) if Path::new(&p).exists() => p,
         _ => return,
@@ -846,9 +849,10 @@ async fn apply_static_inner(
         })
     };
 
-    let engine_changed = swap_last_engine(config.paper.engine).await
-        != Some(config.paper.engine);
-    if engine_changed && config.paper.engine != config::PaperEngine::Awww {
+    let prev_engine = swap_last_engine(config.paper.engine).await;
+    if prev_engine == Some(config::PaperEngine::Awww)
+        && config.paper.engine != config::PaperEngine::Awww
+    {
         kill_awww_if_running().await;
     }
 
@@ -2595,7 +2599,10 @@ async fn read_we_project_type(item_dir: &Path) -> (String, String) {
 }
 
 pub async fn kill_orphan_paper_procs() {
-    let _ = run_sh("pkill -9 -x skwd-paper 2>/dev/null; true").await;
+    let _ = run_sh(
+        "pkill -9 -x skwd-paper 2>/dev/null; pkill -9 -x skwd-paper-still 2>/dev/null; true",
+    )
+    .await;
 }
 
 fn paper_bin() -> String {
@@ -2635,15 +2642,38 @@ async fn swap_last_engine(new: config::PaperEngine) -> Option<config::PaperEngin
     prev
 }
 
+async fn wait_for_awww_ready() -> bool {
+    let safety_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if run_sh_status("awww query >/dev/null 2>&1").await {
+            return true;
+        }
+        if std::time::Instant::now() >= safety_deadline {
+            return false;
+        }
+        if !run_sh_status("pgrep -x awww-daemon >/dev/null 2>&1").await {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 async fn kill_awww_if_running() {
-    if run_sh("awww query >/dev/null 2>&1").await.is_ok() {
+    if run_sh_status("awww query >/dev/null 2>&1").await {
         info!("apply_static: shutting down awww-daemon for non-awww engine");
         let _ = run_sh("awww kill >/dev/null 2>&1; pkill -x awww-daemon 2>/dev/null; true").await;
     }
 }
 
 async fn apply_awww(path: &str, outputs: &[String], config: &Config) -> anyhow::Result<()> {
-    let _ = run_sh("awww query >/dev/null 2>&1 || awww-daemon &").await;
+    if !run_sh_status("awww query >/dev/null 2>&1").await {
+        info!("apply_awww: awww-daemon not running, spawning it");
+        let _ = run_sh("awww-daemon >/dev/null 2>&1 &").await;
+        if !wait_for_awww_ready().await {
+            anyhow::bail!("awww-daemon did not become ready (process missing or 15s safety cap)");
+        }
+        info!("apply_awww: awww-daemon ready");
+    }
 
     let s = &config.paper.awww;
     let resize = match config.display.fill_mode {
@@ -2985,8 +3015,16 @@ async fn run_sh(cmd: &str) -> anyhow::Result<()> {
     let status = Command::new("sh").arg("-c").arg(cmd).silent().status().await?;
     if !status.success() {
         warn!("command failed ({}): {cmd}", status);
+        anyhow::bail!("shell command failed ({}): {cmd}", status);
     }
     Ok(())
+}
+
+async fn run_sh_status(cmd: &str) -> bool {
+    match Command::new("sh").arg("-c").arg(cmd).silent().status().await {
+        Ok(s) => s.success(),
+        Err(_) => false,
+    }
 }
 
 fn shell_quote(s: &str) -> String {
