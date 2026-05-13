@@ -868,7 +868,7 @@ async fn apply_static_inner(
         drop_persist_paper().await;
         drop_steady_image_paper().await;
         fleet().lock().await.replace_steady(Vec::new());
-        run_sh(&format!("plasma-apply-wallpaperimage {}", shell_quote(path))).await?;
+        apply_kde_static(path, outputs, config).await?;
     } else if config.paper.engine == config::PaperEngine::Awww {
         drop_video_persist_paper().await;
         drop_persist_paper().await;
@@ -1094,7 +1094,7 @@ async fn apply_video_inner(
         drop_persist_paper().await;
         drop_steady_image_paper().await;
         fleet().lock().await.replace_steady(Vec::new());
-        apply_kde_video(path, mute).await?;
+        apply_kde_video(path, outputs, &dedup_mute, outputs_volume, config).await?;
     } else {
         let global_volume = config.volume();
         let auto_scale = config.features.video_auto_scale;
@@ -1594,7 +1594,7 @@ async fn apply_we_inner(
         let video_str = video_path.display().to_string();
 
         if is_kde() {
-            apply_kde_video(&video_str, global_mute).await?;
+            apply_kde_video(&video_str, screens, &dedup_mute, outputs_volume, config).await?;
         } else if !screens.is_empty() {
             for out in screens {
                 let m = dedup_mute.get(out).copied().unwrap_or(global_mute);
@@ -2737,25 +2737,184 @@ async fn apply_awww(path: &str, outputs: &[String], config: &Config) -> anyhow::
     Ok(())
 }
 
-async fn apply_kde_video(path: &str, mute: bool) -> anyhow::Result<()> {
-    let plugin = "luisbocanegra.smart.video.wallpaper.reborn";
-    let mute_mode = if mute { "4" } else { "0" };
+async fn run_plasma_evaluate_script(script: &str) -> anyhow::Result<()> {
+    let status = Command::new("qdbus6")
+        .arg("org.kde.plasmashell")
+        .arg("/PlasmaShell")
+        .arg("org.kde.PlasmaShell.evaluateScript")
+        .arg(script)
+        .silent()
+        .status()
+        .await?;
+    if !status.success() {
+        warn!("plasmashell evaluateScript failed ({})", status);
+        anyhow::bail!("plasmashell evaluateScript failed ({})", status);
+    }
+    Ok(())
+}
+
+async fn query_kde_screen_map() -> HashMap<String, u32> {
+    let out = match Command::new("kscreen-doctor").arg("-j").output().await {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return HashMap::new(),
+    };
+    let text = String::from_utf8_lossy(&out);
+    let json: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+    let outputs = match json.get("outputs").and_then(|v| v.as_array()) {
+        Some(o) => o,
+        None => return HashMap::new(),
+    };
+    let mut map = HashMap::new();
+    for output in outputs {
+        let connected = output.get("connected").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !connected {
+            continue;
+        }
+        let name = match output.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let priority = match output.get("priority").and_then(|v| v.as_u64()) {
+            Some(p) if p >= 1 => (p - 1) as u32,
+            _ => continue,
+        };
+        map.insert(name, priority);
+    }
+    map
+}
+
+fn kde_target_indices(outputs: &[String], map: &HashMap<String, u32>) -> Vec<u32> {
+    if outputs.is_empty() {
+        if map.is_empty() {
+            Vec::new()
+        } else {
+            map.values().cloned().collect()
+        }
+    } else {
+        outputs.iter().filter_map(|o| map.get(o).cloned()).collect()
+    }
+}
+
+fn kde_fill_mode_value(fm: config::FillMode) -> u32 {
+    match fm {
+        config::FillMode::Fill => 2,
+        config::FillMode::Fit => 0,
+        config::FillMode::Stretch => 1,
+        config::FillMode::Center => 6,
+        config::FillMode::Tile => 3,
+    }
+}
+
+async fn apply_kde_static(path: &str, outputs: &[String], config: &Config) -> anyhow::Result<()> {
+    let map = query_kde_screen_map().await;
+    let targets = kde_target_indices(outputs, &map);
+    let indices_js = targets.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let fill_mode = kde_fill_mode_value(config.display.fill_mode);
     let file_url = format!("file://{path}");
+    info!(
+        path = %path,
+        outputs = ?outputs,
+        targets = ?targets,
+        "apply_kde_static: setting wallpaper via plasmashell evaluateScript"
+    );
     let script = format!(
-        "var allDesktops = desktops(); \
-         for (var i = 0; i < allDesktops.length; i++) {{ \
-           var d = allDesktops[i]; \
+        "var targets = [{indices_js}]; \
+         var ds = desktops(); \
+         for (var i = 0; i < ds.length; i++) {{ \
+           if (targets.length > 0 && targets.indexOf(ds[i].screen) === -1) continue; \
+           var d = ds[i]; \
+           d.wallpaperPlugin = 'org.kde.image'; \
+           d.currentConfigGroup = ['Wallpaper', 'org.kde.image', 'General']; \
+           d.writeConfig('Image', '{file_url}'); \
+           d.writeConfig('FillMode', '{fill_mode}'); \
+         }}"
+    );
+    run_plasma_evaluate_script(&script).await
+}
+
+async fn apply_kde_video(
+    path: &str,
+    outputs: &[String],
+    outputs_audio: &HashMap<String, bool>,
+    outputs_volume: &HashMap<String, u32>,
+    config: &Config,
+) -> anyhow::Result<()> {
+    let map = query_kde_screen_map().await;
+    let plugin = "luisbocanegra.smart.video.wallpaper.reborn";
+    let file_url = format!("file://{path}");
+    let global_mute = config.is_muted();
+    let global_volume = config.volume();
+    let global_mute_mode = if global_mute { "4" } else { "0" };
+
+    let resolve = |name: &str| -> (String, u32) {
+        let mute = outputs_audio.get(name).copied().unwrap_or(global_mute);
+        let volume = outputs_volume.get(name).copied().unwrap_or(global_volume);
+        (if mute { "4" } else { "0" }.to_string(), volume)
+    };
+
+    let (per_screen, fallback_to_all): (Vec<serde_json::Value>, bool) = if map.is_empty() {
+        (Vec::new(), true)
+    } else if outputs.is_empty() {
+        let mut v = Vec::new();
+        for (name, idx) in &map {
+            let (mute_mode, volume) = resolve(name);
+            v.push(serde_json::json!({
+                "screen": idx,
+                "muteMode": mute_mode,
+                "volume": volume.to_string(),
+            }));
+        }
+        (v, false)
+    } else {
+        let mut v = Vec::new();
+        for name in outputs {
+            if let Some(idx) = map.get(name) {
+                let (mute_mode, volume) = resolve(name);
+                v.push(serde_json::json!({
+                    "screen": idx,
+                    "muteMode": mute_mode,
+                    "volume": volume.to_string(),
+                }));
+            }
+        }
+        (v, false)
+    };
+
+    let configs_js =
+        serde_json::to_string(&per_screen).unwrap_or_else(|_| "[]".to_string());
+
+    info!(
+        path = %path,
+        outputs = ?outputs,
+        configs = %configs_js,
+        fallback_to_all = fallback_to_all,
+        "apply_kde_video: setting video wallpaper via plasmashell evaluateScript"
+    );
+
+    let script = format!(
+        "var configs = {configs_js}; \
+         var fallbackToAll = {fallback_to_all}; \
+         var ds = desktops(); \
+         for (var i = 0; i < ds.length; i++) {{ \
+           var match = null; \
+           for (var j = 0; j < configs.length; j++) {{ \
+             if (configs[j].screen === ds[i].screen) {{ match = configs[j]; break; }} \
+           }} \
+           if (!fallbackToAll && match === null) continue; \
+           var muteMode = match ? match.muteMode : '{global_mute_mode}'; \
+           var volume = match ? match.volume : '{global_volume}'; \
+           var d = ds[i]; \
            d.wallpaperPlugin = '{plugin}'; \
            d.currentConfigGroup = ['Wallpaper', '{plugin}', 'General']; \
            d.writeConfig('VideoUrls', '[{{\"filename\":\"{file_url}\",\"enabled\":true}}]'); \
-           d.writeConfig('MuteMode', '{mute_mode}'); \
+           d.writeConfig('MuteMode', muteMode); \
+           d.writeConfig('Volume', volume); \
          }}"
     );
-    run_sh(&format!(
-        "qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript {}",
-        shell_quote(&script)
-    ))
-    .await
+    run_plasma_evaluate_script(&script).await
 }
 
 async fn pick_thumbs(

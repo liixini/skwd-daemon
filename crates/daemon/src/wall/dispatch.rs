@@ -200,10 +200,14 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                 .get("color_index")
                 .and_then(|v| v.as_u64())
                 .map(|n| (n as u32).min(3));
+            tracing::info!(?scheme, ?mode, ?color_index, "wall.retheme received");
             let config = state.config.read().await.clone();
             match apply::retheme(&config, scheme.as_deref(), mode.as_deref(), color_index).await {
                 Ok(()) => Response::ok(req.id, serde_json::json!({"rethemed": true})),
-                Err(e) => Response::err(req.id, 6, format!("{e}")),
+                Err(e) => {
+                    tracing::warn!(error = %e, "wall.retheme failed");
+                    Response::err(req.id, 6, format!("{e}"))
+                }
             }
         }
 
