@@ -864,6 +864,18 @@ async fn apply_static_inner(
         let _ = tokio::fs::remove_file(config.video_dir().join("lockscreen-video.mp4")).await;
         run_external_apply(config, "static", path, path).await;
     } else if is_kde {
+        let kde_target_outs: Vec<String> = if outputs.is_empty() {
+            vec!["*".to_string()]
+        } else {
+            outputs.to_vec()
+        };
+        let _ = rebuild_scene_we(
+            config,
+            &kde_target_outs,
+            &std::collections::BTreeMap::new(),
+            config.volume(),
+        )
+        .await;
         drop_video_persist_paper().await;
         drop_persist_paper().await;
         drop_steady_image_paper().await;
@@ -1091,6 +1103,18 @@ async fn apply_video_inner(
         fleet().lock().await.replace_steady(Vec::new());
         let _ = tokio::fs::remove_file(config.video_dir().join("lockscreen-video.mp4")).await;
     } else if is_kde {
+        let kde_target_outs: Vec<String> = if outputs.is_empty() {
+            vec!["*".to_string()]
+        } else {
+            outputs.to_vec()
+        };
+        let _ = rebuild_scene_we(
+            config,
+            &kde_target_outs,
+            &std::collections::BTreeMap::new(),
+            config.volume(),
+        )
+        .await;
         drop_persist_paper().await;
         drop_steady_image_paper().await;
         fleet().lock().await.replace_steady(Vec::new());
@@ -1588,6 +1612,10 @@ async fn apply_we_inner(
         }
     }
     rebuild_scene_we(config, screens, &additions, scene_winner_volume).await?;
+
+    if we_type == "scene" && is_kde() {
+        kde_unload_video_plugin(screens).await;
+    }
 
     if we_type == "video" && !we_file.is_empty() {
         let video_path = item_dir.join(&we_file);
@@ -2145,6 +2173,31 @@ pub async fn set_audio_for(
         }
     }
 
+    if is_kde() {
+        // Translate the (mute, volume, filter) into per-output maps the same
+        // way the non-KDE stdin path implicitly does, then push them into
+        // plasma containments.
+        let state = read_outputs_state(&cache_dir).await;
+        let mut mute_map: HashMap<String, bool> = HashMap::new();
+        let mut volume_map: HashMap<String, u32> = HashMap::new();
+        if let Some(obj) = state.as_object() {
+            for out in obj.keys() {
+                if let Some(ref f) = filter {
+                    if !f.contains(out) {
+                        continue;
+                    }
+                }
+                if let Some(m) = mute {
+                    mute_map.insert(out.clone(), m);
+                }
+                if let Some(v) = volume {
+                    volume_map.insert(out.clone(), v);
+                }
+            }
+        }
+        kde_apply_audio(config, &mute_map, &volume_map).await;
+    }
+
     enforce_audio_dedup(config).await;
 }
 
@@ -2382,6 +2435,12 @@ pub async fn enforce_audio_dedup(config: &Config) {
 
     let filter = Some(mute_set.clone());
     update_outputs_state_audio(&cache_dir, &filter, Some(true), None).await;
+
+    if is_kde() {
+        let mute_map: HashMap<String, bool> =
+            mute_set.iter().map(|o| (o.clone(), true)).collect();
+        kde_apply_audio(config, &mute_map, &HashMap::new()).await;
+    }
 
     let any_we = to_mute.iter().any(|out| {
         map.get(out)
@@ -2835,6 +2894,126 @@ async fn apply_kde_static(path: &str, outputs: &[String], config: &Config) -> an
     run_plasma_evaluate_script(&script).await
 }
 
+async fn kde_unload_video_plugin(outputs: &[String]) {
+    if !is_kde() {
+        return;
+    }
+    let map = query_kde_screen_map().await;
+    if map.is_empty() {
+        return;
+    }
+    let target_indices: Vec<u32> = if outputs.is_empty() || outputs.iter().any(|o| o == "*") {
+        map.values().copied().collect()
+    } else {
+        outputs.iter().filter_map(|o| map.get(o).copied()).collect()
+    };
+    if target_indices.is_empty() {
+        return;
+    }
+    let indices_js = target_indices
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "var idx = [{indices_js}]; \
+         var ds = desktops(); \
+         for (var i = 0; i < ds.length; i++) {{ \
+           if (idx.indexOf(ds[i].screen) === -1) continue; \
+           ds[i].wallpaperPlugin = 'org.kde.image'; \
+         }}"
+    );
+    info!(outputs = ?outputs, "kde_unload_video_plugin");
+    if let Err(e) = run_plasma_evaluate_script(&script).await {
+        warn!(error = %e, "kde_unload_video_plugin failed");
+    }
+}
+
+async fn kde_apply_audio(
+    config: &Config,
+    mute_per_output: &HashMap<String, bool>,
+    volume_per_output: &HashMap<String, u32>,
+) {
+    if !is_kde() {
+        return;
+    }
+    if mute_per_output.is_empty() && volume_per_output.is_empty() {
+        return;
+    }
+    let kde_map = query_kde_screen_map().await;
+    if kde_map.is_empty() {
+        return;
+    }
+    let plugin = "luisbocanegra.smart.video.wallpaper.reborn";
+
+    // Filter to outputs currently playing video/we in outputs.json.
+    let state = read_outputs_state(&config.cache_dir()).await;
+    let mut video_outputs: HashSet<String> = HashSet::new();
+    if let Some(obj) = state.as_object() {
+        for (out, entry) in obj {
+            let t = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if t == "video" || t == "we" {
+                video_outputs.insert(out.clone());
+            }
+        }
+    }
+
+    let mut configs: Vec<serde_json::Value> = Vec::new();
+    let touched: HashSet<&String> = mute_per_output
+        .keys()
+        .chain(volume_per_output.keys())
+        .collect();
+    for out in touched {
+        if !video_outputs.contains(out) {
+            continue;
+        }
+        let Some(&idx) = kde_map.get(out) else {
+            continue;
+        };
+        let mut entry = serde_json::Map::new();
+        entry.insert("screen".into(), serde_json::json!(idx));
+        if let Some(&m) = mute_per_output.get(out) {
+            // MuteMode: 5 = always mute, 4 = never mute (always play)
+            entry.insert(
+                "muteMode".into(),
+                serde_json::json!(if m { "5" } else { "4" }),
+            );
+        }
+        if let Some(&v) = volume_per_output.get(out) {
+            // Volume: plugin schema is Double in 0.0..1.0 - convert from 0..100 percent.
+            let vol = (v as f32 / 100.0).clamp(0.0, 1.0);
+            entry.insert("volume".into(), serde_json::json!(format!("{vol}")));
+        }
+        configs.push(serde_json::Value::Object(entry));
+    }
+
+    if configs.is_empty() {
+        return;
+    }
+
+    let configs_js =
+        serde_json::to_string(&configs).unwrap_or_else(|_| "[]".to_string());
+    let script = format!(
+        "var cfgs = {configs_js}; \
+         var ds = desktops(); \
+         for (var i = 0; i < ds.length; i++) {{ \
+           var cfg = null; \
+           for (var j = 0; j < cfgs.length; j++) {{ \
+             if (cfgs[j].screen === ds[i].screen) {{ cfg = cfgs[j]; break; }} \
+           }} \
+           if (cfg === null) continue; \
+           var d = ds[i]; \
+           d.currentConfigGroup = ['Wallpaper', '{plugin}', 'General']; \
+           if (cfg.muteMode !== undefined) {{ d.writeConfig('MuteMode', cfg.muteMode); }} \
+           if (cfg.volume !== undefined) {{ d.writeConfig('Volume', cfg.volume); }} \
+         }}"
+    );
+    info!(configs = %configs_js, "kde_apply_audio");
+    if let Err(e) = run_plasma_evaluate_script(&script).await {
+        warn!(error = %e, "kde_apply_audio script failed");
+    }
+}
+
 async fn apply_kde_video(
     path: &str,
     outputs: &[String],
@@ -2847,12 +3026,15 @@ async fn apply_kde_video(
     let file_url = format!("file://{path}");
     let global_mute = config.is_muted();
     let global_volume = config.volume();
-    let global_mute_mode = if global_mute { "4" } else { "0" };
+    let global_mute_mode = if global_mute { "5" } else { "4" };
+    let global_volume_f = (global_volume as f32 / 100.0).clamp(0.0, 1.0);
 
-    let resolve = |name: &str| -> (String, u32) {
+    let resolve = |name: &str| -> (String, f32) {
         let mute = outputs_audio.get(name).copied().unwrap_or(global_mute);
         let volume = outputs_volume.get(name).copied().unwrap_or(global_volume);
-        (if mute { "4" } else { "0" }.to_string(), volume)
+        let mute_mode = if mute { "5" } else { "4" };
+        let vol = (volume as f32 / 100.0).clamp(0.0, 1.0);
+        (mute_mode.to_string(), vol)
     };
 
     let (per_screen, fallback_to_all): (Vec<serde_json::Value>, bool) = if map.is_empty() {
@@ -2864,7 +3046,7 @@ async fn apply_kde_video(
             v.push(serde_json::json!({
                 "screen": idx,
                 "muteMode": mute_mode,
-                "volume": volume.to_string(),
+                "volume": format!("{volume}"),
             }));
         }
         (v, false)
@@ -2876,7 +3058,7 @@ async fn apply_kde_video(
                 v.push(serde_json::json!({
                     "screen": idx,
                     "muteMode": mute_mode,
-                    "volume": volume.to_string(),
+                    "volume": format!("{volume}"),
                 }));
             }
         }
@@ -2905,7 +3087,7 @@ async fn apply_kde_video(
            }} \
            if (!fallbackToAll && match === null) continue; \
            var muteMode = match ? match.muteMode : '{global_mute_mode}'; \
-           var volume = match ? match.volume : '{global_volume}'; \
+           var volume = match ? match.volume : '{global_volume_f}'; \
            var d = ds[i]; \
            d.wallpaperPlugin = '{plugin}'; \
            d.currentConfigGroup = ['Wallpaper', '{plugin}', 'General']; \
