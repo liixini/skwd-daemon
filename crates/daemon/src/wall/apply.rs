@@ -1925,6 +1925,7 @@ async fn generate_matugen_config(config: &Config) -> PathBuf {
     let cache_dir = config.cache_dir();
 
     let mut lines = vec!["[config]".to_string(), "reload_apps = false".to_string(), String::new()];
+    let mut emitted = 0usize;
 
     for (i, integ) in config.integrations.iter().enumerate() {
         let template = match &integ.template {
@@ -1942,6 +1943,15 @@ async fn generate_matugen_config(config: &Config) -> PathBuf {
             template_dir.join(template)
         };
 
+        if !input_path.exists() {
+            warn!(
+                "matugen integration '{}' template not found at {}, skipping",
+                integ.name.as_deref().unwrap_or("(unnamed)"),
+                input_path.display()
+            );
+            continue;
+        }
+
         let output_path = if output.contains('/') {
             config::resolve_tilde(output)
         } else {
@@ -1958,14 +1968,12 @@ async fn generate_matugen_config(config: &Config) -> PathBuf {
         lines.push(format!("input_path = \"{}\"", input_path.display()));
         lines.push(format!("output_path = \"{}\"", output_path.display()));
         lines.push(String::new());
+        emitted += 1;
     }
 
     let _ = tokio::fs::create_dir_all(config_path.parent().unwrap_or_else(|| Path::new("/tmp"))).await;
     let _ = tokio::fs::write(&config_path, lines.join("\n")).await;
-    info!(
-        "generated matugen config with {} integrations",
-        config.integrations.len()
-    );
+    info!("generated matugen config with {emitted} integrations");
     config_path
 }
 
@@ -3436,3 +3444,113 @@ async fn run_post_processing(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, Integration};
+
+    #[tokio::test]
+    async fn generate_matugen_config_skips_missing_template_files() {
+        let tmp = std::env::temp_dir().join(format!("skwd-test-matugen-{}", std::process::id()));
+        let template_dir = tmp.join("templates");
+        let cache_dir = tmp.join("cache");
+        std::fs::create_dir_all(&template_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        std::fs::write(template_dir.join("good.conf"), "value = {{colors.primary}}").unwrap();
+
+        let mut config = Config::default();
+        config.features.matugen = true;
+        config.paths.templates = Some(template_dir.to_string_lossy().to_string());
+        config.paths.cache = Some(cache_dir.to_string_lossy().to_string());
+        config.integrations = vec![
+            Integration {
+                name: Some("good".into()),
+                template: Some("good.conf".into()),
+                output: Some("good-output.conf".into()),
+                reload: None,
+            },
+            Integration {
+                name: Some("missing-relative".into()),
+                template: Some("does-not-exist.conf".into()),
+                output: Some("never-written.conf".into()),
+                reload: None,
+            },
+            Integration {
+                name: Some("missing-absolute".into()),
+                template: Some("/var/empty/__skwd_missing__.conf".into()),
+                output: Some("also-never.conf".into()),
+                reload: None,
+            },
+            Integration {
+                name: Some("missing-tilde".into()),
+                template: Some("~/.config/__skwd_missing_tilde__.conf".into()),
+                output: Some("tilde-never.conf".into()),
+                reload: None,
+            },
+        ];
+
+        let cfg_path = generate_matugen_config(&config).await;
+        let content = std::fs::read_to_string(&cfg_path).unwrap();
+
+        assert!(content.contains("[templates.good]"), "good integration should be emitted:\n{content}");
+        assert!(content.contains("good.conf"), "good template path should be present:\n{content}");
+
+        assert!(!content.contains("[templates.missing-relative]"), "missing-relative should be skipped:\n{content}");
+        assert!(!content.contains("does-not-exist.conf"), "missing relative template path should not be emitted:\n{content}");
+
+        assert!(!content.contains("[templates.missing-absolute]"), "missing-absolute should be skipped:\n{content}");
+        assert!(!content.contains("__skwd_missing__.conf"), "missing absolute template path should not be emitted:\n{content}");
+
+        assert!(!content.contains("[templates.missing-tilde]"), "missing-tilde should be skipped:\n{content}");
+        assert!(!content.contains("__skwd_missing_tilde__.conf"), "missing tilde template path should not be emitted:\n{content}");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn generate_matugen_config_emits_only_when_both_template_and_output_set() {
+        let tmp = std::env::temp_dir().join(format!("skwd-test-matugen-pair-{}", std::process::id()));
+        let template_dir = tmp.join("templates");
+        let cache_dir = tmp.join("cache");
+        std::fs::create_dir_all(&template_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        std::fs::write(template_dir.join("a.conf"), "x").unwrap();
+        std::fs::write(template_dir.join("b.conf"), "x").unwrap();
+
+        let mut config = Config::default();
+        config.features.matugen = true;
+        config.paths.templates = Some(template_dir.to_string_lossy().to_string());
+        config.paths.cache = Some(cache_dir.to_string_lossy().to_string());
+        config.integrations = vec![
+            Integration {
+                name: Some("no-output".into()),
+                template: Some("a.conf".into()),
+                output: None,
+                reload: None,
+            },
+            Integration {
+                name: Some("no-template".into()),
+                template: None,
+                output: Some("orphan.conf".into()),
+                reload: None,
+            },
+            Integration {
+                name: Some("complete".into()),
+                template: Some("b.conf".into()),
+                output: Some("complete.conf".into()),
+                reload: None,
+            },
+        ];
+
+        let cfg_path = generate_matugen_config(&config).await;
+        let content = std::fs::read_to_string(&cfg_path).unwrap();
+
+        assert!(content.contains("[templates.complete]"));
+        assert!(!content.contains("[templates.no-output]"));
+        assert!(!content.contains("[templates.no-template]"));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+}
