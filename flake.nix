@@ -30,6 +30,7 @@
             buildInputs = with pkgs; [
               ffmpeg
               alsa-lib
+              libpulseaudio
               imagemagick
               wayland
               wayland-protocols
@@ -40,9 +41,12 @@
               ffmpeg
               imagemagick
               alsa-lib
+              libpulseaudio
               wayland
               libGL
             ];
+
+            env.NIX_LDFLAGS = "-L${pkgs.libpulseaudio.out}/lib";
 
             postInstall = ''
               install -Dm644 data/skwd-daemon.service $out/lib/systemd/user/skwd-daemon.service
