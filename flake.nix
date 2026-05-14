@@ -52,6 +52,7 @@
               install -Dm644 data/skwd-daemon.service $out/lib/systemd/user/skwd-daemon.service
               substituteInPlace $out/lib/systemd/user/skwd-daemon.service \
                 --replace-fail "/usr/bin/skwd-daemon" "$out/bin/skwd-daemon"
+              install -Dm644 data/host/shell.qml $out/share/skwd/skwd-daemon/host/shell.qml
             '';
 
             meta = {
