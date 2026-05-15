@@ -78,6 +78,7 @@ jobs:
         run: |
           v="${{ steps.ver.outputs.v }}"
           name="${{ steps.tar.outputs.name }}"
+          gh release delete "$v" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$v" \
             --title "$v" \
             --notes "Automated binary build for $v" \
@@ -91,7 +92,14 @@ jobs:
           sed -i "s/^pkgver=.*/pkgver=${v}/" packaging/aur-bin/PKGBUILD
           sed -i "s/^sha256sums=.*/sha256sums=('${sha}')/" packaging/aur-bin/PKGBUILD
 
-          ( cd packaging/aur-bin && makepkg --printsrcinfo > .SRCINFO )
+          T=$'\t'
+          src="skwd-daemon-${v}.tar.gz::https://github.com/liixini/skwd-daemon/releases/download/${v}/skwd-daemon-${v}-x86_64.tar.gz"
+          sed -i \
+            -e "s/^${T}pkgver = .*/${T}pkgver = ${v}/" \
+            -e "s/^${T}provides = skwd-daemon=.*/${T}provides = skwd-daemon=${v}/" \
+            -e "s|^${T}source = .*|${T}source = ${src}|" \
+            -e "s/^${T}sha256sums = .*/${T}sha256sums = ${sha}/" \
+            packaging/aur-bin/.SRCINFO
 
       - name: Push to AUR (skwd-daemon-bin)
         env:
