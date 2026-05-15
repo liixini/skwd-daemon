@@ -106,10 +106,21 @@ jobs:
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
           mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
           printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
-          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
-          printf 'Host aur.archlinux.org\n  IdentityFile ~/.ssh/aur\n  User aur\n' >> ~/.ssh/config
+          ssh-keyscan -t rsa,ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            User aur
+            StrictHostKeyChecking accept-new
+            IdentitiesOnly yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+          ssh -o BatchMode=yes -T aur@aur.archlinux.org || true
 
           git clone ssh://aur@aur.archlinux.org/skwd-daemon-bin.git /tmp/aur-bin
           cp packaging/aur-bin/PKGBUILD          /tmp/aur-bin/
