@@ -1,0 +1,120 @@
+name: Build & publish binary release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-bin
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    permissions:
+      contents: write
+    steps:
+      - name: Install build & packaging deps
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed \
+            base-devel git openssh github-cli \
+            rust clang pkgconf \
+            ffmpeg alsa-lib libpulse wayland wayland-protocols mesa imagemagick
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Compute pkgver
+        id: ver
+        run: |
+          count=$(git rev-list --count HEAD)
+          hash=$(git rev-parse --short HEAD)
+          v="r${count}.${hash}"
+          echo "v=${v}" >> "$GITHUB_OUTPUT"
+          echo "Computed pkgver: ${v}"
+
+      - name: Build
+        env:
+          RUSTUP_TOOLCHAIN: stable
+          LIBCLANG_PATH: /usr/lib
+        run: cargo build --release --locked
+
+      - name: Smoke test
+        run: |
+          ./target/release/skwd-daemon --help >/dev/null 2>&1 || true
+          ./target/release/skwd --help >/dev/null 2>&1 || true
+          ./target/release/skwd-paper --help >/dev/null 2>&1 || true
+          ./target/release/skwd-paper-still --help >/dev/null 2>&1 || true
+          file ./target/release/skwd-daemon
+          file ./target/release/skwd
+          file ./target/release/skwd-paper
+          file ./target/release/skwd-paper-still
+
+      - name: Assemble tarball
+        id: tar
+        run: |
+          v="${{ steps.ver.outputs.v }}"
+          name="skwd-daemon-${v}-x86_64"
+          mkdir -p "$name/bin" "$name/data/host"
+          cp target/release/skwd            "$name/bin/"
+          cp target/release/skwd-daemon     "$name/bin/"
+          cp target/release/skwd-paper      "$name/bin/"
+          cp target/release/skwd-paper-still "$name/bin/"
+          cp data/skwd-daemon.service       "$name/data/"
+          cp data/host/shell.qml            "$name/data/host/"
+          cp LICENSE                        "$name/"
+          tar -czf "${name}.tar.gz" "$name"
+          sha=$(sha256sum "${name}.tar.gz" | cut -d' ' -f1)
+          echo "${sha}  ${name}.tar.gz" > "${name}.tar.gz.sha256"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          v="${{ steps.ver.outputs.v }}"
+          name="${{ steps.tar.outputs.name }}"
+          gh release create "$v" \
+            --title "$v" \
+            --notes "Automated binary build for $v" \
+            "${name}.tar.gz" "${name}.tar.gz.sha256"
+
+      - name: Render AUR -bin packaging
+        run: |
+          v="${{ steps.ver.outputs.v }}"
+          sha="${{ steps.tar.outputs.sha }}"
+
+          sed -i "s/^pkgver=.*/pkgver=${v}/" packaging/aur-bin/PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${sha}')/" packaging/aur-bin/PKGBUILD
+
+          ( cd packaging/aur-bin && makepkg --printsrcinfo > .SRCINFO )
+
+      - name: Push to AUR (skwd-daemon-bin)
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          printf 'Host aur.archlinux.org\n  IdentityFile ~/.ssh/aur\n  User aur\n' >> ~/.ssh/config
+
+          git clone ssh://aur@aur.archlinux.org/skwd-daemon-bin.git /tmp/aur-bin
+          cp packaging/aur-bin/PKGBUILD          /tmp/aur-bin/
+          cp packaging/aur-bin/.SRCINFO          /tmp/aur-bin/
+          cp packaging/aur-bin/skwd-daemon.install /tmp/aur-bin/
+
+          cd /tmp/aur-bin
+          git config user.name "liixini"
+          git config user.email "liixini@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "bump pkgver to ${{ steps.ver.outputs.v }}"
+          git push
