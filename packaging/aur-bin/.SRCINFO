@@ -18,6 +18,9 @@ pkgbase = skwd-daemon-bin
 	optdepends = linux-wallpaperengine: Wallpaper Engine scene rendering
 	provides = skwd-daemon=0.0.0
 	conflicts = skwd-daemon
+	conflicts = skwd-daemon-debug
+	options = !debug
+	options = !strip
 	source = skwd-daemon-0.0.0.tar.gz::https://github.com/liixini/skwd-daemon/releases/download/0.0.0/skwd-daemon-0.0.0-x86_64.tar.gz
 	sha256sums = SKIP
 
