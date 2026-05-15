@@ -10,17 +10,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
     container: archlinux:latest
     permissions:
       contents: write
+    outputs:
+      v: ${{ steps.ver.outputs.v }}
+      sha: ${{ steps.tar.outputs.sha }}
     steps:
-      - name: Install build & packaging deps
+      - name: Install build deps
         run: |
           pacman -Syu --noconfirm
           pacman -S --noconfirm --needed \
-            base-devel git openssh github-cli \
+            base-devel git github-cli \
             rust clang pkgconf \
             ffmpeg alsa-lib libpulse wayland wayland-protocols mesa imagemagick
 
@@ -84,52 +87,47 @@ jobs:
             --notes "Automated binary build for $v" \
             "${name}.tar.gz" "${name}.tar.gz.sha256"
 
-      - name: Render AUR -bin packaging
-        run: |
-          v="${{ steps.ver.outputs.v }}"
-          sha="${{ steps.tar.outputs.sha }}"
+  publish-aur-bin:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-          sed -i "s/^pkgver=.*/pkgver=${v}/" packaging/aur-bin/PKGBUILD
-          sed -i "s/^sha256sums=.*/sha256sums=('${sha}')/" packaging/aur-bin/PKGBUILD
+      - name: Render AUR -bin packaging
+        env:
+          V: ${{ needs.build.outputs.v }}
+          SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${V}/" packaging/aur-bin/PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${SHA}')/" packaging/aur-bin/PKGBUILD
 
           T=$'\t'
-          src="skwd-daemon-${v}.tar.gz::https://github.com/liixini/skwd-daemon/releases/download/${v}/skwd-daemon-${v}-x86_64.tar.gz"
+          src="skwd-daemon-${V}.tar.gz::https://github.com/liixini/skwd-daemon/releases/download/${V}/skwd-daemon-${V}-x86_64.tar.gz"
           sed -i \
-            -e "s/^${T}pkgver = .*/${T}pkgver = ${v}/" \
-            -e "s/^${T}provides = skwd-daemon=.*/${T}provides = skwd-daemon=${v}/" \
+            -e "s/^${T}pkgver = .*/${T}pkgver = ${V}/" \
+            -e "s/^${T}provides = skwd-daemon=.*/${T}provides = skwd-daemon=${V}/" \
             -e "s|^${T}source = .*|${T}source = ${src}|" \
-            -e "s/^${T}sha256sums = .*/${T}sha256sums = ${sha}/" \
+            -e "s/^${T}sha256sums = .*/${T}sha256sums = ${SHA}/" \
             packaging/aur-bin/.SRCINFO
 
-      - name: Push to AUR (skwd-daemon-bin)
+      - name: Push to AUR
         env:
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
           mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
           printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
-          ssh-keyscan -t rsa,ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
-          chmod 644 ~/.ssh/known_hosts
-          cat > ~/.ssh/config <<'EOF'
-          Host aur.archlinux.org
-            IdentityFile ~/.ssh/aur
-            User aur
-            StrictHostKeyChecking accept-new
-            IdentitiesOnly yes
-          EOF
-          chmod 600 ~/.ssh/config
-
-          ssh -o BatchMode=yes -T aur@aur.archlinux.org || true
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          printf 'Host aur.archlinux.org\n  IdentityFile ~/.ssh/aur\n  User aur\n' >> ~/.ssh/config
 
           git clone ssh://aur@aur.archlinux.org/skwd-daemon-bin.git /tmp/aur-bin
-          cp packaging/aur-bin/PKGBUILD          /tmp/aur-bin/
-          cp packaging/aur-bin/.SRCINFO          /tmp/aur-bin/
+          cp packaging/aur-bin/PKGBUILD            /tmp/aur-bin/
+          cp packaging/aur-bin/.SRCINFO            /tmp/aur-bin/
           cp packaging/aur-bin/skwd-daemon.install /tmp/aur-bin/
 
           cd /tmp/aur-bin
           git config user.name "liixini"
           git config user.email "liixini@users.noreply.github.com"
           git add -A
-          git diff --cached --quiet || git commit -m "bump pkgver to ${{ steps.ver.outputs.v }}"
+          git diff --cached --quiet || git commit -m "bump pkgver to ${{ needs.build.outputs.v }}"
           git push
