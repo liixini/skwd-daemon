@@ -48,14 +48,10 @@ jobs:
 
       - name: Smoke test
         run: |
-          ./target/release/skwd-daemon --help >/dev/null 2>&1 || true
-          ./target/release/skwd --help >/dev/null 2>&1 || true
-          ./target/release/skwd-paper --help >/dev/null 2>&1 || true
-          ./target/release/skwd-paper-still --help >/dev/null 2>&1 || true
-          file ./target/release/skwd-daemon
-          file ./target/release/skwd
-          file ./target/release/skwd-paper
-          file ./target/release/skwd-paper-still
+          for bin in skwd-daemon skwd skwd-paper skwd-paper-still; do
+            test -x "./target/release/$bin" || { echo "missing: $bin"; exit 1; }
+            file "./target/release/$bin" | grep -q "ELF 64-bit LSB" || { echo "not ELF: $bin"; exit 1; }
+          done
 
       - name: Assemble tarball
         id: tar
