@@ -470,9 +470,9 @@ pub async fn run() -> anyhow::Result<()> {
     info!("listening on {}", sock_path.display());
 
     let (event_tx, _) = broadcast::channel::<String>(256);
-    let config = crate::config::load().expect("failed to load config");
 
-    wall::bootstrap::run(&config).await;
+    wall::bootstrap::run(&crate::config::load().unwrap_or_default()).await;
+    let config = crate::config::load().expect("failed to load config");
     wall::clean_trash::run(&config).await;
 
     let steam_state = Arc::new(Mutex::new(SteamState::new(&config)));
