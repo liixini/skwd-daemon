@@ -10,7 +10,6 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::db;
-use crate::util::CommandExt;
 use crate::wall::analysis::AnalysisState;
 use crate::wall::cache::CacheState;
 use crate::wall::optimize::OptimizeState;
@@ -73,7 +72,30 @@ impl ManagedProcess {
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
-        match cmd.silent().spawn() {
+        cmd.stdin(std::process::Stdio::null());
+        match open_managed_log(self.label) {
+            Some(log_path) => match std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&log_path) {
+                Ok(stdout_file) => match stdout_file.try_clone() {
+                    Ok(stderr_file) => {
+                        info!("{}: spawn stdout/stderr -> {}", self.label, log_path.display());
+                        cmd.stdout(std::process::Stdio::from(stdout_file));
+                        cmd.stderr(std::process::Stdio::from(stderr_file));
+                    }
+                    Err(e) => {
+                        warn!("{}: failed to clone log fd ({e}); spawn output discarded", self.label);
+                        cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+                    }
+                },
+                Err(e) => {
+                    warn!("{}: failed to open {} ({e}); spawn output discarded", self.label, log_path.display());
+                    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+                }
+            },
+            None => {
+                cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            }
+        }
+        match cmd.spawn() {
             Ok(child) => {
                 self.child = Some(child);
             }
@@ -102,6 +124,16 @@ impl ManagedProcess {
             self.launch_with_env(extra_env);
         }
     }
+}
+
+fn open_managed_log(label: &str) -> Option<PathBuf> {
+    let base = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".cache")))?
+        .join("skwd");
+    std::fs::create_dir_all(&base).ok()?;
+    Some(base.join(format!("{label}.log")))
 }
 
 fn resolve_shell_qml() -> PathBuf {
