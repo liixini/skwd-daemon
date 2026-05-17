@@ -100,13 +100,13 @@ You are tagging an image for a wallpaper browser where the user filters a large 
 
 OUTPUT EXACTLY THREE LINES, NOTHING ELSE.
 
-LINE 1 — dominant color and saturation
+LINE 1 - dominant color and saturation
 Format: COLOR|NUMBER (e.g. teal|62)
 Color from this list: red, orange, yellow, lime, green, teal, cyan, sky blue, blue, indigo, violet, pink, neutral
 Mapping hints: dark blue / navy → indigo, brown / sepia / earth tones → orange, purple → violet, light blue → sky blue. Use 'neutral' ONLY for pure grayscale.
 Saturation: 0 (grayscale) to 100 (very vivid).
 
-LINE 2 — 8 to 12 lowercase comma-separated tags
+LINE 2 - 8 to 12 lowercase comma-separated tags
 Cover the dimensions below WHEN APPLICABLE. Skip a dimension if it doesn't fit.
   - subject: the main thing depicted (forest, mountain, city, woman, dragon, spaceship, cat, building, road, tree, flower, ship, robot, road, person, character)
   - style: visual treatment (anime, illustration, photo, painting, render, 3d, pixelart, sketch, abstract, minimalist, cyberpunk, vaporwave, fantasy, scifi, horror, retro, realistic, surreal)
@@ -120,11 +120,11 @@ Tag rules:
   - if the image is in anime, manga, or Japanese-cartoon visual style, ALWAYS include 'anime'
   - prefer concrete and searchable over generic ('cyberpunk' over 'futuristic-stuff', 'sunset' over 'orange-light')
 
-Quality tags — these augment the metric-based sort modes so users can filter for them.
+Quality tags - these augment the metric-based sort modes so users can filter for them.
 ALWAYS evaluate each independently and include the matching tag(s):
-  - 'minimalist' — sparse composition, lots of negative space, single subject on a flat/simple background, very few visual elements. NOT just low color count; also requires compositional simplicity.
-  - 'colourful' — five or more distinct, well-distributed colors throughout the image (not just one accent color in a sea of black). Multi-hue artwork, rainbow palettes, busy illustrations qualify.
-  - 'vibrant' — saturated, high-energy, eye-catching colors regardless of how many. Neon scenes, fully-saturated cartoons, vivid sunsets qualify; pastel and muted images do NOT.
+  - 'minimalist' - sparse composition, lots of negative space, single subject on a flat/simple background, very few visual elements. NOT just low color count; also requires compositional simplicity.
+  - 'colourful' - five or more distinct, well-distributed colors throughout the image (not just one accent color in a sea of black). Multi-hue artwork, rainbow palettes, busy illustrations qualify.
+  - 'vibrant' - saturated, high-energy, eye-catching colors regardless of how many. Neon scenes, fully-saturated cartoons, vivid sunsets qualify; pastel and muted images do NOT.
 A wallpaper can have multiple of these (a vivid abstract can be both colourful and vibrant); pick whichever genuinely apply.
 
 Examples:
@@ -133,7 +133,7 @@ Examples:
   abstract gradient → abstract, gradient, minimalist, dreamy, smooth, render
   solid black wallpaper with one red sphere → minimalist, sphere, render, dramatic
 
-LINE 3 — weather fit
+LINE 3 - weather fit
 Which weather conditions would this wallpaper match? Comma-separated subset of: clear, sunny, cloudy, rainy, snowy, stormy, foggy, windy.";
 
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";

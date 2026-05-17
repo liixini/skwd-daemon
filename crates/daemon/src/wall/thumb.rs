@@ -46,13 +46,18 @@ pub async fn generate_static(src: &Path, thumb_path: &Path, thumb_sm_path: &Path
         "-quality".as_ref(),
         "85".as_ref(),
         tmp_thumb.as_os_str(),
-    ])
-    .silent();
-    let status = util::timed_status(&mut cmd, util::CMD_TIMEOUT).await?;
+    ]);
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
 
-    if !status.success() {
+    let output = match tokio::time::timeout(util::CMD_TIMEOUT, cmd.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => anyhow::bail!("magick spawn failed for {}: {e}", src.display()),
+        Err(_) => anyhow::bail!("magick timed out for {}", src.display()),
+    };
+    if !output.status.success() {
         let _ = tokio::fs::remove_file(&tmp_thumb).await;
-        anyhow::bail!("magick failed for {}", src.display());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("magick failed for {}: {}", src.display(), stderr.trim());
     }
     tokio::fs::rename(&tmp_thumb, thumb_path).await?;
 

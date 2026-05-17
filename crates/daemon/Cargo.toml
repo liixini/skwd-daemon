@@ -19,6 +19,7 @@ tracing-appender = "0.2"
 rusqlite = { workspace = true }
 notify = { workspace = true }
 image = { workspace = true }
+rayon = { workspace = true }
 walkdir = { workspace = true }
 reqwest = { workspace = true }
 base64 = { workspace = true }

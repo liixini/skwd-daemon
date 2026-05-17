@@ -1220,6 +1220,9 @@ async fn dispatch_request(
     if req.method.starts_with("optimize.") || req.method.starts_with("video_convert.") {
         return optimize::dispatch(req, event_tx, state).await;
     }
+    if req.method.starts_with("effects.") {
+        return wall::effects::dispatch(req, event_tx, state).await;
+    }
     if req.method.starts_with("analysis.") {
         if !state.config.read().await.features.analysis {
             return Response::err(req.id, -32601, "analysis module is disabled");
