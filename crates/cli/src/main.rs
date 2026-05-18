@@ -110,7 +110,7 @@ fn print_help() {
     println!("  skwd analysis stop");
     println!("  skwd analysis status");
     println!("  skwd analysis regenerate");
-    println!("  skwd analysis retag_one '{{\"name\":\"file.jpg\"}}'");
+    println!("  skwd analysis retag_one '{{\"key\":\"file.jpg.webp\"}}'");
     println!("  skwd optimize-videos [DIR_OR_FILE...]");
     println!("  skwd gen-icons [--font PATH] [--output PATH]");
 }

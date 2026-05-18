@@ -61,6 +61,10 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             Response::ok(req.id, serde_json::json!({"ok": true}))
         }
 
+        "default_prompt" => {
+            Response::ok(req.id, serde_json::json!({"prompt": OLLAMA_PROMPT}))
+        }
+
         "retag_one" => {
             let key = req.str_param("key", "").to_string();
             if key.is_empty() {
@@ -96,65 +100,31 @@ pub struct AnalysisState {
 
 
 const OLLAMA_PROMPT: &str = "\
-You are tagging an image for a wallpaper browser where the user filters a large collection by what they want to look at right now.
+You are tagging an image for visual search. Look at the image, then output exactly two lines.
 
-OUTPUT EXACTLY THREE LINES, NOTHING ELSE.
+LINE 1 - tags, lowercase, comma-separated. Cover these four categories, in this order. Skip a category if nothing in the image fits it.
 
-LINE 1 - dominant color and saturation
-Format: COLOR|NUMBER (e.g. teal|62)
-Color from this list: red, orange, yellow, lime, green, teal, cyan, sky blue, blue, indigo, violet, pink, neutral
-Mapping hints: dark blue / navy → indigo, brown / sepia / earth tones → orange, purple → violet, light blue → sky blue. Use 'neutral' ONLY for pure grayscale.
-Saturation: 0 (grayscale) to 100 (very vivid).
+1. SUBJECTS - every distinct living thing or notable foreground object you can see. Each subject gets its own tag. If two creatures are present, tag both separately.
+2. THEMES - the larger setting, environment, or location depicted (one to a few tags).
+3. MOOD - the overall feeling the image conveys (one tag, sometimes two).
+4. ART STYLE - the visual technique used to make the image (one tag).
 
-LINE 2 - 8 to 12 lowercase comma-separated tags
-Cover the dimensions below WHEN APPLICABLE. Skip a dimension if it doesn't fit.
-  - subject: the main thing depicted (forest, mountain, city, woman, dragon, spaceship, cat, building, road, tree, flower, ship, robot, road, person, character)
-  - style: visual treatment (anime, illustration, photo, painting, render, 3d, pixelart, sketch, abstract, minimalist, cyberpunk, vaporwave, fantasy, scifi, horror, retro, realistic, surreal)
-  - mood: emotional feel (peaceful, melancholy, ominous, epic, dreamy, vibrant, lonely, intimate, energetic, mysterious, cozy, somber, hopeful, eerie)
-  - lighting / time: when applicable (sunset, sunrise, night, twilight, golden, neon, moonlit, overcast, dramatic)
-  - setting: when applicable (indoor, outdoor, underwater, space, urban, rural, forest, desert, beach, mountain, futuristic, medieval, ancient, post-apocalyptic, abandoned)
-  - notable details: when present (fog, snow, rain, fire, water, reflection, silhouette, closeup, panorama)
-Tag rules:
-  - lowercase only, single English word per tag (use a hyphen for unavoidable two-word concepts: post-apocalyptic, sci-fi)
-  - no duplicates, no color words (line 1 covers color), no generic filler ('image', 'wallpaper', 'background', 'scene', 'view')
-  - if the image is in anime, manga, or Japanese-cartoon visual style, ALWAYS include 'anime'
-  - prefer concrete and searchable over generic ('cyberpunk' over 'futuristic-stuff', 'sunset' over 'orange-light')
+Strict rules:
+  - Only tag what is clearly visible. Never invent. If you do not see a person or creature, do not tag one. Missing a tag is always better than inventing one.
+  - Lowercase, one word per tag (hyphen only for unavoidable compounds).
+  - No duplicates. No color names. No generic filler (image, wallpaper, background, scene, view, aesthetic, beautiful).
+  - Prefer specific over vague.
+  - Tag count scales to image complexity. A dense scene may have 10-15 tags; a simple abstract may have 3-4. Do not pad to hit a number.
 
-Quality tags - these augment the metric-based sort modes so users can filter for them.
-ALWAYS evaluate each independently and include the matching tag(s):
-  - 'minimalist' - sparse composition, lots of negative space, single subject on a flat/simple background, very few visual elements. NOT just low color count; also requires compositional simplicity.
-  - 'colourful' - five or more distinct, well-distributed colors throughout the image (not just one accent color in a sea of black). Multi-hue artwork, rainbow palettes, busy illustrations qualify.
-  - 'vibrant' - saturated, high-energy, eye-catching colors regardless of how many. Neon scenes, fully-saturated cartoons, vivid sunsets qualify; pastel and muted images do NOT.
-A wallpaper can have multiple of these (a vivid abstract can be both colourful and vibrant); pick whichever genuinely apply.
+Quality flags - include each independently only if it obviously applies:
+  - minimalist (sparse composition, lots of negative space)
+  - colourful (five or more distinct, well-distributed colors)
+  - vibrant (saturated, high-energy colors)
 
-Examples:
-  forest at sunset, photo → trees, forest, sunset, golden, peaceful, outdoor, photo, nature, vibrant
-  anime girl in a neon city at night → anime, character, city, neon, night, cyberpunk, illustration, vibrant, colourful
-  abstract gradient → abstract, gradient, minimalist, dreamy, smooth, render
-  solid black wallpaper with one red sphere → minimalist, sphere, render, dramatic
-
-LINE 3 - weather fit
-Which weather conditions would this wallpaper match? Comma-separated subset of: clear, sunny, cloudy, rainy, snowy, stormy, foggy, windy.";
+LINE 2 - weather fit, comma-separated subset of: clear, sunny, cloudy, rainy, snowy, stormy, foggy, windy. If nothing fits, output 'clear'.";
 
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 const DEFAULT_OLLAMA_MODEL: &str = "llava:latest";
-
-const COLOR_ALIASES: &[(&str, i64)] = &[
-    ("red", 0),
-    ("orange", 1),
-    ("yellow", 2),
-    ("lime", 3),
-    ("green", 4),
-    ("teal", 5),
-    ("cyan", 6),
-    ("sky", 7),
-    ("blue", 8),
-    ("indigo", 9),
-    ("violet", 10),
-    ("purple", 10),
-    ("pink", 11),
-];
-
 
 pub async fn start(
     config: &Config,
@@ -178,6 +148,11 @@ pub async fn start(
         DEFAULT_OLLAMA_MODEL.to_string()
     } else {
         config.ollama.model.clone()
+    };
+    let ollama_prompt = if config.ollama.prompt.trim().is_empty() {
+        OLLAMA_PROMPT.to_string()
+    } else {
+        config.ollama.prompt.clone()
     };
     {
         let mut s = state.lock().await;
@@ -291,7 +266,7 @@ pub async fn start(
             );
         }
 
-        match analyze_one(path, &ollama_url, &ollama_model, &client).await {
+        match analyze_one(path, &ollama_url, &ollama_model, &ollama_prompt, &client).await {
             Ok((hue, sat, tags, colors_json, weather)) => {
                 let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into());
                 let weather_json = serde_json::to_string(&weather).unwrap_or_else(|_| "[]".into());
@@ -399,6 +374,11 @@ pub async fn retag_one(
     } else {
         config.ollama.model.clone()
     };
+    let ollama_prompt = if config.ollama.prompt.trim().is_empty() {
+        OLLAMA_PROMPT.to_string()
+    } else {
+        config.ollama.prompt.clone()
+    };
 
     let thumb_path: Option<String> = {
         let conn = db.lock().await;
@@ -419,7 +399,7 @@ pub async fn retag_one(
 
     info!("retagging {key} from {thumb_path}");
 
-    match analyze_one(&thumb_path, &ollama_url, &ollama_model, &client).await {
+    match analyze_one(&thumb_path, &ollama_url, &ollama_model, &ollama_prompt, &client).await {
         Ok((hue, sat, tags, colors_json, weather)) => {
             let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into());
             let weather_json = serde_json::to_string(&weather).unwrap_or_else(|_| "[]".into());
@@ -465,6 +445,7 @@ async fn analyze_one(
     thumb_path: &str,
     ollama_url: &str,
     model: &str,
+    prompt: &str,
     client: &reqwest::Client,
 ) -> anyhow::Result<(i64, i64, Vec<String>, String, Vec<String>)> {
     let image_bytes = tokio::fs::read(thumb_path)
@@ -478,7 +459,7 @@ async fn analyze_one(
 
     let body = serde_json::json!({
         "model": model,
-        "prompt": OLLAMA_PROMPT,
+        "prompt": prompt,
         "images": [image_b64],
         "stream": false,
     });
@@ -525,34 +506,23 @@ async fn parse_ollama_response(
 ) -> anyhow::Result<(i64, i64, Vec<String>, String, Vec<String>)> {
     let lines: Vec<&str> = text.lines().collect();
 
-    let mut color_line = None;
     let mut tag_line = None;
     let mut weather_line = None;
 
     for line in &lines {
         let trimmed = line.trim();
-        if trimmed.contains('|') && color_line.is_none() {
-            color_line = Some(trimmed);
-        } else if trimmed.contains(',') && tag_line.is_none() {
+        if !trimmed.contains(',') {
+            continue;
+        }
+        if tag_line.is_none() {
             tag_line = Some(trimmed);
-        } else if trimmed.contains(',') && weather_line.is_none() {
+        } else if weather_line.is_none() {
             weather_line = Some(trimmed);
         }
     }
 
     let (mut hue, mut sat) = (99i64, 0i64);
-    if let Some(cl) = color_line {
-        let parts: Vec<&str> = cl.split('|').collect();
-        if parts.len() >= 2 {
-            let color_name = parts[0].trim();
-            hue = color_to_hue(color_name);
-            sat = parts[1].trim().parse::<i64>().unwrap_or(0).clamp(0, 100);
-        }
-    }
-
-    if hue == 99
-        && let Ok((extracted_hue, extracted_sat)) = extract_hue_from_thumb(thumb_path).await
-    {
+    if let Ok((extracted_hue, extracted_sat)) = extract_hue_from_thumb(thumb_path).await {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         {
             hue = i64::from(thumb::hue_bucket(extracted_hue as u16, extracted_sat as u16));
@@ -572,7 +542,7 @@ async fn parse_ollama_response(
             if seen.insert(tag.clone()) {
                 tags.push(tag);
             }
-            if tags.len() >= 20 {
+            if tags.len() >= 30 {
                 break;
             }
         }
@@ -614,29 +584,6 @@ async fn extract_hue_from_thumb(path: &str) -> anyhow::Result<(f32, f32)> {
     Ok((hue, sat))
 }
 
-
-fn color_to_hue(name: &str) -> i64 {
-    let n = name.to_lowercase();
-    match n.as_str() {
-        "red" | "crimson" | "scarlet" | "maroon" | "burgundy" | "wine" => 0,
-        "orange" | "amber" | "coral" | "peach" | "brown" | "rust" | "copper" | "sepia" | "tan" => 1,
-        "yellow" | "gold" | "golden" | "beige" | "cream" => 2,
-        "lime" | "chartreuse" | "yellow-green" => 3,
-        "green" | "emerald" | "olive" | "mint" | "forest" | "dark green" | "neon" => 4,
-        "teal" | "sea green" | "aqua" => 5,
-        "cyan" | "turquoise" => 6,
-        "sky blue" | "sky" | "light blue" => 7,
-        "blue" | "cobalt" => 8,
-        "navy" | "dark blue" | "indigo" | "dark purple" => 9,
-        "violet" | "purple" | "magenta" | "lavender" | "lilac" | "plum" => 10,
-        "pink" | "rose" | "fuchsia" | "hot pink" | "salmon" => 11,
-        "neutral" | "gray" | "grey" | "black" | "white" | "grayscale" | "monochrome" => 99,
-        _ => COLOR_ALIASES
-            .iter()
-            .find(|(alias, _)| n.contains(alias) || alias.contains(n.as_str()))
-            .map_or(99, |(_, hue)| *hue),
-    }
-}
 
 fn format_eta(seconds: f64) -> String {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

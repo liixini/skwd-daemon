@@ -33,6 +33,7 @@ pub async fn run(config: &Config) {
             if let Err(e) = tokio::fs::copy(&example, &config_json).await {
                 tracing::warn!("bootstrap: failed to seed config.json: {e}");
             } else {
+                set_user_writable(&config_json);
                 info!("bootstrap: created default config.json");
             }
         }
@@ -78,11 +79,14 @@ async fn seed_shell_config() {
     }
 
     match tokio::fs::copy(&src, &dst).await {
-        Ok(_) => info!(
-            "bootstrap: seeded shell config to {} from {}",
-            dst.display(),
-            src.display()
-        ),
+        Ok(_) => {
+            set_user_writable(&dst);
+            info!(
+                "bootstrap: seeded shell config to {} from {}",
+                dst.display(),
+                src.display()
+            );
+        }
         Err(e) => tracing::warn!("bootstrap: failed to seed shell config: {e}"),
     }
 }
@@ -116,7 +120,17 @@ async fn seed_dir(src_dir: &Path, dst_dir: &Path, executable: bool) {
                 let perms = std::fs::Permissions::from_mode(0o755);
                 std::fs::set_permissions(&dst, perms).ok();
             }
+        } else {
+            set_user_writable(&dst);
         }
         info!("bootstrap: seeded {}", name.to_string_lossy());
+    }
+}
+
+fn set_user_writable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
     }
 }

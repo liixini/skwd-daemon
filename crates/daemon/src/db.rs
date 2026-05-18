@@ -130,7 +130,7 @@ pub fn import_from_qml(conn: &Connection) -> anyhow::Result<i64> {
         |r| r.get(0),
     )?;
     if already {
-        anyhow::bail!("already imported — use wall.reimport to force");
+        anyhow::bail!("already imported - use wall.reimport to force");
     }
 
     info!("importing from {}", src_path.display());

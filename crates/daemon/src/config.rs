@@ -279,8 +279,9 @@ pub struct OllamaConfig {
     pub url: String,
     #[serde(default)]
     pub model: String,
-    
-    
+    #[serde(default)]
+    pub prompt: String,
+
     #[serde(default, rename = "consolidationModel")]
     #[allow(dead_code)]
     pub consolidation_model: String,
