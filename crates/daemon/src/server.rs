@@ -507,6 +507,15 @@ pub async fn run() -> anyhow::Result<()> {
     let config = crate::config::load().expect("failed to load config");
     wall::clean_trash::run(&config).await;
 
+    {
+        let cfg_clone = config.clone();
+        tokio::spawn(async move {
+            if let Some(prev) = wall::overview_backdrop::resolve_source(&cfg_clone).await {
+                wall::overview_backdrop::refresh(&prev, &cfg_clone).await;
+            }
+        });
+    }
+
     let steam_state = Arc::new(Mutex::new(SteamState::new(&config)));
     steam::recover_queue(&steam_state).await;
 

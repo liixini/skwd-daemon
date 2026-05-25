@@ -44,7 +44,7 @@ fn decode_image(file_path: &str) -> Result<(u32, u32, Vec<u8>)> {
     Ok((img_w, img_h, rgba.into_raw()))
 }
 
-pub fn run(target: OutputTarget, file_path: &str, persist: bool, fill_mode: FillMode) -> Result<()> {
+pub fn run(target: OutputTarget, file_path: &str, persist: bool, fill_mode: FillMode, namespace: &str) -> Result<()> {
     let (img_w, img_h, bytes) = decode_image(file_path)?;
     tracing::info!(w = img_w, h = img_h, ?fill_mode, "image decoded");
 
@@ -89,6 +89,7 @@ pub fn run(target: OutputTarget, file_path: &str, persist: bool, fill_mode: Fill
         ready_signaled: false,
         persist,
         pending_cmd: pending_cmd.clone(),
+        namespace: namespace.to_string(),
     };
 
     if persist {
@@ -235,6 +236,7 @@ struct App {
     ready_signaled: bool,
     persist: bool,
     pending_cmd: Arc<Mutex<Option<ImagePersistCommand>>>,
+    namespace: String,
 }
 
 struct SurfaceState {
@@ -281,7 +283,7 @@ impl App {
             &surface,
             Some(&output),
             Layer::Background,
-            "skwd-paper".to_string(),
+            self.namespace.clone(),
             &self.qh,
             (),
         );

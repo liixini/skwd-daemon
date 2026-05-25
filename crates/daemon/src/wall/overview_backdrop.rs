@@ -1,0 +1,141 @@
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
+use image::ImageReader;
+use tokio::process::Command;
+
+use crate::config::Config;
+
+const NAMESPACE: &str = "skwd-paper-backdrop";
+
+pub fn backdrop_path(config: &Config) -> PathBuf {
+    config.cache_dir().join("wallpaper").join("overview-backdrop.jpg")
+}
+
+pub async fn resolve_source(config: &Config) -> Option<String> {
+    let cache_dir = config.cache_dir();
+    let state_path = cache_dir.join("last-wallpaper.json");
+    let text = tokio::fs::read_to_string(&state_path).await.ok()?;
+    let state: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let wp_type = state.get("type").and_then(|v| v.as_str())?;
+
+    match wp_type {
+        "static" => state
+            .get("path")
+            .and_then(|v| v.as_str())
+            .filter(|p| Path::new(p).exists())
+            .map(|s| s.to_string()),
+        "video" => {
+            let path = state.get("path").and_then(|v| v.as_str())?;
+            let stem = Path::new(path).file_stem()?.to_string_lossy().into_owned();
+            let thumb = cache_dir.join(format!("wallpaper/video-thumbs/{stem}.jpg"));
+            if thumb.exists() { Some(thumb.display().to_string()) } else { None }
+        }
+        "we" => {
+            let we_id = state.get("we_id").and_then(|v| v.as_str()).unwrap_or("");
+            if !we_id.is_empty() {
+                let thumb = cache_dir.join(format!("wallpaper/we-thumbs/{we_id}.webp"));
+                if thumb.exists() {
+                    return Some(thumb.display().to_string());
+                }
+            }
+            state
+                .get("path")
+                .and_then(|v| v.as_str())
+                .filter(|p| !p.is_empty() && Path::new(p).exists())
+                .map(|s| s.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn is_niri() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|d| d.to_lowercase().contains("niri"))
+        .unwrap_or(false)
+}
+
+pub async fn refresh(source: &str, config: &Config) {
+    if !is_niri() {
+        let _ = kill_existing().await;
+        return;
+    }
+    if !config.niri.overview_backdrop {
+        let _ = kill_existing().await;
+        return;
+    }
+
+    let blur = config.niri.overview_backdrop_blur.max(1) as f32;
+    let src = source.to_string();
+    let dst = backdrop_path(config);
+
+    let blur_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let img = ImageReader::open(&src)?.with_guessed_format()?.decode()?;
+        let blurred = image::imageops::blur(&img.to_rgb8(), blur);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        blurred.save(&dst)?;
+        Ok(())
+    })
+    .await;
+
+    match blur_result {
+        Ok(Ok(())) => {
+            tracing::info!("overview-backdrop: regenerated blurred copy");
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("overview-backdrop: blur failed: {e}");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("overview-backdrop: blur task joined with error: {e}");
+            return;
+        }
+    }
+
+    if let Err(e) = respawn(&backdrop_path(config)).await {
+        tracing::warn!("overview-backdrop: respawn failed: {e}");
+    }
+}
+
+async fn kill_existing() -> anyhow::Result<()> {
+    let _ = Command::new("pkill")
+        .args(["-f", &format!("skwd-paper-still .*--namespace {NAMESPACE}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    Ok(())
+}
+
+async fn respawn(blurred: &Path) -> anyhow::Result<()> {
+    let _ = kill_existing().await;
+
+    let bin = which_paper_still();
+    Command::new(bin)
+        .args([
+            "*",
+            blurred.to_string_lossy().as_ref(),
+            "--namespace",
+            NAMESPACE,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    Ok(())
+}
+
+fn which_paper_still() -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let local = dir.join("skwd-paper-still");
+            if local.exists() {
+                return local.to_string_lossy().to_string();
+            }
+        }
+    }
+    "skwd-paper-still".to_string()
+}

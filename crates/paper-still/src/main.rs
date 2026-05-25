@@ -18,6 +18,8 @@ struct Cli {
     persist: bool,
     #[arg(long = "fill-mode", value_enum, default_value_t = FillMode::default())]
     fill_mode: FillMode,
+    #[arg(long = "namespace", default_value = "skwd-paper")]
+    namespace: String,
 }
 
 fn main() -> Result<()> {
@@ -65,5 +67,5 @@ fn main() -> Result<()> {
     } else {
         image_paper::OutputTarget::Named(cli.output)
     };
-    image_paper::run(target, &cli.file, cli.persist, cli.fill_mode)
+    image_paper::run(target, &cli.file, cli.persist, cli.fill_mode, &cli.namespace)
 }

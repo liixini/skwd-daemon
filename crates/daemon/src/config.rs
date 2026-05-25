@@ -32,6 +32,8 @@ pub struct Config {
     pub wallpaper_volume: Option<u32>,
     #[serde(default)]
     pub performance: PerformanceConfig,
+    #[serde(default)]
+    pub niri: NiriConfig,
     #[serde(default, rename = "defaultMatugenConfig")]
     pub default_matugen_config: Option<String>,
     #[serde(default, rename = "externalMatugenCommand")]
@@ -357,6 +359,16 @@ pub struct Integration {
     #[serde(default)]
     pub reload: Option<String>,
 }
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct NiriConfig {
+    #[serde(default, rename = "overviewBackdrop")]
+    pub overview_backdrop: bool,
+    #[serde(default = "default_backdrop_blur", rename = "overviewBackdropBlur")]
+    pub overview_backdrop_blur: u32,
+}
+
+fn default_backdrop_blur() -> u32 { 30 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[allow(dead_code)]

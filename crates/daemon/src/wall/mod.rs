@@ -1,5 +1,6 @@
 pub mod apply;
 pub mod bootstrap;
+pub mod overview_backdrop;
 pub mod cache;
 pub mod clean_trash;
 pub mod optimized;

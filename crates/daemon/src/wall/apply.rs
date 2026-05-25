@@ -3159,7 +3159,7 @@ async fn pick_random_thumbs(wallpaper_dir: &Path, exclude: &[&str], n: usize) ->
     picks
 }
 
-async fn read_prev_transition_image(cache_dir: &Path) -> Option<String> {
+pub async fn read_prev_transition_image(cache_dir: &Path) -> Option<String> {
     let state_path = cache_dir.join("last-wallpaper.json");
     let text = tokio::fs::read_to_string(&state_path).await.ok()?;
     let state: serde_json::Value = serde_json::from_str(&text).ok()?;

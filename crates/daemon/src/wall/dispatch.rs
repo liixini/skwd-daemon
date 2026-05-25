@@ -8,6 +8,22 @@ use crate::server::{RandomRotation, SharedState, broadcast_event};
 pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state: &SharedState) -> Response {
     let method = req.method.strip_prefix("wall.").unwrap_or(&req.method);
     match method {
+        "refresh_overview_backdrop" => {
+            let config = state.config.read().await.clone();
+
+            let source = match super::overview_backdrop::resolve_source(&config).await {
+                Some(p) => p,
+                None => return Response::err(req.id, 1, "no recent wallpaper recorded"),
+            };
+
+            let source_for_resp = source.clone();
+            tokio::spawn(async move {
+                super::overview_backdrop::refresh(&source, &config).await;
+            });
+
+            return Response::ok(req.id, serde_json::json!({"started": true, "source": source_for_resp}));
+        }
+
         "toggle" => {
             let mut ui = state.ui.lock().await;
             ui.toggle();
@@ -169,6 +185,16 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                         "skwd.wall.applied",
                         serde_json::json!({"type": wp_type, "name": &name, "path": path, "we_id": we_id, "key": key}),
                     );
+
+                    {
+                        let cfg_clone = config.clone();
+                        tokio::spawn(async move {
+                            if let Some(src) = super::overview_backdrop::resolve_source(&cfg_clone).await {
+                                super::overview_backdrop::refresh(&src, &cfg_clone).await;
+                            }
+                        });
+                    }
+
                     Response::ok(req.id, serde_json::json!({"applied": name}))
                 }
                 Err(e) => Response::err(req.id, 4, format!("{e}")),
