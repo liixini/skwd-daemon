@@ -15,11 +15,10 @@ impl SessionStore {
 
     pub async fn ensure(&self) -> Result<Session> {
         let mut guard = self.inner.lock().await;
-        if let Some(s) = guard.as_ref() {
-            if !s.is_invalid() {
+        if let Some(s) = guard.as_ref()
+            && !s.is_invalid() {
                 return Ok(s.clone());
             }
-        }
         let cache = build_cache().ok();
         let cfg = SessionConfig::default();
         let session = Session::new(cfg, cache);

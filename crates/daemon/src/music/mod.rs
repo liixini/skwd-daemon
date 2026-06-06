@@ -1,3 +1,5 @@
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+
 use anyhow::Result;
 use serde_json::{Value, json};
 use skwd_proto::{Request, Response};
@@ -67,7 +69,7 @@ pub async fn dispatch(
         "auth.status" => {
             let tokens = music.auth.current().await;
             let authenticated = tokens.is_some();
-            let expires_at = tokens.as_ref().map(|t| t.expires_at_secs).unwrap_or(0);
+            let expires_at = tokens.as_ref().map_or(0, |t| t.expires_at_secs);
             Response::ok(
                 req.id,
                 json!({"authenticated": authenticated, "expiresAtSecs": expires_at}),
@@ -141,7 +143,7 @@ pub async fn dispatch(
         }
         "player.volume" => {
             let v = req.params.get("volume").and_then(Value::as_u64).unwrap_or(0) as u16;
-            let percent = ((v as u32 * 100) / 65535).min(100) as u8;
+            let percent = ((u32::from(v) * 100) / 65535).min(100) as u8;
             let did = ensure_target_device(&music).await;
             match api_call(&music, move |a| {
                 let did = did.clone();
@@ -273,14 +275,12 @@ pub async fn dispatch(
             let types: Vec<String> = req
                 .params
                 .get("types")
-                .and_then(Value::as_array)
-                .map(|a| {
+                .and_then(Value::as_array).map_or_else(|| vec!["track".into()], |a| {
                     a.iter()
                         .filter_map(Value::as_str)
                         .map(String::from)
                         .collect()
-                })
-                .unwrap_or_else(|| vec!["track".into()]);
+                });
             let limit = req
                 .params
                 .get("limit")
@@ -346,7 +346,7 @@ pub async fn dispatch(
                 .params
                 .get("market")
                 .and_then(Value::as_str)
-                .map(|s| s.to_string());
+                .map(std::string::ToString::to_string);
             if id.is_empty() {
                 return Response::err(req.id, -32602, "id required");
             }
@@ -460,7 +460,7 @@ pub async fn dispatch(
         _ => Response::err(
             req.id,
             -32601,
-            format!("Unknown music method: {}", method),
+            format!("Unknown music method: {method}"),
         ),
     }
 }

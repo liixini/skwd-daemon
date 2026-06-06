@@ -118,3 +118,107 @@ fn opaque_black(w: u32, h: u32) -> Vec<u8> {
 fn opaque_black_image(w: u32, h: u32) -> RgbaImage {
     RgbaImage::from_raw(w, h, opaque_black(w, h)).unwrap()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const BLACK: [u8; 4] = [0, 0, 0, 255];
+
+    fn solid(w: u32, h: u32, color: [u8; 4]) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            v.extend_from_slice(&color);
+        }
+        v
+    }
+
+    fn px(pixels: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * w + x) * 4) as usize;
+        [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+    }
+
+    #[test]
+    fn zero_surface_returns_input_unchanged() {
+        let pixels = solid(2, 2, RED);
+        let (w, h, out) = apply_fill_mode(2, 2, pixels.clone(), 0, 4, FillMode::Fill);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(out, pixels);
+    }
+
+    #[test]
+    fn zero_image_returns_opaque_black_surface() {
+        let (w, h, out) = apply_fill_mode(0, 0, Vec::new(), 3, 2, FillMode::Fill);
+        assert_eq!((w, h), (3, 2));
+        assert_eq!(out.len(), 3 * 2 * 4);
+        for p in out.chunks_exact(4) {
+            assert_eq!(p, BLACK);
+        }
+    }
+
+    #[test]
+    fn stretch_matches_surface_dimensions() {
+        let (w, h, out) = apply_fill_mode(4, 4, solid(4, 4, RED), 8, 6, FillMode::Stretch);
+        assert_eq!((w, h), (8, 6));
+        assert_eq!(px(&out, 8, 0, 0), RED);
+        assert_eq!(px(&out, 8, 7, 5), RED);
+    }
+
+    #[test]
+    fn fill_covers_whole_surface() {
+        let (w, h, out) = apply_fill_mode(4, 2, solid(4, 2, RED), 8, 8, FillMode::Fill);
+        assert_eq!((w, h), (8, 8));
+        for p in out.chunks_exact(4) {
+            assert_eq!(p, RED);
+        }
+    }
+
+    #[test]
+    fn fit_letterboxes_with_black_bars() {
+        let (w, h, out) = apply_fill_mode(4, 2, solid(4, 2, RED), 4, 4, FillMode::Fit);
+        assert_eq!((w, h), (4, 4));
+        assert_eq!(px(&out, 4, 0, 0), BLACK);
+        assert_eq!(px(&out, 4, 3, 0), BLACK);
+        assert_eq!(px(&out, 4, 0, 1), RED);
+        assert_eq!(px(&out, 4, 2, 2), RED);
+        assert_eq!(px(&out, 4, 0, 3), BLACK);
+    }
+
+    #[test]
+    fn center_smaller_image_is_padded() {
+        let (w, h, out) = apply_fill_mode(2, 2, solid(2, 2, RED), 4, 4, FillMode::Center);
+        assert_eq!((w, h), (4, 4));
+        assert_eq!(px(&out, 4, 0, 0), BLACK);
+        assert_eq!(px(&out, 4, 1, 1), RED);
+        assert_eq!(px(&out, 4, 2, 2), RED);
+        assert_eq!(px(&out, 4, 3, 3), BLACK);
+    }
+
+    #[test]
+    fn center_larger_image_is_cropped() {
+        let (w, h, out) = apply_fill_mode(8, 8, solid(8, 8, RED), 4, 4, FillMode::Center);
+        assert_eq!((w, h), (4, 4));
+        for p in out.chunks_exact(4) {
+            assert_eq!(p, RED);
+        }
+    }
+
+    #[test]
+    fn tile_fills_surface_with_repeats() {
+        let (w, h, out) = apply_fill_mode(2, 2, solid(2, 2, RED), 5, 5, FillMode::Tile);
+        assert_eq!((w, h), (5, 5));
+        for p in out.chunks_exact(4) {
+            assert_eq!(p, RED);
+        }
+    }
+
+    #[test]
+    fn opaque_black_is_fully_opaque() {
+        let v = opaque_black(2, 3);
+        assert_eq!(v.len(), 2 * 3 * 4);
+        for p in v.chunks_exact(4) {
+            assert_eq!(p, BLACK);
+        }
+    }
+}

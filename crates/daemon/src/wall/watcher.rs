@@ -274,3 +274,24 @@ fn classify_file(name: &str) -> Option<FileType> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_type_as_str() {
+        assert_eq!(FileType::Static.as_str(), "static");
+        assert_eq!(FileType::Video.as_str(), "video");
+    }
+
+    #[test]
+    fn classify_file_buckets_by_extension() {
+        assert_eq!(classify_file("a.png"), Some(FileType::Static));
+        assert_eq!(classify_file("a.JPG"), Some(FileType::Static));
+        assert_eq!(classify_file("a.mp4"), Some(FileType::Video));
+        assert_eq!(classify_file("a.WEBM"), Some(FileType::Video));
+        assert_eq!(classify_file("a.txt"), None);
+        assert_eq!(classify_file("noext"), None);
+    }
+}

@@ -583,7 +583,7 @@ impl App {
             egl_display,
             egl_config,
             primary_ctx,
-            primary_pbuffer: primary_pbuffer,
+            primary_pbuffer,
             tex_old,
             tex_new,
             video_old,
@@ -2973,4 +2973,41 @@ fn resolve_shader(name: &str) -> (&'static str, &'static str) {
 
 fn pipeline_for(_name: &str) -> Pipeline {
     Pipeline::Single
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_video_path_matches_video_extensions() {
+        for p in ["/a/b.mp4", "clip.MKV", "x.webm", "y.MOV", "z.avi"] {
+            assert!(is_video_path(p), "{p} should be video");
+        }
+        for p in ["/a/b.png", "photo.jpg", "noext", "tricky.mp4.png"] {
+            assert!(!is_video_path(p), "{p} should not be video");
+        }
+    }
+
+    #[test]
+    fn resolve_shader_known_name_returns_that_entry() {
+        assert_eq!(resolve_shader("glitch").0, "glitch");
+        assert_eq!(resolve_shader("pixelate").0, "pixelate");
+    }
+
+    #[test]
+    fn resolve_shader_unknown_falls_back_to_liquid_ripple() {
+        assert_eq!(resolve_shader("does-not-exist").0, "liquid-ripple");
+    }
+
+    #[test]
+    fn resolve_shader_random_returns_catalog_entry() {
+        let picked = resolve_shader("random").0;
+        assert!(SHADER_CATALOG.iter().any(|(n, _)| *n == picked));
+    }
+
+    #[test]
+    fn placeholder_pixels_is_one_black_pixel() {
+        assert_eq!(placeholder_pixels(), (1, 1, vec![0, 0, 0, 255]));
+    }
 }

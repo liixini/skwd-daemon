@@ -49,6 +49,7 @@ pub async fn run_one_shot(music: Arc<MusicState>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::unnecessary_unwrap)]
 async fn handle_conn(
     socket: &mut tokio::net::TcpStream,
     music: &MusicState,
@@ -65,7 +66,7 @@ async fn handle_conn(
     let path = first_line.split_whitespace().nth(1).unwrap_or_default();
 
     let (status, body) = if path.starts_with("/callback") {
-        let qs = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let qs = path.split_once('?').map_or("", |(_, q)| q);
         let mut code = None;
         let mut state = None;
         let mut err = None;

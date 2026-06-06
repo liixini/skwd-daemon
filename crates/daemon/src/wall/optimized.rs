@@ -18,8 +18,7 @@ pub fn cache_key(path: &Path) -> std::io::Result<String> {
         .modified()
         .ok()
         .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let s = format!("{}|{size}|{mtime}", canonical.display());
     let mut h = DefaultHasher::new();
     s.hash(&mut h);

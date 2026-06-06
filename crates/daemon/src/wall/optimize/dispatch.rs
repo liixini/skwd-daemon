@@ -14,10 +14,11 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             let optimize_state = state.optimize_state.clone();
             let db = state.db_shared.clone();
             let tx = event_tx.clone();
+            let runner = state.runner.clone();
             let p = preset.to_string();
             let r = resolution.to_string();
             tokio::spawn(async move {
-                if let Err(e) = image::start(&config, db, tx, optimize_state, &p, &r).await {
+                if let Err(e) = image::start(runner, &config, db, tx, optimize_state, &p, &r).await {
                     warn!("optimize start failed: {e}");
                 }
             });
@@ -60,10 +61,11 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             let convert_state = state.convert_state.clone();
             let db = state.db_shared.clone();
             let tx = event_tx.clone();
+            let runner = state.runner.clone();
             let p = preset.to_string();
             let r = resolution.to_string();
             tokio::spawn(async move {
-                if let Err(e) = video::start(&config, db, tx, convert_state, &p, &r).await {
+                if let Err(e) = video::start(runner, &config, db, tx, convert_state, &p, &r).await {
                     warn!("video_convert start failed: {e}");
                 }
             });
@@ -100,5 +102,41 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
         ),
 
         _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::server::test_state;
+
+    #[tokio::test]
+    async fn optimize_status_and_presets() {
+        let h = test_state();
+        assert_eq!(
+            h.dispatch("optimize.status", serde_json::json!({})).await.result.unwrap()["running"],
+            false
+        );
+        let pr = h.dispatch("optimize.presets", serde_json::json!({})).await.result.unwrap();
+        assert!(pr["presets"].is_object());
+        assert!(pr["resolutions"].is_object());
+    }
+
+    #[tokio::test]
+    async fn video_convert_status_and_presets() {
+        let h = test_state();
+        assert_eq!(
+            h.dispatch("video_convert.status", serde_json::json!({})).await.result.unwrap()["running"],
+            false
+        );
+        assert!(
+            h.dispatch("video_convert.presets", serde_json::json!({})).await.result.unwrap()["presets"]
+                .is_object()
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_optimize_method_errors() {
+        let h = test_state();
+        assert!(h.dispatch("optimize.bogus", serde_json::json!({})).await.error.is_some());
     }
 }

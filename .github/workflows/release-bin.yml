@@ -24,7 +24,7 @@ jobs:
           pacman -Syu --noconfirm
           pacman -S --noconfirm --needed \
             base-devel git github-cli \
-            rust clang pkgconf \
+            rust clang pkgconf patchelf \
             ffmpeg alsa-lib libpulse wayland wayland-protocols mesa imagemagick
 
       - uses: actions/checkout@v4
@@ -61,11 +61,13 @@ jobs:
         run: |
           v="${{ steps.ver.outputs.v }}"
           name="skwd-daemon-${v}-x86_64"
-          mkdir -p "$name/bin" "$name/data/host"
+          mkdir -p "$name/bin" "$name/lib" "$name/data/host"
           cp target/release/skwd            "$name/bin/"
           cp target/release/skwd-daemon     "$name/bin/"
           cp target/release/skwd-paper      "$name/bin/"
           cp target/release/skwd-paper-still "$name/bin/"
+          cp target/release/libsteam_api.so "$name/lib/"
+          patchelf --set-rpath '$ORIGIN/../lib/skwd-daemon' "$name/bin/skwd-daemon"
           cp data/skwd-daemon.service       "$name/data/"
           cp data/host/shell.qml            "$name/data/host/"
           cp LICENSE                        "$name/"

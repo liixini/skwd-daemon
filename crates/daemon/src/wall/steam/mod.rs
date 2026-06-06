@@ -1,3 +1,7 @@
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+
+pub mod workshop_query;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,8 +45,59 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             Response::ok(req.id, st.to_status_json())
         }
 
+        "browser_status" => {
+            let steam_mode = state.steam_state.lock().await.backend == crate::config::SteamBackend::Steam;
+            let available = steam_mode && ensure_browser(&state.workshop_browser).await.is_some();
+            Response::ok(req.id, serde_json::json!({"available": available}))
+        }
+
+        "search" => {
+            let steam_mode = state.steam_state.lock().await.backend == crate::config::SteamBackend::Steam;
+            let browser = if steam_mode { ensure_browser(&state.workshop_browser).await } else { None };
+            let Some(browser) = browser else {
+                return Response::err(req.id, 1, "steamworks browser unavailable (Steam not running, or backend is steamcmd)");
+            };
+            let page = req.params.get("page").and_then(serde_json::Value::as_u64).unwrap_or(1) as u32;
+            let search = req.params.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let sort = req.params.get("sort").and_then(|v| v.as_str()).unwrap_or("trend").to_string();
+            let sort_mode = workshop_query::SortMode::from_str(&sort);
+
+            let required_tags = collect_string_array(req.params.get("required_tags"));
+            let excluded_tags = collect_string_array(req.params.get("excluded_tags"));
+            let match_any_required = req.params.get("match_any_required").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let trend_days = req.params.get("trend_days").and_then(serde_json::Value::as_u64).map(|d| d as u32);
+
+            let filters = workshop_query::SearchFilters {
+                required_tags,
+                excluded_tags,
+                match_any_required,
+                trend_days,
+            };
+
+            match browser.search(page, &search, sort_mode, filters).await {
+                Ok(items) => Response::ok(req.id, serde_json::json!({"items": items, "page": page})),
+                Err(e) => {
+                    warn!("steam.search failed: {e}");
+                    Response::err(req.id, 2, format!("search failed: {e}"))
+                }
+            }
+        }
+
         _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
     }
+}
+
+async fn ensure_browser(
+    cell: &Arc<Mutex<Option<workshop_query::WorkshopBrowser>>>,
+) -> Option<workshop_query::WorkshopBrowser> {
+    let mut guard = cell.lock().await;
+    if guard.is_none() {
+        *guard = tokio::task::spawn_blocking(workshop_query::WorkshopBrowser::try_init)
+            .await
+            .ok()
+            .flatten();
+    }
+    guard.clone()
 }
 
 
@@ -56,8 +111,11 @@ pub struct SteamState {
     batch_running: bool,
     failed_auth: Vec<String>,
     steam_dir: PathBuf,
+    we_dir: PathBuf,
     username: String,
     status_path: PathBuf,
+    pub backend: crate::config::SteamBackend,
+    pub workshop_browser: Option<Arc<Mutex<Option<workshop_query::WorkshopBrowser>>>>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -68,8 +126,8 @@ pub struct DownloadEntry {
 
 impl SteamState {
     pub fn new(config: &Config) -> Self {
-        let steam_dir = config
-            .we_dir()
+        let we_dir = config.we_dir();
+        let steam_dir = we_dir
             .parent()
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
@@ -87,9 +145,26 @@ impl SteamState {
             batch_running: false,
             failed_auth: Vec::new(),
             steam_dir,
+            we_dir,
             username: config.steam_username().to_string(),
             status_path: config.cache_dir().join("wallpaper/steam-dl-status.json"),
+            backend: config.steam.backend,
+            workshop_browser: None,
         }
+    }
+
+    pub fn attach_browser(
+        &mut self,
+        cell: Arc<Mutex<Option<workshop_query::WorkshopBrowser>>>,
+    ) {
+        self.workshop_browser = Some(cell);
+    }
+
+    pub fn apply_runtime_config(&mut self, config: &Config) -> bool {
+        let was_client = self.backend == crate::config::SteamBackend::Steam;
+        self.backend = config.steam.backend;
+        self.username = config.steam_username().to_string();
+        was_client && !config.steam.uses_steam_client()
     }
 
     fn to_status_json(&self) -> serde_json::Value {
@@ -112,7 +187,7 @@ impl SteamState {
 }
 
 
-pub async fn recover_queue(state: &Arc<Mutex<SteamState>>) {
+pub async fn recover_queue(state: &Arc<Mutex<SteamState>>, event_tx: &broadcast::Sender<String>) {
     let status_path = { state.lock().await.status_path.clone() };
     let Ok(t) = tokio::fs::read_to_string(&status_path).await else {
         return;
@@ -120,39 +195,45 @@ pub async fn recover_queue(state: &Arc<Mutex<SteamState>>) {
     let Ok(obj) = serde_json::from_str::<serde_json::Value>(&t) else {
         return;
     };
-    let Some(downloads) = obj.get("downloads").and_then(|v| v.as_object()) else {
-        return;
-    };
 
     let mut to_queue = Vec::new();
-    for (id, entry) in downloads {
-        if let Some(status) = entry.get("status").and_then(|s| s.as_str())
-            && matches!(status, "queued" | "downloading" | "auth_error")
-        {
-            to_queue.push(id.clone());
+    if let Some(downloads) = obj.get("downloads").and_then(|v| v.as_object()) {
+        for (id, entry) in downloads {
+            if let Some(status) = entry.get("status").and_then(|s| s.as_str())
+                && matches!(status, "queued" | "downloading" | "auth_error")
+            {
+                to_queue.push(id.clone());
+            }
         }
     }
 
-    if !to_queue.is_empty() {
-        info!(
-            "steam: recovering {} incomplete downloads from status file",
-            to_queue.len()
-        );
+    let should_drain = {
         let mut st = state.lock().await;
+        st.auth_paused = false;
+        st.failed_auth.clear();
+        st.active_id.clear();
+        st.active_message.clear();
+        if !to_queue.is_empty() {
+            info!("steam: recovering {} incomplete downloads from status file", to_queue.len());
+        }
         for id in &to_queue {
             if st.downloads.contains_key(id) {
                 continue;
             }
             st.downloads.insert(
                 id.clone(),
-                DownloadEntry {
-                    status: "queued".into(),
-                    progress: 0.0,
-                },
+                DownloadEntry { status: "queued".into(), progress: 0.0 },
             );
             st.queue.push(id.clone());
         }
         st.queue_length = st.queue.len();
+        write_status(&st).await;
+        broadcast_steam_event(event_tx, &st);
+        !st.batch_running && !st.queue.is_empty()
+    };
+
+    if should_drain {
+        drain_queue(state, event_tx).await;
     }
 }
 
@@ -233,6 +314,18 @@ async fn drain_queue(state: &Arc<Mutex<SteamState>>, event_tx: &broadcast::Sende
 }
 
 async fn spawn_batch(state: Arc<Mutex<SteamState>>, event_tx: broadcast::Sender<String>, ids: Vec<String>) {
+    let backend = state.lock().await.backend;
+    match backend {
+        crate::config::SteamBackend::Steam => {
+            spawn_batch_steamworks(state, event_tx, ids).await;
+        }
+        crate::config::SteamBackend::Steamcmd => {
+            spawn_batch_steamcmd(state, event_tx, ids).await;
+        }
+    }
+}
+
+async fn spawn_batch_steamcmd(state: Arc<Mutex<SteamState>>, event_tx: broadcast::Sender<String>, ids: Vec<String>) {
     let (steam_dir, username) = {
         let mut st = state.lock().await;
         st.active_id = ids[0].clone();
@@ -245,7 +338,7 @@ async fn spawn_batch(state: Arc<Mutex<SteamState>>, event_tx: broadcast::Sender<
         (st.steam_dir.clone(), st.username.clone())
     };
 
-    info!("steam: spawning batch of {} items: {}", ids.len(), ids.join(", "));
+    info!("steam: spawning steamcmd batch of {} items: {}", ids.len(), ids.join(", "));
 
     let mut cmd = Command::new("steamcmd");
     if !steam_dir.as_os_str().is_empty() {
@@ -422,6 +515,197 @@ async fn spawn_batch(state: Arc<Mutex<SteamState>>, event_tx: broadcast::Sender<
     broadcast_steam_event(&event_tx, &st);
 }
 
+async fn spawn_batch_steamworks(state: Arc<Mutex<SteamState>>, event_tx: broadcast::Sender<String>, ids: Vec<String>) {
+    let (browser_cell, we_dir) = {
+        let mut st = state.lock().await;
+        st.active_id = ids[0].clone();
+        st.active_message = "Asking Steam to download workshop item...".into();
+        if let Some(entry) = st.downloads.get_mut(&ids[0]) {
+            entry.status = "downloading".into();
+        }
+        st.queue_length = ids.len();
+        write_status(&st).await;
+        broadcast_steam_event(&event_tx, &st);
+        (st.workshop_browser.clone(), st.we_dir.clone())
+    };
+
+    let browser_handle = match browser_cell.as_ref() {
+        Some(cell) => ensure_browser(cell).await,
+        None => None,
+    };
+
+    let Some(browser) = browser_handle else {
+        warn!("steam: steamworks backend selected but browser not initialised (Steam not running, or user doesn't own Wallpaper Engine)");
+        let mut st = state.lock().await;
+        for id in &ids {
+            if let Some(entry) = st.downloads.get_mut(id) {
+                entry.status = "error".into();
+            }
+        }
+        st.active_message = "Steam is not running, or the account does not own Wallpaper Engine. Start Steam (logged in as the WE owner), or switch backend in Settings → Steam.".into();
+        st.batch_running = false;
+        st.active_id.clear();
+        st.queue_length = 0;
+        write_status(&st).await;
+        broadcast_steam_event(&event_tx, &st);
+        return;
+    };
+
+    let mut done_ids: HashSet<String> = HashSet::new();
+
+    for id in &ids {
+        let id_u64: u64 = match id.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                warn!("steam: invalid workshop id {id}");
+                let mut st = state.lock().await;
+                if let Some(entry) = st.downloads.get_mut(id) {
+                    entry.status = "error".into();
+                }
+                continue;
+            }
+        };
+
+        {
+            let mut st = state.lock().await;
+            st.active_id = id.clone();
+            st.active_message = format!("Subscribing to {id}...");
+            if let Some(entry) = st.downloads.get_mut(id) {
+                entry.status = "downloading".into();
+                entry.progress = 0.0;
+            }
+            write_status(&st).await;
+            broadcast_steam_event(&event_tx, &st);
+        }
+
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<workshop_query::DownloadProgress>();
+        let state_for_progress = state.clone();
+        let event_tx_for_progress = event_tx.clone();
+        let id_for_progress = id.clone();
+        let progress_task = tokio::spawn(async move {
+            while let Some(p) = progress_rx.recv().await {
+                let mut st = state_for_progress.lock().await;
+                let pct = if p.total > 0 { (p.current as f64) / (p.total as f64) } else { 0.0 };
+                if let Some(entry) = st.downloads.get_mut(&id_for_progress) {
+                    entry.progress = pct.clamp(0.0, 1.0);
+                }
+                if p.total > 0 {
+                    st.active_message = format!(
+                        "Downloading {} ({:.0}%)",
+                        id_for_progress,
+                        (pct * 100.0).round()
+                    );
+                } else if workshop_query::is_pending(p.state) {
+                    st.active_message = format!("Steam queued {id_for_progress}, waiting for download to start...");
+                } else if workshop_query::is_downloading(p.state) {
+                    st.active_message = format!("Downloading {id_for_progress}...");
+                }
+                write_status(&st).await;
+                broadcast_steam_event(&event_tx_for_progress, &st);
+            }
+        });
+
+        let result = browser.download(id_u64, progress_tx).await;
+        progress_task.await.ok();
+
+        match result {
+            Ok(info) => {
+                let src = std::path::PathBuf::from(&info.install_folder);
+                let dst = if we_dir.as_os_str().is_empty() {
+                    src.clone()
+                } else {
+                    we_dir.join(id)
+                };
+                let copy_result = if src == dst {
+                    Ok(())
+                } else {
+                    copy_dir_recursive(&src, &dst).await
+                };
+
+                let mut st = state.lock().await;
+                match copy_result {
+                    Ok(()) => {
+                        done_ids.insert(id.clone());
+                        if let Some(entry) = st.downloads.get_mut(id) {
+                            entry.status = "done".into();
+                            entry.progress = 1.0;
+                        }
+                        st.active_message = format!("Downloaded {id}");
+                        info!("steam: steamworks installed {id} ({} bytes) -> {}", info.size_on_disk, dst.display());
+                    }
+                    Err(e) => {
+                        warn!("steam: failed to copy Steam-installed item {id} from {} to {}: {e}", src.display(), dst.display());
+                        if let Some(entry) = st.downloads.get_mut(id) {
+                            entry.status = "error".into();
+                        }
+                        st.active_message = format!("Steam downloaded {id} but copy into WE dir failed: {e}");
+                    }
+                }
+                write_status(&st).await;
+                broadcast_steam_event(&event_tx, &st);
+            }
+            Err(e) => {
+                warn!("steam: steamworks download failed for {id}: {e}");
+                let mut st = state.lock().await;
+                if let Some(entry) = st.downloads.get_mut(id) {
+                    entry.status = "error".into();
+                }
+                st.active_message = format!("Steam download failed for {id}: {e}");
+                write_status(&st).await;
+                broadcast_steam_event(&event_tx, &st);
+            }
+        }
+    }
+
+    let mut st = state.lock().await;
+    info!("steam: steamworks batch done, {}/{} completed", done_ids.len(), ids.len());
+    st.batch_running = false;
+
+    if !st.queue.is_empty() {
+        let next_batch: Vec<String> = std::mem::take(&mut st.queue);
+        st.batch_running = true;
+        st.queue_length = next_batch.len();
+        write_status(&st).await;
+        broadcast_steam_event(&event_tx, &st);
+        drop(st);
+        Box::pin(spawn_batch(state.clone(), event_tx.clone(), next_batch)).await;
+        return;
+    }
+
+    st.active_id.clear();
+    st.active_message.clear();
+    st.queue_length = 0;
+    write_status(&st).await;
+    broadcast_steam_event(&event_tx, &st);
+}
+
+async fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(dst).await?;
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((s, d)) = stack.pop() {
+        let mut entries = tokio::fs::read_dir(&s).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let ty = entry.file_type().await?;
+            let from = entry.path();
+            let to = d.join(entry.file_name());
+            if ty.is_dir() {
+                tokio::fs::create_dir_all(&to).await?;
+                stack.push((from, to));
+            } else {
+                tokio::fs::copy(&from, &to).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_string_array(v: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(arr) = v.and_then(|v| v.as_array()) else { return Vec::new() };
+    arr.iter()
+        .filter_map(|item| item.as_str().map(std::string::ToString::to_string))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
 
 fn extract_workshop_id(line: &str, ids: &[String], done: &HashSet<String>) -> Option<String> {
     line.split(|c: char| !c.is_ascii_digit())
@@ -449,4 +733,68 @@ async fn write_status(st: &SteamState) {
 fn broadcast_steam_event(tx: &broadcast::Sender<String>, st: &SteamState) {
     let evt = make_event("skwd.wall.steam.status", st.to_status_json());
     let _ = tx.send(evt);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_workshop_id_finds_known_unfinished_id() {
+        let ids = vec!["1234567890".to_string(), "9876543210".to_string()];
+        let done = HashSet::new();
+        assert_eq!(
+            extract_workshop_id("Downloading item 1234567890 to ...", &ids, &done),
+            Some("1234567890".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_workshop_id_skips_done_and_unknown_and_short() {
+        let ids = vec!["1234567890".to_string()];
+        let mut done = HashSet::new();
+        assert_eq!(extract_workshop_id("item 999 short", &ids, &done), None);
+        assert_eq!(extract_workshop_id("item 5555555 unknown", &ids, &done), None);
+        done.insert("1234567890".to_string());
+        assert_eq!(extract_workshop_id("Success 1234567890", &ids, &done), None);
+    }
+
+    #[test]
+    fn extract_percent_parses_progress() {
+        assert_eq!(extract_percent("progress: 45.5%"), Some(0.455));
+        assert_eq!(extract_percent("[ 12%]"), Some(0.12));
+        assert_eq!(extract_percent("100% complete"), Some(1.0));
+    }
+
+    #[test]
+    fn extract_percent_handles_no_match() {
+        assert_eq!(extract_percent("no percent here"), None);
+        assert_eq!(extract_percent("abc%"), None);
+    }
+
+    #[test]
+    fn apply_runtime_config_refreshes_backend_and_releases_on_switch_to_steamcmd() {
+        use crate::config::{Config, SteamBackend};
+
+        let mut cfg = Config::default();
+        cfg.steam.backend = SteamBackend::Steam;
+        let mut st = SteamState::new(&cfg);
+        assert_eq!(st.backend, SteamBackend::Steam);
+
+        cfg.steam.backend = SteamBackend::Steamcmd;
+        cfg.steam.username = "alice".into();
+        let release = st.apply_runtime_config(&cfg);
+        assert!(release, "leaving the steam client must release the browser");
+        assert_eq!(
+            st.backend,
+            SteamBackend::Steamcmd,
+            "download backend follows the live toggle (prevents the frozen-backend deadlock)"
+        );
+        assert_eq!(st.username, "alice");
+
+        cfg.steam.backend = SteamBackend::Steam;
+        let release_back = st.apply_runtime_config(&cfg);
+        assert!(!release_back, "returning to the client does not release it");
+        assert_eq!(st.backend, SteamBackend::Steam);
+    }
 }

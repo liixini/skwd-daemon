@@ -32,6 +32,13 @@ pub fn open() -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+#[cfg(test)]
+pub(crate) fn open_in_memory() -> rusqlite::Result<Connection> {
+    let conn = Connection::open_in_memory()?;
+    migrate(&conn)?;
+    Ok(conn)
+}
+
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta(
@@ -461,4 +468,210 @@ pub fn update_meta_dimensions(
         params![filesize, width, height, key],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn
+    }
+
+    fn insert(conn: &Connection, key: &str, wp_type: &str, name: &str) {
+        upsert_cache_entry(conn, key, wp_type, name, "thumb", "thumb_sm", "", "", 100, 99, 0, 0).unwrap();
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let conn = mem();
+        assert!(migrate(&conn).is_ok());
+    }
+
+    #[test]
+    fn upsert_then_list_and_has_entry() {
+        let conn = mem();
+        insert(&conn, "static:one", "static", "one");
+        assert!(has_entry(&conn, "static:one"));
+        assert!(!has_entry(&conn, "missing"));
+
+        let rows = list_wallpapers(&conn, false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["key"], "static:one");
+        assert_eq!(rows[0]["name"], "one");
+        assert_eq!(rows[0]["type"], "static");
+    }
+
+    #[test]
+    fn upsert_updates_in_place_on_conflict() {
+        let conn = mem();
+        insert(&conn, "k", "static", "old");
+        upsert_cache_entry(&conn, "k", "video", "new", "t", "ts", "v.mp4", "", 200, 10, 5, 7).unwrap();
+        let rows = list_wallpapers(&conn, false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "new");
+        assert_eq!(rows[0]["type"], "video");
+        assert_eq!(rows[0]["video_file"], "v.mp4");
+        assert_eq!(rows[0]["richness"], 7);
+    }
+
+    #[test]
+    fn favourite_filter_and_toggle() {
+        let conn = mem();
+        insert(&conn, "a", "static", "a");
+        insert(&conn, "b", "static", "b");
+        assert!(set_favourite(&conn, "a", true).unwrap());
+        assert!(!set_favourite(&conn, "missing", true).unwrap());
+
+        let favs = list_wallpapers(&conn, true).unwrap();
+        assert_eq!(favs.len(), 1);
+        assert_eq!(favs[0]["key"], "a");
+        assert_eq!(list_wallpapers(&conn, false).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn bump_apply_count_increments() {
+        let conn = mem();
+        insert(&conn, "a", "static", "a");
+        assert_eq!(bump_apply_count(&conn, "a").unwrap(), 1);
+        bump_apply_count(&conn, "a").unwrap();
+        let rows = list_wallpapers(&conn, false).unwrap();
+        assert_eq!(rows[0]["apply_count"], 2);
+    }
+
+    #[test]
+    fn get_cache_entries_builds_composite_key() {
+        let conn = mem();
+        insert(&conn, "static:wall1", "static", "wall1");
+        upsert_cache_entry(&conn, "we:99", "we", "scene", "t", "ts", "", "99", 5, 0, 0, 0).unwrap();
+        let mut entries = get_cache_entries(&conn).unwrap();
+        entries.sort();
+        assert_eq!(entries[0], ("static:wall1".to_string(), "static:wall1".to_string(), 100));
+        assert_eq!(entries[1], ("we:99".to_string(), "we:99".to_string(), 5));
+    }
+
+    #[test]
+    fn random_pick_respects_types_exclude_and_favourites() {
+        let conn = mem();
+        insert(&conn, "s1", "static", "s1");
+        insert(&conn, "v1", "video", "v1");
+
+        assert!(random_pick(&conn, None, &[], false).unwrap().is_none());
+
+        let picked = random_pick(&conn, None, &["video"], false).unwrap().unwrap();
+        assert_eq!(picked.1, "video");
+        assert_eq!(picked.2, "v1");
+
+        assert!(random_pick(&conn, Some("s1"), &["static"], false).unwrap().is_none());
+        assert!(random_pick(&conn, None, &["static"], true).unwrap().is_none());
+
+        set_favourite(&conn, "s1", true).unwrap();
+        let fav = random_pick(&conn, None, &["static"], true).unwrap().unwrap();
+        assert_eq!(fav.0, "s1");
+    }
+
+    #[test]
+    fn delete_entries_by_keys() {
+        let conn = mem();
+        insert(&conn, "a", "static", "a");
+        insert(&conn, "b", "static", "b");
+        assert_eq!(delete_entries(&conn, &[]).unwrap(), 0);
+        assert_eq!(delete_entries(&conn, &["a".to_string(), "b".to_string()]).unwrap(), 2);
+        assert!(list_wallpapers(&conn, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_by_name_and_we_id() {
+        let conn = mem();
+        insert(&conn, "a", "static", "named");
+        upsert_cache_entry(&conn, "we:1", "we", "scene", "t", "ts", "", "1", 0, 0, 0, 0).unwrap();
+        assert!(delete_by_name(&conn, "named").unwrap());
+        assert!(!delete_by_name(&conn, "named").unwrap());
+        delete_meta_by_we_id(&conn, "1").unwrap();
+        assert!(list_wallpapers(&conn, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_by_name_prefix_returns_matched_names() {
+        let conn = mem();
+        insert(&conn, "a", "static", "trip01");
+        insert(&conn, "b", "static", "trip02");
+        insert(&conn, "c", "static", "other");
+        let mut deleted = delete_by_name_prefix(&conn, "trip").unwrap();
+        deleted.sort();
+        assert_eq!(deleted, vec!["trip01".to_string(), "trip02".to_string()]);
+        let remaining = list_wallpapers(&conn, false).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0]["name"], "other");
+    }
+
+    #[test]
+    fn rename_meta_key_changes_key_and_name() {
+        let conn = mem();
+        insert(&conn, "old", "static", "oldname");
+        rename_meta_key(&conn, "old", "new", "newname").unwrap();
+        assert!(!has_entry(&conn, "old"));
+        assert!(has_entry(&conn, "new"));
+        assert_eq!(list_wallpapers(&conn, false).unwrap()[0]["name"], "newname");
+    }
+
+    #[test]
+    fn update_analysis_coalesces_none_fields() {
+        let conn = mem();
+        insert(&conn, "a", "static", "a");
+        assert!(update_analysis(&conn, "a", Some("tag1,tag2"), None, Some("ollama"), Some(120), None, None).unwrap());
+        let rows = list_wallpapers(&conn, false).unwrap();
+        assert_eq!(rows[0]["tags"], "tag1,tag2");
+        assert_eq!(rows[0]["analyzed_by"], "ollama");
+        assert_eq!(rows[0]["hue"], 120);
+        assert_eq!(rows[0]["sat"], 0);
+
+        update_analysis(&conn, "a", None, Some("#fff"), None, None, None, None).unwrap();
+        let rows = list_wallpapers(&conn, false).unwrap();
+        assert_eq!(rows[0]["tags"], "tag1,tag2");
+        assert_eq!(rows[0]["colors"], "#fff");
+    }
+
+    #[test]
+    fn update_meta_dimensions_sets_size_and_geometry() {
+        let conn = mem();
+        insert(&conn, "a", "static", "a");
+        update_meta_dimensions(&conn, "a", 4096, 1920, 1080).unwrap();
+        let rows = list_wallpapers(&conn, false).unwrap();
+        assert_eq!(rows[0]["filesize"], 4096);
+        assert_eq!(rows[0]["width"], 1920);
+        assert_eq!(rows[0]["height"], 1080);
+    }
+
+    #[test]
+    fn image_optimize_roundtrip_and_delete() {
+        let conn = mem();
+        upsert_image_optimize(&conn, "src.png", "dest.webp", "balanced", "webp", 800, 600, 1000, 400).unwrap();
+        let list = list_image_optimizations(&conn).unwrap();
+        assert_eq!(list, vec![("src.png".to_string(), "balanced".to_string(), "webp".to_string())]);
+        delete_optimize_by_src(&conn, "src.png").unwrap();
+        assert!(list_image_optimizations(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn video_convert_roundtrip() {
+        let conn = mem();
+        upsert_video_convert(&conn, "in.mov", "out.mp4", "h264", "h264", 1920, 1080, 9999, 5000).unwrap();
+        let list = list_video_conversions(&conn).unwrap();
+        assert_eq!(list, vec![("in.mov".to_string(), "h264".to_string())]);
+    }
+
+    #[test]
+    fn clear_all_empties_tables() {
+        let conn = mem();
+        insert(&conn, "a", "static", "a");
+        upsert_image_optimize(&conn, "s", "d", "p", "webp", 1, 1, 1, 1).unwrap();
+        upsert_video_convert(&conn, "s", "d", "p", "c", 1, 1, 1, 1).unwrap();
+        clear_all(&conn).unwrap();
+        assert!(list_wallpapers(&conn, false).unwrap().is_empty());
+        assert!(list_image_optimizations(&conn).unwrap().is_empty());
+        assert!(list_video_conversions(&conn).unwrap().is_empty());
+    }
 }

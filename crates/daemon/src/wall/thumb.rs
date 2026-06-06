@@ -1,3 +1,5 @@
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+
 use std::path::{Path, PathBuf};
 
 use image::DynamicImage;
@@ -282,7 +284,7 @@ pub fn hue_bucket(hue: u16, sat: u16) -> u16 {
 
 
 fn hue_to_bucket_idx(hue: u16) -> usize {
-    if hue >= 355 || hue < 25 {
+    if !(25..355).contains(&hue) {
         return 0;
     }
     if hue >= 320 {
@@ -306,4 +308,40 @@ pub fn small_thumb_path(thumb_path: &str) -> String {
 pub fn cache_key(thumb_path: &str) -> String {
     let fname = thumb_path.rsplit('/').next().unwrap_or(thumb_path);
     fname.rsplit_once('.').map_or(fname, |(stem, _)| stem).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tmp_path_inserts_tmp_segment_before_extension() {
+        assert_eq!(tmp_path(Path::new("/c/wall.webp")), PathBuf::from("/c/wall.tmp.webp"));
+        assert_eq!(tmp_path(Path::new("thumb.png")), PathBuf::from("thumb.tmp.png"));
+    }
+
+    #[test]
+    fn cache_key_strips_dir_and_extension() {
+        assert_eq!(cache_key("/cache/thumbs/wall.webp"), "wall");
+        assert_eq!(cache_key("wall.png"), "wall");
+        assert_eq!(cache_key("noext"), "noext");
+        assert_eq!(cache_key("/d/archive.tar.gz"), "archive.tar");
+    }
+
+    #[test]
+    fn hue_bucket_is_greyscale_when_low_saturation() {
+        assert_eq!(hue_bucket(200, 9), 99);
+        assert_eq!(hue_bucket(0, 0), 99);
+    }
+
+    #[test]
+    fn hue_bucket_maps_colored_hues() {
+        assert_eq!(hue_bucket(0, 50), 0);
+        assert_eq!(hue_bucket(10, 50), 0);
+        assert_eq!(hue_bucket(355, 50), 0);
+        assert_eq!(hue_bucket(330, 50), 11);
+        assert_eq!(hue_bucket(300, 50), 10);
+        assert_eq!(hue_bucket(25, 50), 1);
+        assert_eq!(hue_bucket(120, 50), 4);
+    }
 }

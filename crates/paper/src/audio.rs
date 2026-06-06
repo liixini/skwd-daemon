@@ -21,7 +21,7 @@ pub struct AudioPlayer {
 
 impl AudioPlayer {
     pub fn new(file_path: &str, mute: bool, volume: u32) -> Result<Option<Self>> {
-        let probe = ff::format::input(&file_path)
+        let probe = ff::format::input(file_path)
             .with_context(|| format!("audio probe: {file_path}"))?;
         let has_audio = probe.streams().best(ff::media::Type::Audio).is_some();
         drop(probe);
@@ -127,7 +127,7 @@ fn decode_loop(path: &str, mut producer: RingProducer, stop: Arc<AtomicBool>) ->
     let mut input_opts = ff::Dictionary::new();
     input_opts.set("probesize", "65536");
     input_opts.set("analyzeduration", "500000");
-    let mut input = ff::format::input_with_dictionary(&path, input_opts)
+    let mut input = ff::format::input_with_dictionary(path, input_opts)
         .with_context(|| format!("audio open: {path}"))?;
 
     let (audio_idx, mut decoder, in_format, in_rate, in_channels): (

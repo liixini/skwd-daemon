@@ -33,12 +33,9 @@ pub async fn run(args: &[String]) -> i32 {
         args.iter().map(PathBuf::from).collect()
     };
 
-    let cache_dir = match cache_dir() {
-        Some(d) => d,
-        None => {
-            eprintln!("cannot resolve cache dir (HOME unset?)");
-            return 1;
-        }
+    let Some(cache_dir) = cache_dir() else {
+        eprintln!("cannot resolve cache dir (HOME unset?)");
+        return 1;
     };
     if let Err(e) = std::fs::create_dir_all(&cache_dir) {
         eprintln!("create_dir_all {}: {e}", cache_dir.display());
@@ -88,8 +85,7 @@ pub async fn run(args: &[String]) -> i32 {
     }
     let total = work.len();
     println!(
-        "{} cached already, {} to transcode (parallel={PARALLEL_JOBS})",
-        skipped, total
+        "{skipped} cached already, {total} to transcode (parallel={PARALLEL_JOBS})"
     );
     if total == 0 {
         println!("done (everything cached)");
@@ -139,8 +135,7 @@ pub async fn run(args: &[String]) -> i32 {
     for h in handles {
         match h.await {
             Ok(true) => {}
-            Ok(false) => failed += 1,
-            Err(_) => failed += 1,
+            Ok(false) | Err(_) => failed += 1,
         }
     }
 
@@ -196,17 +191,15 @@ fn default_dirs() -> Vec<PathBuf> {
 
 fn is_video(p: &Path) -> bool {
     p.extension()
-        .map(|e| {
+        .is_some_and(|e| {
             let lower = e.to_string_lossy().to_lowercase();
             VIDEO_EXTS.iter().any(|x| *x == lower)
         })
-        .unwrap_or(false)
 }
 
 fn collect_videos(root: &Path, out: &mut Vec<PathBuf>) {
-    let walker = match std::fs::read_dir(root) {
-        Ok(w) => w,
-        Err(_) => return,
+    let Ok(walker) = std::fs::read_dir(root) else {
+        return;
     };
     for entry in walker.flatten() {
         let path = entry.path();
@@ -226,8 +219,7 @@ pub fn cache_key(path: &Path) -> std::io::Result<String> {
         .modified()
         .ok()
         .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let s = format!("{}|{size}|{mtime}", canonical.display());
     let mut h = DefaultHasher::new();
     s.hash(&mut h);
@@ -251,18 +243,15 @@ async fn transcode(src: &Path, dst: &Path, encoder: Encoder) -> Result<(u64, u64
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
 
-    match encoder {
-        Encoder::Vaapi => {
-            cmd.args([
-                "-hwaccel",
-                "vaapi",
-                "-hwaccel_device",
-                "/dev/dri/renderD128",
-                "-hwaccel_output_format",
-                "vaapi",
-            ]);
-        }
-        _ => {}
+    if let Encoder::Vaapi = encoder {
+        cmd.args([
+            "-hwaccel",
+            "vaapi",
+            "-hwaccel_device",
+            "/dev/dri/renderD128",
+            "-hwaccel_output_format",
+            "vaapi",
+        ]);
     }
 
     cmd.arg("-i").arg(src);
@@ -372,7 +361,7 @@ async fn transcode(src: &Path, dst: &Path, encoder: Encoder) -> Result<(u64, u64
         eprintln!("DBG ffmpeg argv:");
         eprintln!("  {:?}", std_cmd.get_program());
         for a in std_cmd.get_args() {
-            eprintln!("    {:?}", a);
+            eprintln!("    {a:?}");
         }
     }
 
@@ -394,4 +383,39 @@ async fn transcode(src: &Path, dst: &Path, encoder: Encoder) -> Result<(u64, u64
     let new_size = std::fs::metadata(&dst_tmp).map(|m| m.len()).unwrap_or(0);
     std::fs::rename(&dst_tmp, dst).map_err(|e| format!("rename: {e}"))?;
     Ok((orig_size, new_size))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_video_checks_extension_case_insensitively() {
+        for p in ["a.mp4", "b.MKV", "/x/y.webm", "z.MOV", "c.m4v"] {
+            assert!(is_video(Path::new(p)), "{p} should be video");
+        }
+        for p in ["a.png", "b.gif", "noext", "c.txt"] {
+            assert!(!is_video(Path::new(p)), "{p} should not be video");
+        }
+    }
+
+    #[test]
+    fn cache_key_is_stable_and_size_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("clip.mp4");
+        std::fs::write(&file, b"hello").unwrap();
+
+        let k1 = cache_key(&file).unwrap();
+        assert_eq!(k1.len(), 16);
+        assert_eq!(k1, cache_key(&file).unwrap());
+
+        std::fs::write(&file, b"hello world, longer now").unwrap();
+        assert_ne!(k1, cache_key(&file).unwrap());
+    }
+
+    #[test]
+    fn cache_key_errors_on_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(cache_key(&dir.path().join("nope.mp4")).is_err());
+    }
 }

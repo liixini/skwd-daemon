@@ -69,7 +69,7 @@ impl VideoSource {
         let mut input_opts = ff::Dictionary::new();
         input_opts.set("probesize", "65536");
         input_opts.set("analyzeduration", "500000");
-        let input = ff::format::input_with_dictionary(&file_path, input_opts)
+        let input = ff::format::input_with_dictionary(file_path, input_opts)
             .with_context(|| format!("ffmpeg open input: {file_path}"))?;
 
         let (stream_index, time_base_secs, decoder) = {

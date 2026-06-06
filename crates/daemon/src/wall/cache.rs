@@ -250,7 +250,7 @@ pub async fn rebuild(
                 }
                 Err(e) => {
                     fail_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    warn!("[{}/{}] failed: {} — {e}", i + 1, total, item.name);
+                    warn!("[{}/{}] failed: {} - {e}", i + 1, total, item.name);
                 }
             }
 
@@ -287,7 +287,7 @@ pub async fn rebuild(
     let ok = ok_count.load(std::sync::atomic::Ordering::Relaxed);
     let fail = fail_count.load(std::sync::atomic::Ordering::Relaxed);
     info!(
-        "cache rebuild complete: {}/{} — {} ok, {} failed",
+        "cache rebuild complete: {}/{} - {} ok, {} failed",
         cs.progress, cs.total, ok, fail
     );
     let _ = broadcast_cache_event(&event_tx, "ready", cs.progress, cs.total);
@@ -503,8 +503,6 @@ pub async fn process_we_single(
 }
 
 #[allow(dead_code)]
-
-
 pub async fn recompute_colors(
     db: Arc<Mutex<Connection>>,
     event_tx: broadcast::Sender<String>,
@@ -750,4 +748,112 @@ fn broadcast_item_event(
         Err(_) => warn!("[cache] broadcast skwd.wall.cached name={name} FAILED (no receivers)"),
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_media_dir_collects_matching_exts_with_thumb_names() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("wall");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.png"), b"x").unwrap();
+        std::fs::write(dir.join("sub/b.JPG"), b"x").unwrap();
+        std::fs::write(dir.join("note.txt"), b"x").unwrap();
+
+        let thumb_dir = root.path().join("t");
+        let thumb_sm_dir = root.path().join("ts");
+        let mut items = Vec::new();
+        scan_media_dir(&dir, &thumb_dir, &thumb_sm_dir, "static", &["png", "jpg"], "sm-", &mut items);
+
+        let mut by_name: Vec<(String, PathBuf, PathBuf)> = items
+            .iter()
+            .map(|i| (i.name.clone(), i.thumb_path.clone(), i.thumb_sm_path.clone()))
+            .collect();
+        by_name.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(by_name.len(), 2);
+        assert_eq!(by_name[0].0, "a.png");
+        assert_eq!(by_name[0].1, thumb_dir.join("a.png.webp"));
+        assert_eq!(by_name[0].2, thumb_sm_dir.join("sm-a.png.webp"));
+        assert_eq!(by_name[1].0, "sub/b.JPG");
+        assert_eq!(by_name[1].1, thumb_dir.join("sub--b.JPG.webp"));
+        assert!(items.iter().all(|i| i.wp_type == "static"));
+    }
+
+    #[test]
+    fn scan_we_dir_reads_preview_title_and_video() {
+        let root = tempfile::tempdir().unwrap();
+        let we = root.path().join("workshop");
+        let item_dir = we.join("12345");
+        std::fs::create_dir_all(&item_dir).unwrap();
+        std::fs::write(item_dir.join("preview.jpg"), b"x").unwrap();
+        std::fs::write(item_dir.join("project.json"), r#"{"title":"Cool Scene"}"#).unwrap();
+        std::fs::write(item_dir.join("scene.mp4"), b"x").unwrap();
+
+        let no_preview = we.join("99999");
+        std::fs::create_dir_all(&no_preview).unwrap();
+        std::fs::write(no_preview.join("project.json"), r#"{"title":"Skipped"}"#).unwrap();
+
+        let thumb_dir = root.path().join("t");
+        let thumb_sm_dir = root.path().join("ts");
+        let mut items = Vec::new();
+        scan_we_dir(&we, &thumb_dir, &thumb_sm_dir, &mut items);
+
+        assert_eq!(items.len(), 1);
+        let it = &items[0];
+        assert_eq!(it.we_id, "12345");
+        assert_eq!(it.title, "Cool Scene");
+        assert_eq!(it.we_video, Some(item_dir.join("scene.mp4")));
+        assert_eq!(it.thumb_path, thumb_dir.join("12345.webp"));
+        assert_eq!(it.thumb_sm_path, thumb_sm_dir.join("we-12345.webp"));
+    }
+
+    #[test]
+    fn find_we_video_skips_preview_and_matches_known_exts() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        std::fs::write(dir.join("preview.mp4"), b"x").unwrap();
+        std::fs::write(dir.join("clip.webm"), b"x").unwrap();
+        assert_eq!(find_we_video(dir), Some(dir.join("clip.webm")));
+
+        let empty = tempfile::tempdir().unwrap();
+        std::fs::write(empty.path().join("preview.png"), b"x").unwrap();
+        std::fs::write(empty.path().join("readme.txt"), b"x").unwrap();
+        assert_eq!(find_we_video(empty.path()), None);
+    }
+
+    #[test]
+    fn read_we_title_falls_back_to_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(read_we_title(root.path()), "Unknown");
+        std::fs::write(root.path().join("project.json"), r#"{"title":"Named"}"#).unwrap();
+        assert_eq!(read_we_title(root.path()), "Named");
+        std::fs::write(root.path().join("project.json"), "not json").unwrap();
+        assert_eq!(read_we_title(root.path()), "Unknown");
+    }
+
+    // Contract: skwd-wall's WallpaperSelectorService.qml handler for skwd.wall.cached reads
+    // these exact data fields. Pin them so a rename doesn't silently break live cache updates.
+    #[tokio::test]
+    async fn cached_event_payload_contract() {
+        let (tx, mut rx) = broadcast::channel(8);
+        broadcast_item_event(&tx, "static:x", "static", "x", "/t.webp", "v.mp4", "we9", 111, 50, 60, 3).unwrap();
+        let raw = rx.recv().await.unwrap();
+        let evt: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(evt["event"], "skwd.wall.cached");
+        let d = &evt["data"];
+        assert_eq!(d["key"], "static:x");
+        assert_eq!(d["type"], "static");
+        assert_eq!(d["name"], "x");
+        assert_eq!(d["thumb"], "/t.webp");
+        assert_eq!(d["video_file"], "v.mp4");
+        assert_eq!(d["we_id"], "we9");
+        assert_eq!(d["mtime"], 111);
+        assert_eq!(d["hue"], 50);
+        assert_eq!(d["sat"], 60);
+        assert_eq!(d["richness"], 3);
+    }
 }

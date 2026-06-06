@@ -3,7 +3,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rusqlite::Connection;
-use tokio::process::Command;
 use tokio::sync::{broadcast, Mutex, Semaphore};
 use tracing::warn;
 
@@ -12,7 +11,7 @@ use anyhow::bail;
 use crate::config::Config;
 use crate::db;
 use crate::server::make_event;
-use crate::util::{self, BatchJobState};
+use crate::util::{self, BatchJobState, CommandRunner, CommandSpec};
 
 const MAX_JOBS: usize = 4;
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif"];
@@ -23,6 +22,7 @@ pub fn should_optimize(name: &str) -> bool {
 }
 
 pub async fn optimize_single_inline(
+    runner: &dyn CommandRunner,
     config: &Config,
     db: &Arc<Mutex<Connection>>,
     src: &std::path::Path,
@@ -42,7 +42,7 @@ pub async fn optimize_single_inline(
     let _ = tokio::fs::create_dir_all(&staging_dir).await;
 
     let src_str = src.display().to_string();
-    let opt = optimize_one(&src_str, &wall_dir, &trash_dir, &staging_dir, preset.quality, resolution.max_w, resolution.max_h).await?;
+    let opt = optimize_one(runner, &src_str, &wall_dir, &trash_dir, &staging_dir, preset.quality, resolution.max_w, resolution.max_h).await?;
 
     {
         let conn = db.lock().await;
@@ -92,6 +92,7 @@ fn get_preset(key: &str) -> Option<Preset> {
 pub type OptimizeState = BatchJobState;
 
 pub async fn start(
+    runner: Arc<dyn CommandRunner>,
     config: &Config,
     db: Arc<Mutex<Connection>>,
     event_tx: broadcast::Sender<String>,
@@ -176,6 +177,7 @@ pub async fn start(
         let max_w = resolution.max_w;
         let max_h = resolution.max_h;
         let preset_name = preset_key.to_string();
+        let runner = runner.clone();
 
         let handle = tokio::spawn(async move {
             {
@@ -189,7 +191,7 @@ pub async fn start(
                 s.current_file = name.clone();
             }
 
-            let result = optimize_one(&src, &wall_dir, &trash_dir, &staging_dir, quality, max_w, max_h).await;
+            let result = optimize_one(&*runner, &src, &wall_dir, &trash_dir, &staging_dir, quality, max_w, max_h).await;
 
             match result {
                 Ok(opt) => {
@@ -264,6 +266,7 @@ struct OptimizeResult {
 }
 
 async fn optimize_one(
+    runner: &dyn CommandRunner,
     src: &str,
     wall_dir: &Path,
     trash_dir: &Path,
@@ -282,9 +285,9 @@ async fn optimize_one(
     let orig_size = tokio::fs::metadata(src).await.map(|m| m.len()).unwrap_or(0);
 
     let (new_size, new_w, new_h) = if ext == "gif" {
-        optimize_gif(src, staging_path.to_str().unwrap(), quality, max_w, max_h).await?
+        optimize_gif(runner, src, staging_path.to_str().unwrap(), quality, max_w, max_h).await?
     } else {
-        optimize_static(src, staging_path.to_str().unwrap(), quality, max_w, max_h).await?
+        optimize_static(runner, src, staging_path.to_str().unwrap(), quality, max_w, max_h).await?
     };
 
     let trash_name = format!("{}_{}", &util::hash_prefix(src), old_name);
@@ -306,23 +309,15 @@ async fn optimize_one(
 }
 
 async fn optimize_static(
+    runner: &dyn CommandRunner,
     src: &str,
     dest: &str,
     quality: u32,
     max_w: u32,
     max_h: u32,
 ) -> anyhow::Result<(u64, u32, u32)> {
-    let resize = format!("{max_w}x{max_h}>");
-    let output = Command::new("magick")
-        .args([
-            "-limit", "memory", "512MiB",
-            "-limit", "map", "1GiB",
-            src,
-            "-resize", &resize,
-            "-quality", &quality.to_string(),
-            dest,
-        ])
-        .output()
+    let output = runner
+        .run(CommandSpec::new("magick").args(build_magick_resize_args(src, dest, quality, max_w, max_h)))
         .await
         .map_err(|e| anyhow::anyhow!("magick: {e}"))?;
 
@@ -334,42 +329,47 @@ async fn optimize_static(
     let meta = tokio::fs::metadata(dest).await.map_err(|e| anyhow::anyhow!("stat: {e}"))?;
     let new_size = meta.len();
 
-    let identify = Command::new("magick")
-        .args(["identify", "-format", "%w %h", dest])
-        .output()
+    let identify = runner
+        .run(CommandSpec::new("magick").args(["identify", "-format", "%w %h", dest]))
         .await
         .map_err(|e| anyhow::anyhow!("identify: {e}"))?;
 
     let dims = String::from_utf8_lossy(&identify.stdout);
-    let parts: Vec<&str> = dims.split_whitespace().collect();
-    let w = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0u32);
-    let h = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0u32);
+    let (w, h) = parse_identify_dims(&dims);
 
     Ok((new_size, w, h))
 }
 
+fn build_magick_resize_args(src: &str, dest: &str, quality: u32, max_w: u32, max_h: u32) -> Vec<String> {
+    [
+        "-limit", "memory", "512MiB", "-limit", "map", "1GiB",
+        src, "-resize", &format!("{max_w}x{max_h}>"),
+        "-quality", &quality.to_string(), dest,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+fn parse_identify_dims(text: &str) -> (u32, u32) {
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    let w = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0u32);
+    let h = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0u32);
+    (w, h)
+}
+
 async fn optimize_gif(
+    runner: &dyn CommandRunner,
     src: &str,
     dest: &str,
     quality: u32,
     max_w: u32,
     max_h: u32,
 ) -> anyhow::Result<(u64, u32, u32)> {
-    let vf = format!(
-        "scale=min({max_w}\\,iw):min({max_h}\\,ih):force_original_aspect_ratio=decrease"
-    );
+    let vf = build_gif_vf(max_w, max_h);
 
-    let output = Command::new("ffmpeg")
-        .args([
-            "-y", "-i", src,
-            "-vf", &vf,
-            "-c:v", "libwebp_anim",
-            "-quality", &quality.to_string(),
-            "-loop", "0",
-            "-an",
-            dest,
-        ])
-        .output()
+    let output = runner
+        .run(CommandSpec::new("ffmpeg").args(build_ffmpeg_gif_args(src, dest, quality, &vf)))
         .await
         .map_err(|e| anyhow::anyhow!("ffmpeg gif: {e}"))?;
 
@@ -381,24 +381,39 @@ async fn optimize_gif(
     let meta = tokio::fs::metadata(dest).await.map_err(|e| anyhow::anyhow!("stat: {e}"))?;
     let new_size = meta.len();
 
-    let probe = Command::new("ffprobe")
-        .args([
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "csv=p=0",
-            dest,
-        ])
-        .output()
+    let probe = runner
+        .run(CommandSpec::new("ffprobe").args([
+            "-v", "error", "-select_streams", "v:0", "-show_entries",
+            "stream=width,height", "-of", "csv=p=0", dest,
+        ]))
         .await
         .map_err(|e| anyhow::anyhow!("ffprobe: {e}"))?;
 
     let dims = String::from_utf8_lossy(&probe.stdout);
-    let parts: Vec<&str> = dims.trim().split(',').collect();
-    let w = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0u32);
-    let h = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0u32);
+    let (w, h) = parse_dims_csv(&dims);
 
     Ok((new_size, w, h))
+}
+
+fn build_gif_vf(max_w: u32, max_h: u32) -> String {
+    format!("scale=min({max_w}\\,iw):min({max_h}\\,ih):force_original_aspect_ratio=decrease")
+}
+
+fn build_ffmpeg_gif_args(src: &str, dest: &str, quality: u32, vf: &str) -> Vec<String> {
+    [
+        "-y", "-i", src, "-vf", vf, "-c:v", "libwebp_anim",
+        "-quality", &quality.to_string(), "-loop", "0", "-an", dest,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+fn parse_dims_csv(text: &str) -> (u32, u32) {
+    let parts: Vec<&str> = text.trim().split(',').collect();
+    let w = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0u32);
+    let h = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0u32);
+    (w, h)
 }
 
 async fn broadcast_progress(tx: &broadcast::Sender<String>, state: &Arc<Mutex<OptimizeState>>) {
@@ -420,4 +435,165 @@ fn broadcast_finished(tx: &broadcast::Sender<String>, s: &OptimizeState) {
         "skipped": s.skipped,
         "failed": s.failed,
     })));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_optimize_recognises_image_extensions() {
+        for name in ["a.png", "b.JPG", "c.jpeg", "d.GIF", "/path/to/e.Png"] {
+            assert!(should_optimize(name), "{name} should optimize");
+        }
+        for name in ["a.webp", "b.mp4", "noext", "c.txt"] {
+            assert!(!should_optimize(name), "{name} should not optimize");
+        }
+    }
+
+    #[test]
+    fn get_preset_known_qualities() {
+        assert_eq!(get_preset("light").unwrap().quality, 82);
+        assert_eq!(get_preset("balanced").unwrap().quality, 88);
+        assert_eq!(get_preset("quality").unwrap().quality, 94);
+        assert!(get_preset("ultra").is_none());
+    }
+
+    #[test]
+    fn presets_quality_matches_get_preset() {
+        let p = presets();
+        for key in ["light", "balanced", "quality"] {
+            assert_eq!(p[key]["quality"], get_preset(key).unwrap().quality);
+        }
+    }
+
+    #[test]
+    fn resolutions_delegates_to_util() {
+        assert_eq!(resolutions(), util::resolutions_json());
+    }
+
+    #[test]
+    fn build_magick_resize_args_includes_resize_and_quality() {
+        let args = build_magick_resize_args("in.png", "out.webp", 88, 2560, 1440);
+        assert_eq!(args[0], "-limit");
+        assert_eq!(args[args.len() - 1], "out.webp");
+        let joined = args.join(" ");
+        assert!(joined.contains("in.png"));
+        assert!(joined.contains("-resize 2560x1440>"));
+        assert!(joined.contains("-quality 88"));
+    }
+
+    #[test]
+    fn parse_identify_dims_reads_space_separated() {
+        assert_eq!(parse_identify_dims("1920 1080"), (1920, 1080));
+        assert_eq!(parse_identify_dims("  640   480  \n"), (640, 480));
+        assert_eq!(parse_identify_dims(""), (0, 0));
+        assert_eq!(parse_identify_dims("oops"), (0, 0));
+    }
+
+    #[test]
+    fn build_gif_vf_and_args() {
+        let vf = build_gif_vf(1280, 720);
+        assert!(vf.contains("min(1280\\,iw)"));
+        let args = build_ffmpeg_gif_args("a.gif", "a.webp", 75, &vf);
+        let joined = args.join(" ");
+        assert!(joined.contains("libwebp_anim"));
+        assert!(joined.contains("-quality 75"));
+        assert!(joined.contains("-loop 0"));
+        assert_eq!(args[args.len() - 1], "a.webp");
+    }
+
+    #[test]
+    fn parse_dims_csv_reads_comma_separated() {
+        assert_eq!(parse_dims_csv("800,600\n"), (800, 600));
+        assert_eq!(parse_dims_csv(""), (0, 0));
+        assert_eq!(parse_dims_csv("100"), (100, 0));
+    }
+
+    // Contract: skwd-wall's ImageOptimizeService.qml reads these exact fields off the
+    // skwd.wall.optimize.progress event (note the camelCase `currentFile`).
+    #[tokio::test]
+    async fn optimize_progress_event_contract() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let state = Arc::new(Mutex::new(OptimizeState::default()));
+        {
+            let mut s = state.lock().await;
+            s.running = true;
+            s.progress = 3;
+            s.total = 10;
+            s.current_file = "pic.png".to_string();
+            s.skipped = 1;
+            s.succeeded = 2;
+        }
+        broadcast_progress(&tx, &state).await;
+        let evt: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(evt["event"], "skwd.wall.optimize.progress");
+        let d = &evt["data"];
+        assert_eq!(d["running"], true);
+        assert_eq!(d["progress"], 3);
+        assert_eq!(d["total"], 10);
+        assert_eq!(d["currentFile"], "pic.png");
+        assert_eq!(d["skipped"], 1);
+        assert_eq!(d["optimized"], 2);
+    }
+
+    // Full optimize flow under mock: fake magick writes the output webp, fake identify returns dims.
+    #[tokio::test]
+    async fn optimize_static_full_flow_with_side_effect_runner() {
+        use crate::util::{FakeRunner, OutSpec};
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.png");
+        std::fs::write(&src, vec![0u8; 4000]).unwrap();
+        let dest = dir.path().join("out.webp");
+
+        let runner = FakeRunner::new();
+        runner.on_creating("magick", &["-resize"], OutSpec::LastArg, &vec![0u8; 1200]);
+        runner.on("magick", &["identify"], b"1280 720", 0);
+
+        let (new_size, w, h) = optimize_static(
+            &runner, src.to_str().unwrap(), dest.to_str().unwrap(), 88, 2560, 1440,
+        )
+        .await
+        .unwrap();
+        assert_eq!(new_size, 1200);
+        assert_eq!((w, h), (1280, 720));
+        assert!(dest.exists());
+    }
+
+    #[tokio::test]
+    async fn optimize_static_bails_on_magick_failure() {
+        use crate::util::FakeRunner;
+        let dir = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new();
+        runner.on("magick", &["-resize"], b"", 1);
+        let res = optimize_static(
+            &runner,
+            dir.path().join("in.png").to_str().unwrap(),
+            dir.path().join("out.webp").to_str().unwrap(),
+            88, 2560, 1440,
+        )
+        .await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn optimize_gif_full_flow_with_side_effect_runner() {
+        use crate::util::{FakeRunner, OutSpec};
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("anim.gif");
+        std::fs::write(&src, vec![0u8; 6000]).unwrap();
+        let dest = dir.path().join("anim.webp");
+
+        let runner = FakeRunner::new();
+        runner.on_creating("ffmpeg", &["libwebp_anim"], OutSpec::LastArg, &vec![0u8; 900]);
+        runner.on("ffprobe", &["csv=p=0"], b"640,480", 0);
+
+        let (new_size, w, h) = optimize_gif(
+            &runner, src.to_str().unwrap(), dest.to_str().unwrap(), 75, 1280, 720,
+        )
+        .await
+        .unwrap();
+        assert_eq!(new_size, 900);
+        assert_eq!((w, h), (640, 480));
+    }
 }

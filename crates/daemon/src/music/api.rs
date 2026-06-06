@@ -32,7 +32,7 @@ impl ApiClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GET {} -> {} {}", url, status, body);
+            anyhow::bail!("GET {url} -> {status} {body}");
         }
         Ok(resp.json::<Value>().await?)
     }
@@ -53,7 +53,7 @@ impl ApiClient {
         }
         if !status.is_success() {
             let s = resp.text().await.unwrap_or_default();
-            anyhow::bail!("PUT {} -> {} {}", url, status, s);
+            anyhow::bail!("PUT {url} -> {status} {s}");
         }
         let text = resp.text().await.unwrap_or_default();
         if text.is_empty() {
@@ -78,7 +78,7 @@ impl ApiClient {
         }
         if !status.is_success() {
             let s = resp.text().await.unwrap_or_default();
-            anyhow::bail!("POST {} -> {} {}", url, status, s);
+            anyhow::bail!("POST {url} -> {status} {s}");
         }
         let text = resp.text().await.unwrap_or_default();
         if text.is_empty() {
@@ -103,7 +103,7 @@ impl ApiClient {
         }
         if !status.is_success() {
             let s = resp.text().await.unwrap_or_default();
-            anyhow::bail!("DELETE {} -> {} {}", url, status, s);
+            anyhow::bail!("DELETE {url} -> {status} {s}");
         }
         let text = resp.text().await.unwrap_or_default();
         if text.is_empty() {
@@ -113,13 +113,13 @@ impl ApiClient {
     }
 
     pub async fn devices(&self) -> Result<Value> {
-        self.get_json(&format!("{}/me/player/devices", BASE)).await
+        self.get_json(&format!("{BASE}/me/player/devices")).await
     }
 
     pub async fn currently_playing(&self) -> Result<Value> {
         let resp = self
             .http
-            .get(format!("{}/me/player/currently-playing", BASE))
+            .get(format!("{BASE}/me/player/currently-playing"))
             .header(AUTHORIZATION, self.auth_header())
             .send()
             .await?;
@@ -129,14 +129,14 @@ impl ApiClient {
         if !resp.status().is_success() {
             let s = resp.status();
             let b = resp.text().await.unwrap_or_default();
-            anyhow::bail!("currently-playing {} {}", s, b);
+            anyhow::bail!("currently-playing {s} {b}");
         }
         Ok(resp.json::<Value>().await.unwrap_or(Value::Null))
     }
 
     pub async fn transfer_playback(&self, device_id: &str, play: bool) -> Result<()> {
         self.put_json(
-            &format!("{}/me/player", BASE),
+            &format!("{BASE}/me/player"),
             serde_json::json!({"device_ids":[device_id], "play": play}),
         )
         .await?;
@@ -148,7 +148,7 @@ impl ApiClient {
         uris: &[String],
         device_id: Option<&str>,
     ) -> Result<()> {
-        let mut url = format!("{}/me/player/play", BASE);
+        let mut url = format!("{BASE}/me/player/play");
         if let Some(d) = device_id {
             url.push_str(&format!("?device_id={}", urlencode(d)));
         }
@@ -162,7 +162,7 @@ impl ApiClient {
         offset_uri: Option<&str>,
         device_id: Option<&str>,
     ) -> Result<()> {
-        let mut url = format!("{}/me/player/play", BASE);
+        let mut url = format!("{BASE}/me/player/play");
         if let Some(d) = device_id {
             url.push_str(&format!("?device_id={}", urlencode(d)));
         }
@@ -176,7 +176,7 @@ impl ApiClient {
     }
 
     pub async fn user_playlists(&self) -> Result<Value> {
-        self.get_json(&format!("{}/me/playlists?limit=50", BASE)).await
+        self.get_json(&format!("{BASE}/me/playlists?limit=50")).await
     }
 
     pub async fn playlist_tracks(&self, playlist_id: &str) -> Result<Value> {
@@ -210,7 +210,7 @@ impl ApiClient {
 
     pub async fn like(&self, ids: &[String]) -> Result<()> {
         self.put_json(
-            &format!("{}/me/tracks", BASE),
+            &format!("{BASE}/me/tracks"),
             serde_json::json!({"ids": ids}),
         )
         .await?;
@@ -219,7 +219,7 @@ impl ApiClient {
 
     pub async fn unlike(&self, ids: &[String]) -> Result<()> {
         self.delete_json(
-            &format!("{}/me/tracks", BASE),
+            &format!("{BASE}/me/tracks"),
             serde_json::json!({"ids": ids}),
         )
         .await?;
@@ -236,43 +236,43 @@ impl ApiClient {
     }
 
     pub async fn liked_songs(&self) -> Result<Value> {
-        self.get_json(&format!("{}/me/tracks?limit=50", BASE)).await
+        self.get_json(&format!("{BASE}/me/tracks?limit=50")).await
     }
 
     pub async fn queue(&self) -> Result<Value> {
-        self.get_json(&format!("{}/me/player/queue", BASE)).await
+        self.get_json(&format!("{BASE}/me/player/queue")).await
     }
 
     pub async fn pause(&self, device_id: Option<&str>) -> Result<()> {
-        let mut url = format!("{}/me/player/pause", BASE);
+        let mut url = format!("{BASE}/me/player/pause");
         if let Some(d) = device_id { url.push_str(&format!("?device_id={}", urlencode(d))); }
         self.put_json(&url, Value::Null).await?;
         Ok(())
     }
 
     pub async fn play_resume(&self, device_id: Option<&str>) -> Result<()> {
-        let mut url = format!("{}/me/player/play", BASE);
+        let mut url = format!("{BASE}/me/player/play");
         if let Some(d) = device_id { url.push_str(&format!("?device_id={}", urlencode(d))); }
         self.put_json(&url, serde_json::json!({})).await?;
         Ok(())
     }
 
     pub async fn skip_next(&self, device_id: Option<&str>) -> Result<()> {
-        let mut url = format!("{}/me/player/next", BASE);
+        let mut url = format!("{BASE}/me/player/next");
         if let Some(d) = device_id { url.push_str(&format!("?device_id={}", urlencode(d))); }
         self.post_json(&url, Value::Null).await?;
         Ok(())
     }
 
     pub async fn skip_previous(&self, device_id: Option<&str>) -> Result<()> {
-        let mut url = format!("{}/me/player/previous", BASE);
+        let mut url = format!("{BASE}/me/player/previous");
         if let Some(d) = device_id { url.push_str(&format!("?device_id={}", urlencode(d))); }
         self.post_json(&url, Value::Null).await?;
         Ok(())
     }
 
     pub async fn set_volume(&self, percent: u8, device_id: Option<&str>) -> Result<()> {
-        let mut url = format!("{}/me/player/volume?volume_percent={}", BASE, percent);
+        let mut url = format!("{BASE}/me/player/volume?volume_percent={percent}");
         if let Some(d) = device_id { url.push_str(&format!("&device_id={}", urlencode(d))); }
         self.put_json(&url, Value::Null).await?;
         Ok(())
@@ -280,11 +280,10 @@ impl ApiClient {
 
     pub async fn artist_top_tracks(&self, artist_id: &str, market: Option<&str>) -> Result<Value> {
         let mut url = format!("{}/artists/{}/top-tracks", BASE, urlencode(artist_id));
-        if let Some(m) = market {
-            if !m.is_empty() {
+        if let Some(m) = market
+            && !m.is_empty() {
                 url.push_str(&format!("?market={}", urlencode(m)));
             }
-        }
         self.get_json(&url).await
     }
 }
@@ -296,7 +295,7 @@ fn urlencode(s: &str) -> String {
             out.push(ch);
         } else {
             for b in ch.to_string().as_bytes() {
-                out.push_str(&format!("%{:02X}", b));
+                out.push_str(&format!("%{b:02X}"));
             }
         }
     }

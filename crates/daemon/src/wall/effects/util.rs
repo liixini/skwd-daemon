@@ -13,9 +13,7 @@ pub fn output_path(input: &Path, suffix: &str, override_ext: Option<&str>) -> an
         .ok_or_else(|| anyhow::anyhow!("input has no stem: {}", input.display()))?
         .to_string_lossy()
         .into_owned();
-    let ext = override_ext
-        .map(str::to_owned)
-        .unwrap_or_else(|| input.extension().and_then(|e| e.to_str()).unwrap_or("jpg").to_owned());
+    let ext = override_ext.map_or_else(|| input.extension().and_then(|e| e.to_str()).unwrap_or("jpg").to_owned(), str::to_owned);
     Ok(effects_dir.join(format!("{stem}-{suffix}.{ext}")))
 }
 
@@ -55,4 +53,34 @@ pub async fn simple_effect(
 
 pub fn os(s: impl AsRef<str>) -> OsString {
     OsString::from(s.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_path_places_file_in_effects_dir() {
+        let out = output_path(Path::new("/photos/wall.png"), "blur", None).unwrap();
+        assert_eq!(out, PathBuf::from("/photos/effects/wall-blur.png"));
+    }
+
+    #[test]
+    fn output_path_honors_ext_override_and_default() {
+        let out = output_path(Path::new("/photos/wall.png"), "tint", Some("webp")).unwrap();
+        assert_eq!(out, PathBuf::from("/photos/effects/wall-tint.webp"));
+
+        let out = output_path(Path::new("/photos/noext"), "x", None).unwrap();
+        assert_eq!(out, PathBuf::from("/photos/effects/noext-x.jpg"));
+    }
+
+    #[test]
+    fn output_path_errors_without_parent() {
+        assert!(output_path(Path::new("/"), "x", None).is_err());
+    }
+
+    #[test]
+    fn os_wraps_str_into_osstring() {
+        assert_eq!(os("hello"), OsString::from("hello"));
+    }
 }

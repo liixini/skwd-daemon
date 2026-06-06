@@ -1,3 +1,5 @@
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+
 use skwd_proto::{Request, Response};
 use tokio::sync::broadcast;
 use tracing::warn;
@@ -11,9 +13,8 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
         "refresh_overview_backdrop" => {
             let config = state.config.read().await.clone();
 
-            let source = match super::overview_backdrop::resolve_source(&config).await {
-                Some(p) => p,
-                None => return Response::err(req.id, 1, "no recent wallpaper recorded"),
+            let Some(source) = super::overview_backdrop::resolve_source(&config).await else {
+                return Response::err(req.id, 1, "no recent wallpaper recorded");
             };
 
             let source_for_resp = source.clone();
@@ -21,7 +22,7 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                 super::overview_backdrop::refresh(&source, &config).await;
             });
 
-            return Response::ok(req.id, serde_json::json!({"started": true, "source": source_for_resp}));
+            Response::ok(req.id, serde_json::json!({"started": true, "source": source_for_resp}))
         }
 
         "toggle" => {
@@ -224,7 +225,7 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             let color_index = req
                 .params
                 .get("color_index")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .map(|n| (n as u32).min(3));
             tracing::info!(?scheme, ?mode, ?color_index, "wall.retheme received");
             let config = state.config.read().await.clone();
@@ -232,6 +233,34 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                 Ok(()) => Response::ok(req.id, serde_json::json!({"rethemed": true})),
                 Err(e) => {
                     tracing::warn!(error = %e, "wall.retheme failed");
+                    Response::err(req.id, 6, format!("{e}"))
+                }
+            }
+        }
+
+        "full_palette" | "theme_full_palette" => {
+            let config_guard = state.config.read().await.clone();
+            let scheme = req
+                .params
+                .get("scheme")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| config_guard.matugen_scheme())
+                .to_string();
+            let mode = req
+                .params
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| config_guard.matugen_mode())
+                .to_string();
+            let color_index = req
+                .params
+                .get("color_index")
+                .and_then(serde_json::Value::as_u64).map_or_else(|| config_guard.matugen_color_index(), |n| (n as u32).min(3));
+            tracing::info!(scheme, mode, color_index, "theme.full_palette");
+            match apply::theme_full_palette(&*state.runner, &config_guard, &scheme, &mode, color_index).await {
+                Ok(palette) => Response::ok(req.id, palette),
+                Err(e) => {
+                    tracing::warn!(error = %e, "theme.full_palette failed");
                     Response::err(req.id, 6, format!("{e}"))
                 }
             }
@@ -253,9 +282,8 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             let color_index = req
                 .params
                 .get("color_index")
-                .and_then(|v| v.as_u64())
-                .map(|n| (n as u32).min(3))
-                .unwrap_or(0);
+                .and_then(serde_json::Value::as_u64)
+                .map_or(0, |n| (n as u32).min(3));
             let config = state.config.read().await.clone();
             tracing::info!(scheme, mode, color_index, "theme_preview");
             match apply::theme_preview(&config, &scheme, &mode, color_index).await {
@@ -273,9 +301,10 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             let optimize_state = state.optimize_state.clone();
             let db = state.db_shared.clone();
             let tx = event_tx.clone();
+            let runner = state.runner.clone();
             tokio::spawn(async move {
                 cache::rebuild(&config, db.clone(), cache_state, tx.clone()).await;
-                crate::server::auto_optimize_if_enabled(&config, db, tx, optimize_state).await;
+                crate::server::auto_optimize_if_enabled(runner, &config, db, tx, optimize_state).await;
             });
             Response::ok(req.id, serde_json::json!({"started": true}))
         }
@@ -295,9 +324,10 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             let optimize_state = state.optimize_state.clone();
             let db = state.db_shared.clone();
             let tx = event_tx.clone();
+            let runner = state.runner.clone();
             tokio::spawn(async move {
                 cache::nuke_and_rebuild(&config, db.clone(), cache_state, tx.clone()).await;
-                crate::server::auto_optimize_if_enabled(&config, db, tx, optimize_state).await;
+                crate::server::auto_optimize_if_enabled(runner, &config, db, tx, optimize_state).await;
             });
             Response::ok(req.id, serde_json::json!({"started": true}))
         }
@@ -312,6 +342,17 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                     "total": cs.total,
                 }),
             )
+        }
+
+        "list_cached" => {
+            let favourite_only = req.params.get("favourite_only")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let db = state.db.lock().await;
+            match crate::db::list_wallpapers(&db, favourite_only) {
+                Ok(items) => Response::ok(req.id, serde_json::json!({"items": items})),
+                Err(e) => Response::err(req.id, 2, format!("db error: {e}")),
+            }
         }
 
         "set_favourite" => {
@@ -353,9 +394,9 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             if key.is_empty() {
                 return Response::err(req.id, 1, "missing 'key' parameter");
             }
-            let filesize = req.params.get("filesize").and_then(|v| v.as_i64()).unwrap_or(0);
-            let width = req.params.get("width").and_then(|v| v.as_i64()).unwrap_or(0);
-            let height = req.params.get("height").and_then(|v| v.as_i64()).unwrap_or(0);
+            let filesize = req.params.get("filesize").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let width = req.params.get("width").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let height = req.params.get("height").and_then(serde_json::Value::as_i64).unwrap_or(0);
 
             let db = state.db.lock().await;
             match crate::db::update_meta_dimensions(&db, key, filesize, width, height) {
@@ -418,11 +459,11 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
         }
 
         "set_audio" => {
-            let mute = req.params.get("mute").and_then(|v| v.as_bool());
+            let mute = req.params.get("mute").and_then(serde_json::Value::as_bool);
             let volume = req
                 .params
                 .get("volume")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .map(|v| v.min(100) as u32);
             let outputs: Option<Vec<String>> = req
                 .params
@@ -435,6 +476,49 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                 });
             let cfg = state.config.read().await.clone();
             apply::set_audio_for(&cfg, mute, volume, outputs).await;
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+
+
+        "we_properties" => {
+            let we_id = req.str_param("we_id", "");
+            if we_id.is_empty() {
+                return Response::err(req.id, 1, "missing 'we_id' parameter");
+            }
+            let cfg = state.config.read().await.clone();
+            let res = apply::we_properties_for(&cfg, we_id).await;
+            Response::ok(req.id, res)
+        }
+
+        "set_we_screen_overrides" => {
+            let outputs: Option<Vec<String>> = req
+                .params
+                .get("outputs")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|s| s.as_str().map(String::from))
+                        .collect()
+                });
+            let scaling = req.params.get("scaling").and_then(|v| v.as_str()).map(String::from);
+            let clamp = req.params.get("clamp").and_then(|v| v.as_str()).map(String::from);
+            let cfg = state.config.read().await.clone();
+            apply::set_we_screen_overrides(&cfg, outputs, scaling, clamp).await;
+            Response::ok(req.id, serde_json::json!({"ok": true}))
+        }
+
+        "set_we_props" => {
+            let we_id = req.str_param("we_id", "");
+            if we_id.is_empty() {
+                return Response::err(req.id, 1, "missing 'we_id' parameter");
+            }
+            let values = req
+                .params
+                .get("values")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let cfg = state.config.read().await.clone();
+            apply::set_we_props(&cfg, we_id, values).await;
             Response::ok(req.id, serde_json::json!({"ok": true}))
         }
 
@@ -471,7 +555,7 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
         }
 
         "random_start" => {
-            let interval_secs = req.params.get("interval").and_then(|v| v.as_u64()).unwrap_or(300);
+            let interval_secs = req.params.get("interval").and_then(serde_json::Value::as_u64).unwrap_or(300);
             if interval_secs == 0 {
                 return Response::err(req.id, 1, "interval must be > 0");
             }
@@ -479,15 +563,13 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             let types: Vec<String> = req
                 .params
                 .get("types")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
+                .and_then(|v| v.as_array()).map_or_else(|| vec!["static".into(), "video".into(), "we".into()], |arr| {
                     arr.iter()
                         .filter_map(|v| v.as_str())
                         .filter(|s| matches!(*s, "static" | "video" | "we"))
                         .map(str::to_string)
                         .collect()
-                })
-                .unwrap_or_else(|| vec!["static".into(), "video".into(), "we".into()]);
+                });
             let favourites_only = req.bool_param("favourites_only", false);
             if types.is_empty() {
                 return Response::err(req.id, 1, "types must contain at least one of static|video|we");
@@ -621,5 +703,191 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
         }
 
         _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::server::test_state;
+
+    fn insert(h: &crate::server::TestHarness, key: &str, name: &str) {
+        let db = h.state.db.try_lock().unwrap();
+        crate::db::upsert_cache_entry(&db, key, "static", name, "t", "ts", "", "", 1, 0, 0, 0).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_status_reports_idle() {
+        let h = test_state();
+        let r = h.dispatch("wall.cache_status", serde_json::json!({})).await.result.unwrap();
+        assert_eq!(r["running"], false);
+        assert_eq!(r["progress"], 0);
+        assert_eq!(r["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn list_cached_reflects_db_and_favourite_filter() {
+        let h = test_state();
+        assert_eq!(
+            h.dispatch("wall.list_cached", serde_json::json!({})).await.result.unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        insert(&h, "static:a", "a");
+        let items = h.dispatch("wall.list_cached", serde_json::json!({})).await.result.unwrap();
+        assert_eq!(items["items"].as_array().unwrap().len(), 1);
+        let fav = h
+            .dispatch("wall.list_cached", serde_json::json!({ "favourite_only": true }))
+            .await
+            .result
+            .unwrap();
+        assert_eq!(fav["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn set_favourite_success_and_errors() {
+        let h = test_state();
+        insert(&h, "static:f", "f");
+        let ok = h
+            .dispatch("wall.set_favourite", serde_json::json!({ "key": "static:f", "favourite": true }))
+            .await;
+        assert!(ok.error.is_none());
+        assert_eq!(ok.result.unwrap()["favourite"], true);
+
+        let missing = h.dispatch("wall.set_favourite", serde_json::json!({})).await;
+        assert_eq!(missing.error.unwrap().code, 1);
+
+        let notfound = h
+            .dispatch("wall.set_favourite", serde_json::json!({ "key": "static:nope" }))
+            .await;
+        assert_eq!(notfound.error.unwrap().code, 6);
+    }
+
+    #[tokio::test]
+    async fn update_analysis_writes_and_validates_key() {
+        let h = test_state();
+        insert(&h, "static:a", "a");
+        let ok = h
+            .dispatch(
+                "wall.update_analysis",
+                serde_json::json!({ "key": "static:a", "tags": "x,y", "hue": 120 }),
+            )
+            .await;
+        assert_eq!(ok.result.unwrap()["updated"], "static:a");
+
+        let rows = h.dispatch("wall.list", serde_json::json!({})).await.result.unwrap();
+        assert_eq!(rows["wallpapers"][0]["tags"], "x,y");
+        assert_eq!(rows["wallpapers"][0]["hue"], 120);
+
+        assert_eq!(
+            h.dispatch("wall.update_analysis", serde_json::json!({})).await.error.unwrap().code,
+            1
+        );
+        assert_eq!(
+            h.dispatch("wall.update_analysis", serde_json::json!({ "key": "nope" }))
+                .await
+                .error
+                .unwrap()
+                .code,
+            6
+        );
+    }
+
+    #[tokio::test]
+    async fn update_metadata_sets_dimensions() {
+        let h = test_state();
+        insert(&h, "static:a", "a");
+        let ok = h
+            .dispatch(
+                "wall.update_metadata",
+                serde_json::json!({ "key": "static:a", "filesize": 4096, "width": 1920, "height": 1080 }),
+            )
+            .await;
+        assert!(ok.error.is_none());
+        let rows = h.dispatch("wall.list", serde_json::json!({})).await.result.unwrap();
+        assert_eq!(rows["wallpapers"][0]["width"], 1920);
+        assert_eq!(
+            h.dispatch("wall.update_metadata", serde_json::json!({})).await.error.unwrap().code,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn suppress_and_unsuppress_mutate_set() {
+        let h = test_state();
+        h.dispatch("wall.suppress", serde_json::json!({ "name": "wall.png" })).await;
+        assert!(h.state.suppress_set.lock().unwrap().contains("wall.png"));
+        h.dispatch("wall.unsuppress", serde_json::json!({ "name": "wall.png" })).await;
+        assert!(!h.state.suppress_set.lock().unwrap().contains("wall.png"));
+    }
+
+    #[tokio::test]
+    async fn random_status_idle() {
+        let h = test_state();
+        assert_eq!(
+            h.dispatch("wall.random_status", serde_json::json!({})).await.result.unwrap()["running"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn outputs_reads_empty_cache_dir() {
+        let h = test_state();
+        let dir = tempfile::tempdir().unwrap();
+        h.state.config.write().await.paths.cache = Some(dir.path().to_string_lossy().to_string());
+        assert_eq!(
+            h.dispatch("wall.outputs", serde_json::json!({})).await.result.unwrap()["outputs"],
+            serde_json::json!({})
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_wall_method_errors() {
+        let h = test_state();
+        let e = h.dispatch("wall.bogus", serde_json::json!({})).await.error.unwrap();
+        assert_eq!(e.code, -32601);
+    }
+
+    // Contract: skwd-wall's WallpaperSelectorService.qml reads these exact fields off each
+    // wall.list item. A rename/drop here silently breaks the wallpaper grid.
+    #[tokio::test]
+    async fn wall_list_item_contract_matches_frontend() {
+        let h = test_state();
+        {
+            let db = h.state.db.try_lock().unwrap();
+            crate::db::upsert_cache_entry(
+                &db, "static:cat", "static", "cat", "/t.webp", "/sm.webp", "v.mp4", "we42", 12345, 200, 80, 5,
+            )
+            .unwrap();
+            crate::db::set_favourite(&db, "static:cat", true).unwrap();
+            crate::db::update_analysis(
+                &db, "static:cat", Some("a,b"), Some("#fff"), Some("ollama"), Some(200), Some(80), Some("sunny"),
+            )
+            .unwrap();
+            crate::db::bump_apply_count(&db, "static:cat").unwrap();
+            crate::db::update_meta_dimensions(&db, "static:cat", 9000, 1920, 1080).unwrap();
+        }
+        let r = h.dispatch("wall.list", serde_json::json!({})).await.result.unwrap();
+        assert_eq!(r["count"], 1);
+        let item = &r["wallpapers"][0];
+        assert_eq!(item["key"], "static:cat");
+        assert_eq!(item["name"], "cat");
+        assert_eq!(item["type"], "static");
+        assert_eq!(item["thumb"], "/t.webp");
+        assert_eq!(item["thumb_sm"], "/sm.webp");
+        assert_eq!(item["favourite"], 1);
+        assert_eq!(item["hue"], 200);
+        assert_eq!(item["sat"], 80);
+        assert_eq!(item["tags"], "a,b");
+        assert_eq!(item["colors"], "#fff");
+        assert_eq!(item["video_file"], "v.mp4");
+        assert_eq!(item["we_id"], "we42");
+        assert_eq!(item["mtime"], 12345);
+        assert_eq!(item["richness"], 5);
+        assert_eq!(item["apply_count"], 1);
+        assert_eq!(item["width"], 1920);
+        assert_eq!(item["height"], 1080);
+        assert_eq!(item["weather"], "sunny");
     }
 }

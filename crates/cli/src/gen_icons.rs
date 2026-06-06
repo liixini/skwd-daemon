@@ -29,13 +29,10 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
 
-    let font_path = match font_path.or_else(find_mdi_font) {
-        Some(p) => p,
-        None => {
-            eprintln!("could not find MaterialDesignIconsDesktop.ttf");
-            eprintln!("install ttf-material-design-icons-desktop or pass --font PATH");
-            return 1;
-        }
+    let Some(font_path) = font_path.or_else(find_mdi_font) else {
+        eprintln!("could not find MaterialDesignIconsDesktop.ttf");
+        eprintln!("install ttf-material-design-icons-desktop or pass --font PATH");
+        return 1;
     };
 
     let output_path = output_path.unwrap_or_else(default_output_path);
@@ -56,12 +53,9 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
 
-    let names = match read_post2_names(&data) {
-        Some(n) => n,
-        None => {
-            eprintln!("font has no post 2.0 table with glyph names");
-            return 1;
-        }
+    let Some(names) = read_post2_names(&data) else {
+        eprintln!("font has no post 2.0 table with glyph names");
+        return 1;
     };
 
     let mut entries: Vec<serde_json::Value> = Vec::new();
@@ -76,12 +70,11 @@ pub fn run(args: &[String]) -> i32 {
         entries.push(serde_json::json!({ "n": display, "g": ch.to_string() }));
     }
 
-    if let Some(parent) = output_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
+    if let Some(parent) = output_path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent) {
             eprintln!("create_dir_all {}: {e}", parent.display());
             return 1;
         }
-    }
 
     let serialized = match serde_json::to_string(&entries) {
         Ok(s) => s,
@@ -161,9 +154,7 @@ fn read_post2_names(data: &[u8]) -> Option<Vec<String>> {
     for (gid, idx) in indices.iter().enumerate() {
         let idx = *idx as usize;
         let name = if idx < 258 {
-            mac_standard_name(idx)
-                .map(String::from)
-                .unwrap_or_else(|| format!("glyph{gid}"))
+            mac_standard_name(idx).map_or_else(|| format!("glyph{gid}"), String::from)
         } else {
             let s_idx = idx - 258;
             strings
@@ -208,14 +199,42 @@ fn find_mdi_font() -> Option<PathBuf> {
 }
 
 fn default_output_path() -> PathBuf {
-    let config_dir = std::env::var_os("SKWD_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
+    let config_dir = std::env::var_os("SKWD_CONFIG").map_or_else(|| {
             let base = std::env::var_os("XDG_CONFIG_HOME")
                 .map(PathBuf::from)
                 .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
                 .unwrap_or_else(|| PathBuf::from("."));
             base.join("skwd")
-        });
+        }, PathBuf::from);
     config_dir.join("data/mdi-icons.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_post2_names_rejects_truncated_data() {
+        assert!(read_post2_names(&[]).is_none());
+        assert!(read_post2_names(&[0u8; 4]).is_none());
+        assert!(read_post2_names(&[0u8; 11]).is_none());
+    }
+
+    #[test]
+    fn read_post2_names_rejects_missing_post_table() {
+        let mut data = vec![0u8; 12];
+        data[4] = 0;
+        data[5] = 1;
+        assert!(read_post2_names(&data).is_none());
+    }
+
+    #[test]
+    fn default_output_path_ends_with_expected_file() {
+        assert!(default_output_path().ends_with("data/mdi-icons.json"));
+    }
+
+    #[test]
+    fn glyph_display_name_replaces_separators() {
+        assert_eq!("account_circle-outline".replace(['_', '-'], " "), "account circle outline");
+    }
 }

@@ -19,7 +19,7 @@ pub async fn dispatch(req: &Request, _event_tx: &broadcast::Sender<String>, stat
             };
             let input = PathBuf::from(input_str);
             let effect = req.params.get("effect").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let params = req.params.get("params").cloned().unwrap_or(json!({}));
+            let params = req.params.get("params").cloned().unwrap_or_else(|| json!({}));
 
             let cache_dir = state.config.read().await.cache_dir();
             let suffix = native::suffix(&effect, &params);
@@ -47,7 +47,7 @@ pub async fn dispatch(req: &Request, _event_tx: &broadcast::Sender<String>, stat
             let preview = PathBuf::from(preview_str);
             let input = PathBuf::from(input_str);
             let effect = req.params.get("effect").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let params = req.params.get("params").cloned().unwrap_or(json!({}));
+            let params = req.params.get("params").cloned().unwrap_or_else(|| json!({}));
 
             let suffix = native::suffix(&effect, &params);
             let final_path = match native::library_path(&input, &suffix) {
@@ -93,4 +93,30 @@ async fn commit_preview(preview: &Path, final_path: &Path) -> anyhow::Result<()>
     tokio::fs::rename(&staging, final_path).await?;
     let _ = tokio::fs::remove_file(preview).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::server::test_state;
+
+    #[tokio::test]
+    async fn effects_list_and_param_validation() {
+        let h = test_state();
+        let r = h.dispatch("effects.list", serde_json::json!({})).await.result.unwrap();
+        assert!(r["effects"].as_array().unwrap().len() >= 10);
+        assert_eq!(
+            h.dispatch("effects.preview", serde_json::json!({})).await.error.unwrap().code,
+            -32602
+        );
+        assert_eq!(
+            h.dispatch("effects.commit", serde_json::json!({})).await.error.unwrap().code,
+            -32602
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_effects_method_errors() {
+        let h = test_state();
+        assert!(h.dispatch("effects.bogus", serde_json::json!({})).await.error.is_some());
+    }
 }

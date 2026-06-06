@@ -29,7 +29,7 @@ fn device_id_for(name: &str) -> String {
     let digest = Sha256::digest(name.as_bytes());
     let hex = digest
         .iter()
-        .map(|b| format!("{:02x}", b))
+        .map(|b| format!("{b:02x}"))
         .collect::<String>();
     hex[..40].to_string()
 }

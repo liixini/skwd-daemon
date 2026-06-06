@@ -1,3 +1,6 @@
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+#![allow(clippy::needless_range_loop, clippy::needless_pass_by_value)]
+
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -238,18 +241,18 @@ fn apply_invert(mut img: DynamicImage) -> DynamicImage {
 }
 
 fn apply_brightness(img: DynamicImage, params: &Value) -> DynamicImage {
-    let factor = params.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.1) as f32;
+    let factor = params.get("factor").and_then(serde_json::Value::as_f64).unwrap_or(1.1) as f32;
     let mut rgba = img.into_rgba8();
     for px in rgba.pixels_mut() {
         for i in 0..3 {
-            px[i] = (px[i] as f32 * factor).clamp(0.0, 255.0) as u8;
+            px[i] = (f32::from(px[i]) * factor).clamp(0.0, 255.0) as u8;
         }
     }
     DynamicImage::ImageRgba8(rgba)
 }
 
 fn apply_gamma(img: DynamicImage, params: &Value) -> DynamicImage {
-    let gamma = params.get("gamma").and_then(|v| v.as_f64()).unwrap_or(1.0).max(0.001) as f32;
+    let gamma = params.get("gamma").and_then(serde_json::Value::as_f64).unwrap_or(1.0).max(0.001) as f32;
     let inv = 1.0 / gamma;
     let mut lut = [0u8; 256];
     for v in 0..256 {
@@ -267,7 +270,7 @@ fn apply_gamma(img: DynamicImage, params: &Value) -> DynamicImage {
 
 fn apply_contrast(img: DynamicImage, params: &Value) -> DynamicImage {
     let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("normal");
-    let factor = params.get("factor").and_then(|v| v.as_f64()).unwrap_or(25.0) as f32;
+    let factor = params.get("factor").and_then(serde_json::Value::as_f64).unwrap_or(25.0) as f32;
     let mut lut = [0u8; 256];
 
     if mode == "sigmoid" {
@@ -301,13 +304,13 @@ fn apply_contrast(img: DynamicImage, params: &Value) -> DynamicImage {
 }
 
 fn apply_saturation(img: DynamicImage, params: &Value) -> DynamicImage {
-    let pct = params.get("percentage").and_then(|v| v.as_i64()).unwrap_or(25) as f32;
+    let pct = params.get("percentage").and_then(serde_json::Value::as_i64).unwrap_or(25) as f32;
     let factor = 1.0 + pct / 100.0;
     let mut rgba = img.into_rgba8();
     for px in rgba.pixels_mut() {
-        let r = px[0] as f32;
-        let g = px[1] as f32;
-        let b = px[2] as f32;
+        let r = f32::from(px[0]);
+        let g = f32::from(px[1]);
+        let b = f32::from(px[2]);
         let luma = 0.299 * r + 0.587 * g + 0.114 * b;
         px[0] = (luma + (r - luma) * factor).clamp(0.0, 255.0) as u8;
         px[1] = (luma + (g - luma) * factor).clamp(0.0, 255.0) as u8;
@@ -319,7 +322,7 @@ fn apply_saturation(img: DynamicImage, params: &Value) -> DynamicImage {
 fn apply_pixelate(img: DynamicImage, params: &Value) -> DynamicImage {
     let scale = params
         .get("scale")
-        .and_then(|v| v.as_i64())
+        .and_then(serde_json::Value::as_i64)
         .unwrap_or(15)
         .max(2) as u32;
     let (w, h) = (img.width(), img.height());
@@ -345,12 +348,12 @@ fn apply_border(img: DynamicImage, params: &Value) -> DynamicImage {
     let color = params.get("color").and_then(|v| v.as_str()).unwrap_or("#1a1a1a");
     let thickness = params
         .get("thickness")
-        .and_then(|v| v.as_i64())
+        .and_then(serde_json::Value::as_i64)
         .unwrap_or(30)
         .max(0) as u32;
     let radius = params
         .get("radius")
-        .and_then(|v| v.as_i64())
+        .and_then(serde_json::Value::as_i64)
         .unwrap_or(0)
         .max(0) as u32;
 
@@ -361,7 +364,7 @@ fn apply_border(img: DynamicImage, params: &Value) -> DynamicImage {
 
     let rgba = img.into_rgba8();
     let mut out = RgbaImage::from_pixel(new_w, new_h, Rgba([r, g, b, 255]));
-    image::imageops::overlay(&mut out, &rgba, thickness as i64, thickness as i64);
+    image::imageops::overlay(&mut out, &rgba, i64::from(thickness), i64::from(thickness));
 
     if radius > 0 {
         apply_corner_mask(&mut out, radius);
@@ -373,7 +376,7 @@ fn apply_border(img: DynamicImage, params: &Value) -> DynamicImage {
 fn apply_round(img: DynamicImage, params: &Value) -> DynamicImage {
     let radius = params
         .get("radius")
-        .and_then(|v| v.as_i64())
+        .and_then(serde_json::Value::as_i64)
         .unwrap_or(60)
         .max(1) as u32;
     let mut rgba = img.into_rgba8();
@@ -412,7 +415,7 @@ fn apply_corner_mask(img: &mut RgbaImage, radius: u32) {
                 };
                 if alpha < 1.0 {
                     let p = img.get_pixel_mut(px, py);
-                    p[3] = (p[3] as f32 * alpha) as u8;
+                    p[3] = (f32::from(p[3]) * alpha) as u8;
                 }
             }
         }
@@ -456,7 +459,7 @@ fn build_palette_lut(palette: &[(u8, u8, u8)], sigma: f32) -> Vec<[u8; 3]> {
     let two_sigma_sq = 2.0 * sigma * sigma;
     let palette: Vec<(f32, f32, f32)> = palette
         .iter()
-        .map(|&(r, g, b)| (r as f32, g as f32, b as f32))
+        .map(|&(r, g, b)| (f32::from(r), f32::from(g), f32::from(b)))
         .collect();
 
     (0..N * N * N)
@@ -479,10 +482,10 @@ fn build_palette_lut(palette: &[(u8, u8, u8)], sigma: f32) -> Vec<[u8; 3]> {
                 let dg = tg - pg;
                 let db = tb - pb;
                 let d2 = dr * dr + dg * dg + db * db;
-                let w = (-d2 / two_sigma_sq).exp() as f64;
-                num_r += pr as f64 * w;
-                num_g += pg as f64 * w;
-                num_b += pb as f64 * w;
+                let w = f64::from((-d2 / two_sigma_sq).exp());
+                num_r += f64::from(pr) * w;
+                num_g += f64::from(pg) * w;
+                num_b += f64::from(pb) * w;
                 den += w;
             }
 
@@ -494,4 +497,61 @@ fn build_palette_lut(palette: &[(u8, u8, u8)], sigma: f32) -> Vec<[u8; 3]> {
             ]
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn suffix_themes_and_passthrough() {
+        assert_eq!(suffix("theme", &json!({ "theme": "Tokyo Night" })), "theme-tokyo-night");
+        assert_eq!(suffix("theme", &json!({})), "theme-catppuccin");
+        assert_eq!(suffix("invert", &json!({})), "invert");
+        assert_eq!(suffix("pixelate", &json!({ "n": 8 })), "pixelate");
+    }
+
+    #[test]
+    fn library_path_places_in_effects_dir() {
+        let p = library_path(Path::new("/wall/pic.png"), "invert").unwrap();
+        assert_eq!(p, PathBuf::from("/wall/effects/pic-invert.png"));
+        let p2 = library_path(Path::new("/wall/noext"), "flip").unwrap();
+        assert_eq!(p2, PathBuf::from("/wall/effects/noext-flip.png"));
+        assert!(library_path(Path::new("/"), "x").is_err());
+    }
+
+    #[test]
+    fn preview_path_uses_cache_preview_dir() {
+        let p = preview_path(Path::new("/c"), Path::new("/wall/pic.jpg"), "grayscale").unwrap();
+        let s = p.to_string_lossy();
+        assert!(s.ends_with("-pic-grayscale.jpg"), "{s}");
+        assert!(s.contains("/c/"), "{s}");
+        assert!(preview_path(Path::new("/c"), Path::new("/"), "x").is_err());
+    }
+
+    // Contract: skwd-wall's EffectsPanel.qml reads id/label/description/params off each
+    // effects.list item, and id/label/type off each param.
+    #[test]
+    fn list_item_and_param_contract() {
+        let v = list();
+        let arr = v.as_array().unwrap();
+        assert!(arr.len() >= 10);
+        let names: Vec<&str> = arr.iter().filter_map(|e| e.get("id").and_then(|i| i.as_str())).collect();
+        assert!(names.contains(&"invert"));
+        assert!(names.contains(&"grayscale"));
+
+        let invert = arr.iter().find(|e| e["id"] == "invert").unwrap();
+        assert!(invert["label"].is_string());
+        assert!(invert["description"].is_string());
+        assert!(invert["params"].is_array());
+
+        for effect in arr {
+            for p in effect["params"].as_array().unwrap() {
+                assert!(p["id"].is_string(), "param missing id in {}", effect["id"]);
+                assert!(p["label"].is_string(), "param missing label in {}", effect["id"]);
+                assert!(p["type"].is_string(), "param missing type in {}", effect["id"]);
+            }
+        }
+    }
 }

@@ -194,7 +194,7 @@ async fn forward_player_events(
                 "data": { "position_ms": position_ms }
             })),
             PlayerEvent::VolumeChanged { volume } => {
-                mpris_state.lock().await.volume = (volume as f64) / 65535.0;
+                mpris_state.lock().await.volume = f64::from(volume) / 65535.0;
                 Some(serde_json::json!({
                     "event": "skwd.music.volume",
                     "data": { "volume": volume }

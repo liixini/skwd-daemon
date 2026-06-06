@@ -56,6 +56,115 @@ pub struct Config {
     pub display: DisplayConfig,
     #[serde(default)]
     pub paper: PaperConfig,
+    #[serde(default)]
+    pub we_render: WeRenderConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum WeScaling {
+    Default,
+    #[serde(alias = "fill")]
+    #[default]
+    Fill,
+    Fit,
+    Stretch,
+}
+
+
+impl WeScaling {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            WeScaling::Default => "default",
+            WeScaling::Fill => "fill",
+            WeScaling::Fit => "fit",
+            WeScaling::Stretch => "stretch",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "default" => Some(WeScaling::Default),
+            "fill" => Some(WeScaling::Fill),
+            "fit" => Some(WeScaling::Fit),
+            "stretch" => Some(WeScaling::Stretch),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum WeClamp {
+    #[default]
+    Border,
+    Repeat,
+    Mirror,
+}
+
+
+impl WeClamp {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            WeClamp::Border => "border",
+            WeClamp::Repeat => "repeat",
+            WeClamp::Mirror => "mirror",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "border" => Some(WeClamp::Border),
+            "repeat" => Some(WeClamp::Repeat),
+            "mirror" => Some(WeClamp::Mirror),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WeRenderConfig {
+    #[serde(default = "default_we_fps")]
+    pub fps: u32,
+    #[serde(default = "default_true", rename = "noFullscreenPause")]
+    pub no_fullscreen_pause: bool,
+    #[serde(default, rename = "fullscreenPauseOnlyActive")]
+    pub fullscreen_pause_only_active: bool,
+    #[serde(default = "default_true")]
+    pub noautomute: bool,
+    #[serde(default, rename = "noAudioProcessing")]
+    pub no_audio_processing: bool,
+    #[serde(default, rename = "disableParticles")]
+    pub disable_particles: bool,
+    #[serde(default, rename = "disableMouse")]
+    pub disable_mouse: bool,
+    #[serde(default, rename = "disableParallax")]
+    pub disable_parallax: bool,
+    #[serde(default)]
+    pub scaling: WeScaling,
+    #[serde(default)]
+    pub clamp: WeClamp,
+}
+
+impl Default for WeRenderConfig {
+    fn default() -> Self {
+        Self {
+            fps: default_we_fps(),
+            no_fullscreen_pause: true,
+            fullscreen_pause_only_active: false,
+            noautomute: true,
+            no_audio_processing: false,
+            disable_particles: false,
+            disable_mouse: false,
+            disable_parallax: false,
+            scaling: WeScaling::default(),
+            clamp: WeClamp::default(),
+        }
+    }
+}
+
+fn default_we_fps() -> u32 {
+    30
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
@@ -300,6 +409,18 @@ pub struct MatugenConfig {
     pub mode: Option<String>,
     #[serde(default, rename = "colorIndex")]
     pub color_index: Option<u32>,
+    #[serde(default)]
+    pub contrast: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SteamBackend {
+    #[default]
+    #[serde(alias = "steam", alias = "steamworks", alias = "steam-client")]
+    Steam,
+    #[serde(alias = "steamcmd", alias = "depot-downloader", alias = "depotdownloader")]
+    Steamcmd,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -309,6 +430,15 @@ pub struct SteamConfig {
     pub username: String,
     #[serde(default, rename = "apiKey")]
     pub api_key: String,
+    #[serde(default)]
+    pub backend: SteamBackend,
+}
+
+impl SteamConfig {
+    #[must_use]
+    pub fn uses_steam_client(&self) -> bool {
+        self.backend == SteamBackend::Steam
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -432,7 +562,12 @@ impl Config {
     }
 
     pub fn we_assets_dir(&self) -> Option<PathBuf> {
-        resolve_path(self.paths.steam_we_assets.as_deref())
+        if let Some(p) = resolve_path(self.paths.steam_we_assets.as_deref()) {
+            return Some(p);
+        }
+        let steam = resolve_path(self.paths.steam.as_deref()).unwrap_or_else(|| home().join(".local/share/Steam"));
+        let default = steam.join("steamapps/common/wallpaper_engine/assets");
+        default.exists().then_some(default)
     }
 
     pub fn template_dir(&self) -> PathBuf {
@@ -448,8 +583,7 @@ impl Config {
             || self
                 .external_wallpaper_command
                 .as_deref()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false)
+                .is_some_and(|s| !s.is_empty())
     }
 
     pub fn matugen_scheme(&self) -> &str {
@@ -462,6 +596,13 @@ impl Config {
 
     pub fn matugen_color_index(&self) -> u32 {
         self.matugen.color_index.unwrap_or(0).min(3)
+    }
+
+    pub fn matugen_contrast(&self) -> Option<f64> {
+        self.matugen
+            .contrast
+            .filter(|c| c.is_finite() && *c != 0.0)
+            .map(|c| c.clamp(-1.0, 1.0))
     }
 
     pub fn is_muted(&self) -> bool {
@@ -477,7 +618,8 @@ impl Config {
     }
 
     pub fn default_matugen_config_path(&self) -> Option<PathBuf> {
-        resolve_path(self.default_matugen_config.as_deref())
+        let configured = self.default_matugen_config.as_deref().filter(|s| !s.trim().is_empty());
+        resolve_path(configured.or(Some("~/.config/matugen/config.toml")))
     }
 
     pub fn steam_username(&self) -> &str {
@@ -582,5 +724,269 @@ pub fn resolve_tilde(p: &str) -> PathBuf {
         home().join(p.trim_start_matches("~/"))
     } else {
         PathBuf::from(p)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn we_scaling_as_arg_matches_variants() {
+        assert_eq!(WeScaling::Default.as_arg(), "default");
+        assert_eq!(WeScaling::Fill.as_arg(), "fill");
+        assert_eq!(WeScaling::Fit.as_arg(), "fit");
+        assert_eq!(WeScaling::Stretch.as_arg(), "stretch");
+    }
+
+    #[test]
+    fn we_scaling_from_str_is_case_insensitive() {
+        assert_eq!(WeScaling::from_str("FILL"), Some(WeScaling::Fill));
+        assert_eq!(WeScaling::from_str("Fit"), Some(WeScaling::Fit));
+        assert_eq!(WeScaling::from_str("stretch"), Some(WeScaling::Stretch));
+        assert_eq!(WeScaling::from_str("default"), Some(WeScaling::Default));
+        assert_eq!(WeScaling::from_str("nonsense"), None);
+    }
+
+    #[test]
+    fn we_clamp_roundtrips_arg_and_parse() {
+        for (c, s) in [
+            (WeClamp::Border, "border"),
+            (WeClamp::Repeat, "repeat"),
+            (WeClamp::Mirror, "mirror"),
+        ] {
+            assert_eq!(c.as_arg(), s);
+            assert_eq!(WeClamp::from_str(&s.to_uppercase()), Some(c));
+        }
+        assert_eq!(WeClamp::from_str("wrap"), None);
+    }
+
+    #[test]
+    fn fill_mode_as_arg_covers_all_variants() {
+        assert_eq!(FillMode::Fill.as_arg(), "fill");
+        assert_eq!(FillMode::Fit.as_arg(), "fit");
+        assert_eq!(FillMode::Stretch.as_arg(), "stretch");
+        assert_eq!(FillMode::Center.as_arg(), "center");
+        assert_eq!(FillMode::Tile.as_arg(), "tile");
+        assert_eq!(FillMode::default(), FillMode::Fill);
+    }
+
+    #[test]
+    fn post_process_plain_defaults_to_all() {
+        let e: PostProcessEntry = serde_json::from_str(r#""echo hi""#).unwrap();
+        assert_eq!(e.command(), "echo hi");
+        assert_eq!(e.wp_type(), "all");
+        assert!(e.matches("static"));
+        assert!(e.matches("video"));
+    }
+
+    #[test]
+    fn post_process_detailed_filters_by_type() {
+        let e: PostProcessEntry =
+            serde_json::from_str(r#"{"command":"run","type":"video"}"#).unwrap();
+        assert_eq!(e.command(), "run");
+        assert_eq!(e.wp_type(), "video");
+        assert!(e.matches("video"));
+        assert!(!e.matches("static"));
+    }
+
+    #[test]
+    fn post_process_detailed_type_defaults_to_all() {
+        let e: PostProcessEntry = serde_json::from_str(r#"{"command":"run"}"#).unwrap();
+        assert_eq!(e.wp_type(), "all");
+        assert!(e.matches("anything"));
+    }
+
+    #[test]
+    fn matugen_getters_fall_back_to_defaults() {
+        let c = Config::default();
+        assert_eq!(c.matugen_scheme(), "scheme-fidelity");
+        assert_eq!(c.matugen_mode(), "dark");
+        assert_eq!(c.matugen_color_index(), 0);
+    }
+
+    #[test]
+    fn matugen_color_index_clamps_to_three() {
+        let c: Config = serde_json::from_str(r#"{"matugen":{"colorIndex":9}}"#).unwrap();
+        assert_eq!(c.matugen_color_index(), 3);
+        let c2: Config = serde_json::from_str(r#"{"matugen":{"colorIndex":2}}"#).unwrap();
+        assert_eq!(c2.matugen_color_index(), 2);
+    }
+
+    #[test]
+    fn mute_and_volume_defaults_and_clamp() {
+        let c = Config::default();
+        assert!(c.is_muted());
+        assert_eq!(c.volume(), 100);
+        let c2: Config =
+            serde_json::from_str(r#"{"wallpaperMute":false,"wallpaperVolume":250}"#).unwrap();
+        assert!(!c2.is_muted());
+        assert_eq!(c2.volume(), 100);
+        let c3: Config = serde_json::from_str(r#"{"wallpaperVolume":40}"#).unwrap();
+        assert_eq!(c3.volume(), 40);
+    }
+
+    #[test]
+    fn steam_username_falls_back_to_anonymous() {
+        let c = Config::default();
+        assert_eq!(c.steam_username(), "anonymous");
+        let c2: Config = serde_json::from_str(r#"{"steam":{"username":"bob"}}"#).unwrap();
+        assert_eq!(c2.steam_username(), "bob");
+    }
+
+    #[test]
+    fn empty_json_yields_documented_defaults() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert!(c.restore_on_startup);
+        assert!(c.features.matugen);
+        assert!(c.features.lyrics);
+        assert!(!c.features.steam);
+        assert_eq!(c.we_render.fps, 30);
+        assert!(c.we_render.no_fullscreen_pause);
+        assert!(c.transition.enabled);
+        assert_eq!(c.transition.shader, "random");
+        assert_eq!(c.transition.duration_ms, 600);
+        assert_eq!(c.display.fill_mode, FillMode::Fill);
+        assert_eq!(c.we_render.scaling, WeScaling::Fill);
+    }
+
+    #[test]
+    fn resolve_tilde_leaves_absolute_paths_untouched() {
+        assert_eq!(resolve_tilde("/etc/passwd"), PathBuf::from("/etc/passwd"));
+        assert_eq!(resolve_tilde("relative/dir"), PathBuf::from("relative/dir"));
+    }
+
+    #[test]
+    fn resolve_tilde_expands_home_prefix() {
+        let expanded = resolve_tilde("~/Pictures");
+        assert_eq!(expanded, home().join("Pictures"));
+        assert!(!expanded.to_string_lossy().starts_with('~'));
+    }
+
+    #[test]
+    fn path_getters_honor_explicit_paths() {
+        let mut c = Config::default();
+        c.paths.wallpaper = Some("/custom/walls".into());
+        c.paths.cache = Some("/custom/cache".into());
+        assert_eq!(c.wallpaper_dir(), PathBuf::from("/custom/walls"));
+        assert_eq!(c.cache_dir(), PathBuf::from("/custom/cache"));
+        assert_eq!(c.matugen_config_path(), PathBuf::from("/custom/cache/matugen-config.toml"));
+    }
+
+    #[test]
+    fn video_dir_falls_back_to_wallpaper_dir() {
+        let mut c = Config::default();
+        c.paths.wallpaper = Some("/walls".into());
+        c.paths.video_wallpaper = None;
+        assert_eq!(c.video_dir(), c.wallpaper_dir());
+        c.paths.video_wallpaper = Some("/vids".into());
+        assert_eq!(c.video_dir(), PathBuf::from("/vids"));
+    }
+
+    #[test]
+    fn we_dir_uses_workshop_then_steam_then_default() {
+        let mut c = Config::default();
+        c.paths.steam_workshop = Some("/ws".into());
+        assert_eq!(c.we_dir(), PathBuf::from("/ws"));
+        c.paths.steam_workshop = None;
+        c.paths.steam = Some("/steam".into());
+        assert_eq!(c.we_dir(), PathBuf::from("/steam/steamapps/workshop/content/431960"));
+    }
+
+    #[test]
+    fn wants_external_render_logic() {
+        let mut c = Config::default();
+        assert!(!c.wants_external_render());
+        c.pick_only_mode = true;
+        assert!(c.wants_external_render());
+        c.pick_only_mode = false;
+        c.external_wallpaper_command = Some("setwall %path%".into());
+        assert!(c.wants_external_render());
+        c.external_wallpaper_command = Some(String::new());
+        assert!(!c.wants_external_render());
+    }
+
+    #[test]
+    fn we_assets_dir_falls_back_to_steam_default_when_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let steam = dir.path();
+        let assets = steam.join("steamapps/common/wallpaper_engine/assets");
+
+        let mut c = Config::default();
+        c.paths.steam = Some(steam.to_string_lossy().to_string());
+
+        c.paths.steam_we_assets = None;
+        assert_eq!(c.we_assets_dir(), None, "no fallback when default assets dir absent");
+
+        std::fs::create_dir_all(&assets).unwrap();
+        assert_eq!(c.we_assets_dir(), Some(assets.clone()), "falls back to existing default");
+
+        c.paths.steam_we_assets = Some(String::new());
+        assert_eq!(c.we_assets_dir(), Some(assets.clone()), "empty string also falls back");
+
+        let custom = dir.path().join("custom-assets");
+        c.paths.steam_we_assets = Some(custom.to_string_lossy().to_string());
+        assert_eq!(c.we_assets_dir(), Some(custom), "explicit path wins over default");
+    }
+
+    #[test]
+    fn default_matugen_config_path_treats_empty_as_unset() {
+        let mut c = Config::default();
+
+        assert!(
+            c.default_matugen_config_path().unwrap().ends_with(".config/matugen/config.toml"),
+            "unset -> falls back to default user config"
+        );
+
+        c.default_matugen_config = Some(String::new());
+        assert!(
+            c.default_matugen_config_path().unwrap().ends_with(".config/matugen/config.toml"),
+            "empty string -> falls back (issue #68)"
+        );
+
+        c.default_matugen_config = Some("   ".into());
+        assert!(
+            c.default_matugen_config_path().unwrap().ends_with(".config/matugen/config.toml"),
+            "whitespace -> falls back"
+        );
+
+        c.default_matugen_config = Some("/custom/matugen.toml".into());
+        assert_eq!(
+            c.default_matugen_config_path(),
+            Some(std::path::PathBuf::from("/custom/matugen.toml")),
+            "explicit path wins"
+        );
+    }
+
+    #[test]
+    fn matugen_contrast_clamps_and_omits_default() {
+        let mut c = Config::default();
+        assert_eq!(c.matugen_contrast(), None, "unset -> omit --contrast");
+        c.matugen.contrast = Some(0.0);
+        assert_eq!(c.matugen_contrast(), None, "0 == matugen default -> omit");
+        c.matugen.contrast = Some(0.6);
+        assert_eq!(c.matugen_contrast(), Some(0.6));
+        c.matugen.contrast = Some(5.0);
+        assert_eq!(c.matugen_contrast(), Some(1.0), "clamped to 1");
+        c.matugen.contrast = Some(-9.0);
+        assert_eq!(c.matugen_contrast(), Some(-1.0), "clamped to -1");
+    }
+
+    #[test]
+    fn empty_path_strings_fall_back_to_defaults() {
+        let mut c = Config::default();
+        c.paths.wallpaper = Some("   ".into());
+        assert_eq!(c.wallpaper_dir(), home().join("Pictures/Wallpapers"));
+    }
+
+    #[test]
+    fn steam_client_only_selected_for_steam_backend() {
+        let mut c = SteamConfig { backend: SteamBackend::Steam, ..Default::default() };
+        assert!(c.uses_steam_client(), "default/steam backend connects the steamworks client");
+        c.backend = SteamBackend::Steamcmd;
+        assert!(
+            !c.uses_steam_client(),
+            "steamcmd backend must never init the client (no Steam appid lock)"
+        );
     }
 }

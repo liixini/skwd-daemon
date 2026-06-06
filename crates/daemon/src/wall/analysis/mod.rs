@@ -504,12 +504,26 @@ async fn parse_ollama_response(
     text: &str,
     thumb_path: &str,
 ) -> anyhow::Result<(i64, i64, Vec<String>, String, Vec<String>)> {
-    let lines: Vec<&str> = text.lines().collect();
+    let (tags, weather) = parse_tags_and_weather(text);
 
+    let (mut hue, mut sat) = (99i64, 0i64);
+    if let Ok((extracted_hue, extracted_sat)) = extract_hue_from_thumb(thumb_path).await {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        {
+            hue = i64::from(thumb::hue_bucket(extracted_hue as u16, extracted_sat as u16));
+            sat = extracted_sat as i64;
+        }
+    }
+
+    let colors_json = serde_json::json!({"hue": hue, "saturation": sat}).to_string();
+
+    Ok((hue, sat, tags, colors_json, weather))
+}
+
+fn parse_tags_and_weather(text: &str) -> (Vec<String>, Vec<String>) {
     let mut tag_line = None;
     let mut weather_line = None;
-
-    for line in &lines {
+    for line in text.lines() {
         let trimmed = line.trim();
         if !trimmed.contains(',') {
             continue;
@@ -518,15 +532,6 @@ async fn parse_ollama_response(
             tag_line = Some(trimmed);
         } else if weather_line.is_none() {
             weather_line = Some(trimmed);
-        }
-    }
-
-    let (mut hue, mut sat) = (99i64, 0i64);
-    if let Ok((extracted_hue, extracted_sat)) = extract_hue_from_thumb(thumb_path).await {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        {
-            hue = i64::from(thumb::hue_bucket(extracted_hue as u16, extracted_sat as u16));
-            sat = extracted_sat as i64;
         }
     }
 
@@ -558,9 +563,7 @@ async fn parse_ollama_response(
         }
     }
 
-    let colors_json = serde_json::json!({"hue": hue, "saturation": sat}).to_string();
-
-    Ok((hue, sat, tags, colors_json, weather))
+    (tags, weather)
 }
 
 async fn extract_hue_from_thumb(path: &str) -> anyhow::Result<(f32, f32)> {
@@ -663,4 +666,132 @@ async fn broadcast_progress(tx: &broadcast::Sender<String>, state: &Arc<Mutex<An
             "eta": s.eta,
         }),
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tags_uses_first_comma_line_normalizes_and_dedups() {
+        let text = "Here is the description\nMountain, Sunset , forest, Mountain, sky.\nsunny, clear";
+        let (tags, weather) = parse_tags_and_weather(text);
+        assert_eq!(tags, vec!["mountain", "sunset", "forest", "sky"]);
+        assert_eq!(weather, vec!["sunny", "clear"]);
+    }
+
+    #[test]
+    fn parse_tags_replaces_spaces_and_drops_too_long_or_dashes() {
+        let (tags, _) = parse_tags_and_weather("city lights, -bad, this-tag-is-way-too-long-to-keep-here, ok");
+        assert!(tags.contains(&"city-lights".to_string()));
+        assert!(tags.contains(&"ok".to_string()));
+        assert!(!tags.iter().any(|t| t.starts_with('-')));
+        assert!(!tags.iter().any(|t| t.len() > 24));
+    }
+
+    #[test]
+    fn parse_tags_empty_when_no_comma_lines() {
+        let (tags, weather) = parse_tags_and_weather("just one word\nanother line");
+        assert!(tags.is_empty());
+        assert!(weather.is_empty());
+    }
+
+    // Contract: skwd-wall's WallpaperAnalysisService.qml reads these exact (camelCase) fields
+    // from both analysis.status and the skwd.wall.analysis.progress event.
+    #[tokio::test]
+    async fn analysis_status_field_contract() {
+        let h = crate::server::test_state();
+        let r = h.dispatch("analysis.status", serde_json::json!({})).await.result.unwrap();
+        for field in [
+            "running", "progress", "total", "taggedCount", "coloredCount", "totalThumbs", "lastLog", "eta",
+        ] {
+            assert!(r.get(field).is_some(), "analysis.status missing field: {field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn analysis_default_prompt_returns_prompt_string() {
+        let h = crate::server::test_state();
+        let r = h.dispatch("analysis.default_prompt", serde_json::json!({})).await.result.unwrap();
+        assert!(r["prompt"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn analyze_one_posts_image_and_parses_tags_over_http() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let thumb = dir.path().join("thumb.png");
+        tokio::fs::write(&thumb, b"not-a-real-image").await.unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .and(body_string_contains("bm90LWEtcmVhbC1pbWFnZQ=="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "response": "forest, mountain, sunset\nsunny, clear"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let (_hue, _sat, tags, colors_json, weather) =
+            analyze_one(thumb.to_str().unwrap(), &server.uri(), "llava", "describe", &client)
+                .await
+                .unwrap();
+
+        assert_eq!(tags, vec!["forest", "mountain", "sunset"]);
+        assert_eq!(weather, vec!["sunny", "clear"]);
+        assert!(colors_json.contains("\"hue\""));
+        assert!(colors_json.contains("\"saturation\""));
+    }
+
+    #[tokio::test]
+    async fn analyze_one_bails_on_ollama_error_field() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let thumb = dir.path().join("thumb.png");
+        tokio::fs::write(&thumb, b"bytes").await.unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": "model not found"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = analyze_one(thumb.to_str().unwrap(), &server.uri(), "llava", "p", &client)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("model not found"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn analyze_one_bails_on_http_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let thumb = dir.path().join("thumb.png");
+        tokio::fs::write(&thumb, b"bytes").await.unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = analyze_one(thumb.to_str().unwrap(), &server.uri(), "llava", "p", &client)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ollama failed"), "got: {err}");
+    }
 }

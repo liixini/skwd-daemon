@@ -77,23 +77,35 @@ impl AuthStore {
         let Some(tokens) = state.tokens.clone() else {
             return Ok(None);
         };
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if tokens.expires_at_secs > now + 60 {
+        let now = now_unix_secs();
+        if token_is_fresh(&tokens, now) {
             return Ok(Some(tokens));
         }
         drop(state);
         let refreshed = refresh_tokens(client_id, &tokens.refresh_token).await?;
-        let new_tokens = StoredTokens {
-            access_token: refreshed.access_token,
-            refresh_token: refreshed.refresh_token.unwrap_or(tokens.refresh_token),
-            expires_at_secs: now + refreshed.expires_in.unwrap_or(3600),
-            scope: refreshed.scope.unwrap_or_else(|| tokens.scope.clone()),
-        };
+        let new_tokens = merge_refreshed_tokens(&tokens, refreshed, now);
         self.store(new_tokens.clone()).await?;
         Ok(Some(new_tokens))
+    }
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn token_is_fresh(tokens: &StoredTokens, now: u64) -> bool {
+    tokens.expires_at_secs > now + 60
+}
+
+fn merge_refreshed_tokens(prev: &StoredTokens, refreshed: TokenResponse, now: u64) -> StoredTokens {
+    StoredTokens {
+        access_token: refreshed.access_token,
+        refresh_token: refreshed.refresh_token.unwrap_or_else(|| prev.refresh_token.clone()),
+        expires_at_secs: now + refreshed.expires_in.unwrap_or(3600),
+        scope: refreshed.scope.unwrap_or_else(|| prev.scope.clone()),
     }
 }
 
@@ -113,9 +125,17 @@ struct TokenResponse {
 }
 
 async fn refresh_tokens(client_id: &str, refresh_token: &str) -> Result<TokenResponse> {
+    refresh_tokens_at(SPOTIFY_TOKEN_URL, client_id, refresh_token).await
+}
+
+async fn refresh_tokens_at(
+    token_url: &str,
+    client_id: &str,
+    refresh_token: &str,
+) -> Result<TokenResponse> {
     let client = reqwest::Client::new();
     let resp = client
-        .post(SPOTIFY_TOKEN_URL)
+        .post(token_url)
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
@@ -127,7 +147,7 @@ async fn refresh_tokens(client_id: &str, refresh_token: &str) -> Result<TokenRes
     if !resp.status().is_success() {
         let s = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("token refresh failed: {} {}", s, body);
+        anyhow::bail!("token refresh failed: {s} {body}");
     }
     let body: TokenResponse = resp.json().await?;
     Ok(body)
@@ -163,9 +183,18 @@ pub async fn exchange_code(
     code: &str,
     verifier: &str,
 ) -> Result<StoredTokens> {
+    exchange_code_at(SPOTIFY_TOKEN_URL, client_id, code, verifier).await
+}
+
+async fn exchange_code_at(
+    token_url: &str,
+    client_id: &str,
+    code: &str,
+    verifier: &str,
+) -> Result<StoredTokens> {
     let client = reqwest::Client::new();
     let resp = client
-        .post(SPOTIFY_TOKEN_URL)
+        .post(token_url)
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -178,7 +207,7 @@ pub async fn exchange_code(
     if !resp.status().is_success() {
         let s = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("code exchange failed: {} {}", s, body);
+        anyhow::bail!("code exchange failed: {s} {body}");
     }
     let body: TokenResponse = resp.json().await?;
     let now = SystemTime::now()
@@ -202,7 +231,7 @@ fn urlencoded(s: &str) -> String {
             out.push(ch);
         } else {
             for b in ch.to_string().as_bytes() {
-                out.push_str(&format!("%{:02X}", b));
+                out.push_str(&format!("%{b:02X}"));
             }
         }
     }
@@ -215,4 +244,189 @@ pub fn redirect_listen_addr() -> std::net::SocketAddr {
 
 pub fn loopback_timeout() -> Duration {
     Duration::from_secs(180)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn challenge_for_matches_rfc7636_vector() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let expected = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        assert_eq!(challenge_for(verifier), expected);
+    }
+
+    #[test]
+    fn random_verifier_is_url_safe_and_long() {
+        let v = random_verifier();
+        assert_eq!(v.len(), 86);
+        assert!(
+            v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "unexpected char in {v}"
+        );
+        assert_ne!(random_verifier(), random_verifier());
+    }
+
+    #[test]
+    fn build_authorize_url_includes_pkce_params() {
+        let url = build_authorize_url("my client", "CHALLENGE123", "state-xyz");
+        assert!(url.starts_with(SPOTIFY_AUTHORIZE_URL));
+        assert!(url.contains("response_type=code"));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("code_challenge=CHALLENGE123"));
+        assert!(url.contains("state=state-xyz"));
+        assert!(url.contains("client_id=my%20client"));
+        assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcallback"));
+        assert!(url.contains("scope=user-read-playback-state%20"));
+    }
+
+    #[test]
+    fn urlencoded_preserves_unreserved_and_escapes_rest() {
+        assert_eq!(urlencoded("abcXYZ09-_.~"), "abcXYZ09-_.~");
+        assert_eq!(urlencoded("a b/c"), "a%20b%2Fc");
+    }
+
+    fn tokens(expires_at: u64) -> StoredTokens {
+        StoredTokens {
+            access_token: "a".into(),
+            refresh_token: "r".into(),
+            expires_at_secs: expires_at,
+            scope: "s".into(),
+        }
+    }
+
+    #[test]
+    fn token_is_fresh_requires_sixty_second_margin() {
+        assert!(token_is_fresh(&tokens(1000), 900));
+        assert!(!token_is_fresh(&tokens(1000), 940));
+        assert!(!token_is_fresh(&tokens(1000), 1000));
+        assert!(!token_is_fresh(&tokens(1000), 2000));
+    }
+
+    #[test]
+    fn merge_refreshed_keeps_previous_when_fields_absent() {
+        let prev = tokens(100);
+        let refreshed: TokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": "new-access"
+        }))
+        .unwrap();
+        let merged = merge_refreshed_tokens(&prev, refreshed, 5000);
+        assert_eq!(merged.access_token, "new-access");
+        assert_eq!(merged.refresh_token, "r");
+        assert_eq!(merged.scope, "s");
+        assert_eq!(merged.expires_at_secs, 5000 + 3600);
+    }
+
+    #[test]
+    fn merge_refreshed_overrides_when_fields_present() {
+        let prev = tokens(100);
+        let refreshed: TokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": "na",
+            "refresh_token": "nr",
+            "expires_in": 1000,
+            "scope": "ns"
+        }))
+        .unwrap();
+        let merged = merge_refreshed_tokens(&prev, refreshed, 5000);
+        assert_eq!(merged.refresh_token, "nr");
+        assert_eq!(merged.scope, "ns");
+        assert_eq!(merged.expires_at_secs, 6000);
+    }
+
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn exchange_code_at_maps_token_json_to_stored_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/token"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .and(body_string_contains("code_verifier=ver"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "ACCESS",
+                "refresh_token": "REFRESH",
+                "expires_in": 3600,
+                "scope": "user-read-playback-state"
+            })))
+            .mount(&server)
+            .await;
+
+        let toks = exchange_code_at(&format!("{}/api/token", server.uri()), "cid", "the-code", "ver")
+            .await
+            .unwrap();
+        assert_eq!(toks.access_token, "ACCESS");
+        assert_eq!(toks.refresh_token, "REFRESH");
+        assert_eq!(toks.scope, "user-read-playback-state");
+    }
+
+    #[tokio::test]
+    async fn exchange_code_at_errors_without_refresh_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "ACCESS",
+                "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+
+        let err = exchange_code_at(&format!("{}/api/token", server.uri()), "cid", "c", "v")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no refresh token"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn exchange_code_at_propagates_http_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("invalid_grant"))
+            .mount(&server)
+            .await;
+
+        let err = exchange_code_at(&format!("{}/api/token", server.uri()), "cid", "c", "v")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("code exchange failed"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn refresh_tokens_at_parses_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "FRESH",
+                "expires_in": 1800
+            })))
+            .mount(&server)
+            .await;
+
+        let resp = refresh_tokens_at(&format!("{}/api/token", server.uri()), "cid", "rt")
+            .await
+            .unwrap();
+        assert_eq!(resp.access_token, "FRESH");
+        assert_eq!(resp.expires_in, Some(1800));
+        assert_eq!(resp.refresh_token, None);
+    }
+
+    #[tokio::test]
+    async fn refresh_tokens_at_propagates_http_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/token"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+            .mount(&server)
+            .await;
+
+        let err = refresh_tokens_at(&format!("{}/api/token", server.uri()), "cid", "rt")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("token refresh failed"), "got: {err}");
+    }
 }

@@ -24,7 +24,7 @@ pub async fn resolve_source(config: &Config) -> Option<String> {
             .get("path")
             .and_then(|v| v.as_str())
             .filter(|p| Path::new(p).exists())
-            .map(|s| s.to_string()),
+            .map(std::string::ToString::to_string),
         "video" => {
             let path = state.get("path").and_then(|v| v.as_str())?;
             let stem = Path::new(path).file_stem()?.to_string_lossy().into_owned();
@@ -43,7 +43,7 @@ pub async fn resolve_source(config: &Config) -> Option<String> {
                 .get("path")
                 .and_then(|v| v.as_str())
                 .filter(|p| !p.is_empty() && Path::new(p).exists())
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
         }
         _ => None,
     }
@@ -129,13 +129,12 @@ async fn respawn(blurred: &Path) -> anyhow::Result<()> {
 }
 
 fn which_paper_still() -> String {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent() {
             let local = dir.join("skwd-paper-still");
             if local.exists() {
                 return local.to_string_lossy().to_string();
             }
         }
-    }
     "skwd-paper-still".to_string()
 }

@@ -1,5 +1,3 @@
-use std::sync::Mutex as StdMutex;
-use std::time::Instant;
 
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -8,6 +6,11 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::server::SharedState;
+
+mod parse;
+mod providers;
+use parse::*;
+use providers::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LyricWord {
@@ -34,10 +37,6 @@ pub(crate) struct LyricsData {
     lines: Vec<LyricLine>,
 }
 
-static MX_TOKEN: std::sync::LazyLock<StdMutex<Option<(String, Instant)>>> =
-    std::sync::LazyLock::new(|| StdMutex::new(None));
-
-const MX_TOKEN_TTL_SECS: u64 = 600;
 
 pub enum CachedLyrics {
     Hit(LyricsData),
@@ -103,671 +102,6 @@ pub fn mark_not_found(conn: &Connection, artist: &str, title: &str) -> rusqlite:
     Ok(())
 }
 
-fn build_client() -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("skwd-lyrics/1.0")
-        .build()
-}
-
-async fn mx_ensure_token(client: &reqwest::Client) -> Option<String> {
-    {
-        let guard = MX_TOKEN.lock().unwrap();
-        if let Some((ref token, ref fetched)) = *guard {
-            if fetched.elapsed().as_secs() < MX_TOKEN_TTL_SECS {
-                return Some(token.clone());
-            }
-        }
-    }
-
-    let resp: serde_json::Value = client
-        .get("https://apic-desktop.musixmatch.com/ws/1.1/token.get")
-        .query(&[
-            ("app_id", "web-desktop-app-v1.0"),
-            ("user_language", "en"),
-        ])
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-
-    let status = resp
-        .pointer("/message/header/status_code")
-        .and_then(|v| v.as_i64())?;
-    if status == 401 {
-        return None;
-    }
-
-    let token = resp
-        .pointer("/message/body/user_token")
-        .and_then(|v| v.as_str())?
-        .to_string();
-
-    {
-        let mut guard = MX_TOKEN.lock().unwrap();
-        *guard = Some((token.clone(), Instant::now()));
-    }
-
-    Some(token)
-}
-
-async fn mx_api_call(
-    client: &reqwest::Client,
-    action: &str,
-    params: &[(&str, String)],
-) -> Option<serde_json::Value> {
-    let token = mx_ensure_token(client).await?;
-    let mut query: Vec<(&str, String)> = params.to_vec();
-    query.push(("app_id", "web-desktop-app-v1.0".into()));
-    query.push(("usertoken", token));
-    query.push(("t", chrono_or_now()));
-
-    let url = format!(
-        "https://apic-desktop.musixmatch.com/ws/1.1/{}",
-        action
-    );
-
-    let resp: serde_json::Value = client
-        .get(&url)
-        .query(&query)
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-
-    let status = resp
-        .pointer("/message/header/status_code")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    if status != 200 {
-        return None;
-    }
-
-    resp.pointer("/message/body").cloned()
-}
-
-fn chrono_or_now() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .to_string()
-}
-
-fn normalize_token(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
-}
-
-fn tokenize(s: &str) -> Vec<String> {
-    const STOP: &[&str] = &[
-        "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "by",
-        "for", "with", "from", "is", "it", "i", "im", "you", "me", "my",
-        "feat", "ft", "featuring", "with", "vs", "remix", "edit", "version",
-        "remastered", "remaster", "mix", "official", "video", "audio",
-    ];
-    s.split_whitespace()
-        .map(normalize_token)
-        .filter(|t| t.len() >= 3 && !STOP.contains(&t.as_str()))
-        .collect()
-}
-
-fn token_overlap(target: &[String], candidate: &[String]) -> usize {
-    target.iter().filter(|t| candidate.contains(t)).count()
-}
-
-fn mx_best_match(
-    track_list: &[serde_json::Value],
-    artist: &str,
-    title: &str,
-) -> Option<i64> {
-    let target_artist_tokens = tokenize(artist);
-    let target_title_tokens = tokenize(title);
-    let need_artist = !target_artist_tokens.is_empty();
-    let need_title = !target_title_tokens.is_empty();
-
-    let mut best_id: Option<i64> = None;
-    let mut best_score: usize = 0;
-
-    for item in track_list {
-        let Some(track) = item.get("track") else { continue };
-        let name = track.get("track_name").and_then(|v| v.as_str()).unwrap_or("");
-        let art = track.get("artist_name").and_then(|v| v.as_str()).unwrap_or("");
-
-        let cand_artist_tokens = tokenize(art);
-        let cand_title_tokens = tokenize(name);
-
-        let artist_overlap = token_overlap(&target_artist_tokens, &cand_artist_tokens);
-        let title_overlap = token_overlap(&target_title_tokens, &cand_title_tokens);
-
-        if need_artist && artist_overlap == 0 {
-            continue;
-        }
-        if need_title && title_overlap == 0 {
-            continue;
-        }
-
-        let score = artist_overlap * 2 + title_overlap;
-        if score > best_score {
-            best_score = score;
-            best_id = track.get("track_id").and_then(|v| v.as_i64());
-        }
-    }
-
-    best_id
-}
-
-async fn fetch_musixmatch(
-    client: &reqwest::Client,
-    artist: &str,
-    title: &str,
-) -> Option<LyricsData> {
-    let search_term = format!("{} {}", artist, title);
-
-    let body = mx_api_call(
-        client,
-        "track.search",
-        &[
-            ("q", search_term),
-            ("page_size", "5".into()),
-            ("page", "1".into()),
-        ],
-    )
-    .await?;
-
-    let track_list = body
-        .get("track_list")
-        .and_then(|v| v.as_array())?;
-
-    if track_list.is_empty() {
-        return None;
-    }
-
-    let track_id = mx_best_match(track_list, artist, title)?;
-
-    if let Some(data) = mx_get_richsync(client, track_id).await {
-        return Some(data);
-    }
-
-    mx_get_subtitle(client, track_id).await
-}
-
-async fn mx_get_richsync(client: &reqwest::Client, track_id: i64) -> Option<LyricsData> {
-    let body = mx_api_call(
-        client,
-        "track.richsync.get",
-        &[("track_id", track_id.to_string())],
-    )
-    .await?;
-
-    let richsync_body = body
-        .pointer("/richsync/richsync_body")
-        .and_then(|v| v.as_str())?;
-
-    let rich_data: Vec<serde_json::Value> = serde_json::from_str(richsync_body).ok()?;
-    let lines = parse_richsync(&rich_data);
-
-    if lines.is_empty() {
-        return None;
-    }
-
-    Some(LyricsData {
-        enhanced: true,
-        lines,
-    })
-}
-
-async fn mx_get_subtitle(client: &reqwest::Client, track_id: i64) -> Option<LyricsData> {
-    let body = mx_api_call(
-        client,
-        "track.subtitle.get",
-        &[
-            ("track_id", track_id.to_string()),
-            ("subtitle_format", "lrc".into()),
-        ],
-    )
-    .await?;
-
-    let lrc = body
-        .pointer("/subtitle/subtitle_body")
-        .and_then(|v| v.as_str())?;
-
-    let (lines, enhanced) = parse_lrc(lrc);
-    if lines.is_empty() {
-        return None;
-    }
-
-    Some(LyricsData { enhanced, lines })
-}
-
-async fn fetch_lrclib(
-    client: &reqwest::Client,
-    artist: &str,
-    title: &str,
-) -> Option<LyricsData> {
-    if let Some(data) = lrclib_get(client, artist, title).await {
-        return Some(data);
-    }
-    lrclib_search(client, artist, title).await
-}
-
-async fn lrclib_get(
-    client: &reqwest::Client,
-    artist: &str,
-    title: &str,
-) -> Option<LyricsData> {
-    let resp: serde_json::Value = client
-        .get("https://lrclib.net/api/get")
-        .query(&[("artist_name", artist), ("track_name", title)])
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-
-    let synced = resp.get("syncedLyrics").and_then(|v| v.as_str())?;
-    let (lines, enhanced) = parse_lrc(synced);
-    if lines.is_empty() {
-        return None;
-    }
-    Some(LyricsData { enhanced, lines })
-}
-
-async fn lrclib_search(
-    client: &reqwest::Client,
-    artist: &str,
-    title: &str,
-) -> Option<LyricsData> {
-    let query = format!("{} {}", artist, title);
-    let results: Vec<serde_json::Value> = client
-        .get("https://lrclib.net/api/search")
-        .query(&[("q", &query)])
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-
-    let mut best_synced: Option<&str> = None;
-    let mut best_enhanced: Option<&str> = None;
-
-    for item in &results {
-        if let Some(synced) = item.get("syncedLyrics").and_then(|v| v.as_str()) {
-            if best_synced.is_none() {
-                best_synced = Some(synced);
-            }
-            if best_enhanced.is_none() && is_enhanced_lrc(synced) {
-                best_enhanced = Some(synced);
-            }
-        }
-    }
-
-    let lrc = best_enhanced.or(best_synced)?;
-    let (lines, enhanced) = parse_lrc(lrc);
-    if lines.is_empty() {
-        return None;
-    }
-    Some(LyricsData { enhanced, lines })
-}
-
-async fn fetch_netease(
-    client: &reqwest::Client,
-    artist: &str,
-    title: &str,
-) -> Option<LyricsData> {
-    let search_term = format!("{} {}", artist, title);
-
-    let resp: serde_json::Value = client
-        .get("https://music.163.com/api/search/pc")
-        .query(&[
-            ("limit", "5"),
-            ("type", "1"),
-            ("offset", "0"),
-            ("s", &search_term),
-        ])
-        .header("Referer", "https://music.163.com/")
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-
-    let songs = resp
-        .pointer("/result/songs")
-        .and_then(|v| v.as_array())?;
-
-    let track_id = songs.first()?.get("id").and_then(|v| v.as_i64())?;
-
-    let lyric_resp: serde_json::Value = client
-        .get("https://music.163.com/api/song/lyric")
-        .query(&[("id", &track_id.to_string()), ("lv", &"1".to_string())])
-        .header("Referer", "https://music.163.com/")
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-
-    let lrc = lyric_resp
-        .pointer("/lrc/lyric")
-        .and_then(|v| v.as_str())?;
-
-    let (lines, _) = parse_lrc(lrc);
-    if lines.is_empty() {
-        return None;
-    }
-
-    Some(LyricsData {
-        enhanced: false,
-        lines,
-    })
-}
-
-fn is_enhanced_lrc(text: &str) -> bool {
-    text.contains('<') && has_word_timestamp(text)
-}
-
-fn has_word_timestamp(text: &str) -> bool {
-    let mut rest = text;
-    while let Some(pos) = rest.find('<') {
-        rest = &rest[pos + 1..];
-        if let Some(end) = rest.find('>') {
-            let inner = &rest[..end];
-            if parse_timestamp(inner).is_some() {
-                return true;
-            }
-            rest = &rest[end + 1..];
-        } else {
-            break;
-        }
-    }
-    false
-}
-
-fn parse_timestamp(s: &str) -> Option<i64> {
-    let (min_s, sec_s) = s.trim().split_once(':')?;
-    if !sec_s.contains('.') {
-        return None;
-    }
-    let _: i64 = min_s.parse().ok()?;
-    let _: f64 = sec_s.parse().ok()?;
-    Some(ts_to_ms(s))
-}
-
-fn ts_to_ms(ts: &str) -> i64 {
-    let parts: Vec<&str> = ts.trim().splitn(2, ':').collect();
-    if parts.len() == 2 {
-        let minutes: i64 = parts[0].parse().unwrap_or(0);
-        let seconds: f64 = parts[1].parse().unwrap_or(0.0);
-        ((minutes as f64 * 60.0 + seconds) * 1000.0).round() as i64
-    } else {
-        0
-    }
-}
-
-fn parse_lrc(text: &str) -> (Vec<LyricLine>, bool) {
-    if is_enhanced_lrc(text) {
-        return (parse_enhanced_lrc(text), true);
-    }
-    parse_regular_lrc(text)
-}
-
-fn parse_regular_lrc(text: &str) -> (Vec<LyricLine>, bool) {
-    let mut result = Vec::new();
-
-    for raw in text.lines() {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        let Some((ts, rest)) = parse_lrc_line_start(raw) else {
-            continue;
-        };
-        let start = ts_to_ms(ts);
-        let line_text = rest.trim();
-        if line_text.is_empty() {
-            continue;
-        }
-        result.push(LyricLine {
-            text: line_text.to_string(),
-            start,
-            end: start + 3000,
-            words: vec![],
-        });
-    }
-
-    for i in 0..result.len().saturating_sub(1) {
-        result[i].end = result[i + 1].start;
-    }
-
-    (result, false)
-}
-
-fn parse_lrc_line_start(line: &str) -> Option<(&str, &str)> {
-    let line = line.trim();
-    if !line.starts_with('[') {
-        return None;
-    }
-    let close = line.find(']')?;
-    let ts = &line[1..close];
-    parse_timestamp(ts)?;
-    let rest = &line[close + 1..];
-    Some((ts, rest))
-}
-
-fn parse_enhanced_lrc(text: &str) -> Vec<LyricLine> {
-    let mut result = Vec::new();
-
-    for raw in text.lines() {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        let Some((ts, rest)) = parse_lrc_line_start(raw) else {
-            continue;
-        };
-        let line_start = ts_to_ms(ts);
-        let rest = rest.trim();
-        if rest.is_empty() {
-            continue;
-        }
-
-        let word_matches = extract_word_timestamps(rest);
-
-        if !word_matches.is_empty() {
-            let full_text = strip_word_timestamps(rest);
-            let mut parsed_words = Vec::new();
-            let mut search_from = 0;
-
-            for (i, (w_ts, w)) in word_matches.iter().enumerate() {
-                let w_start = ts_to_ms(w_ts);
-                let w_end = if i + 1 < word_matches.len() {
-                    ts_to_ms(&word_matches[i + 1].0)
-                } else {
-                    w_start + std::cmp::max(200, (w.len() as i64) * 80)
-                };
-
-                let (char_start, char_end) = if let Some(pos) = full_text[search_from..].find(w.as_str()) {
-                    let cs = search_from + pos;
-                    let ce = cs + w.len();
-                    search_from = ce;
-                    (cs, ce)
-                } else {
-                    let cs = search_from;
-                    let ce = search_from + w.len();
-                    search_from = ce;
-                    (cs, ce)
-                };
-
-                parsed_words.push(LyricWord {
-                    word: w.clone(),
-                    start: w_start,
-                    end: w_end,
-                    char_start,
-                    char_end,
-                });
-            }
-
-            let line_end = parsed_words
-                .last()
-                .map(|w| w.end)
-                .unwrap_or(line_start + 3000);
-
-            result.push(LyricLine {
-                text: full_text,
-                start: line_start,
-                end: line_end,
-                words: parsed_words,
-            });
-        } else {
-            result.push(LyricLine {
-                text: rest.to_string(),
-                start: line_start,
-                end: line_start + 3000,
-                words: vec![],
-            });
-        }
-    }
-
-    for i in 0..result.len().saturating_sub(1) {
-        let next_start = result[i + 1].start;
-        if let Some(last_word) = result[i].words.last_mut() {
-            last_word.end = next_start;
-        }
-        result[i].end = next_start;
-    }
-
-    result
-}
-
-fn extract_word_timestamps(text: &str) -> Vec<(String, String)> {
-    let mut result = Vec::new();
-    let mut rest = text;
-
-    while let Some(open) = rest.find('<') {
-        rest = &rest[open + 1..];
-        let Some(close) = rest.find('>') else { break };
-        let ts = &rest[..close];
-        if parse_timestamp(ts).is_none() {
-            rest = &rest[close + 1..];
-            continue;
-        }
-        rest = &rest[close + 1..];
-
-        let word_end = rest.find('<').unwrap_or(rest.len());
-        let word = rest[..word_end].trim();
-        if !word.is_empty() {
-            result.push((ts.to_string(), word.to_string()));
-        }
-        rest = &rest[word_end..];
-    }
-
-    result
-}
-
-fn strip_word_timestamps(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut rest = text;
-
-    while let Some(open) = rest.find('<') {
-        result.push_str(&rest[..open]);
-        rest = &rest[open + 1..];
-        if let Some(close) = rest.find('>') {
-            let inner = &rest[..close];
-            if parse_timestamp(inner).is_none() {
-                result.push('<');
-                result.push_str(inner);
-                result.push('>');
-            }
-            rest = &rest[close + 1..];
-        } else {
-            result.push('<');
-        }
-    }
-    result.push_str(rest);
-    result.trim().to_string()
-}
-
-fn parse_richsync(rich_data: &[serde_json::Value]) -> Vec<LyricLine> {
-    let mut result = Vec::new();
-
-    for line in rich_data {
-        let line_start = (line.get("ts").and_then(|v| v.as_f64()).unwrap_or(0.0) * 1000.0).round() as i64;
-        let line_end = (line.get("te").and_then(|v| v.as_f64()).unwrap_or(0.0) * 1000.0).round() as i64;
-
-        let fragments = match line.get("l").and_then(|v| v.as_array()) {
-            Some(f) => f,
-            None => continue,
-        };
-
-        let mut full_text = String::new();
-        let mut words = Vec::new();
-
-        let ts_base = line.get("ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-        for frag in fragments {
-            let c = frag
-                .get("c")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let offset = frag
-                .get("o")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            let w_start = ((ts_base + offset) * 1000.0).round() as i64;
-
-            if c.trim().is_empty() {
-                full_text.push_str(c);
-            } else {
-                let char_start = full_text.len();
-                full_text.push_str(c);
-                let char_end = full_text.len();
-                words.push(LyricWord {
-                    word: c.to_string(),
-                    start: w_start,
-                    end: w_start,
-                    char_start,
-                    char_end,
-                });
-            }
-        }
-
-        for i in 0..words.len().saturating_sub(1) {
-            words[i].end = words[i + 1].start;
-        }
-        if let Some(last) = words.last_mut() {
-            last.end = line_end;
-        }
-
-        let display = line
-            .get("x")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&full_text)
-            .trim()
-            .to_string();
-
-        if !display.is_empty() {
-            result.push(LyricLine {
-                text: display,
-                start: line_start,
-                end: line_end,
-                words,
-            });
-        }
-    }
-
-    result
-}
 
 pub async fn dispatch(
     req: &Request,
@@ -904,5 +238,351 @@ pub async fn dispatch(
         }
 
         _ => Response::err(req.id, -32601, format!("unknown method: {}", req.method)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn toks(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn normalize_token_strips_non_alnum_and_lowercases() {
+        assert_eq!(normalize_token("Hello!"), "hello");
+        assert_eq!(normalize_token("R.E.M."), "rem");
+        assert_eq!(normalize_token("café"), "café");
+        assert_eq!(normalize_token("123-abc"), "123abc");
+    }
+
+    #[test]
+    fn tokenize_drops_short_and_stopwords() {
+        assert_eq!(tokenize("The Official Video"), Vec::<String>::new());
+        assert_eq!(tokenize("Bohemian Rhapsody"), toks(&["bohemian", "rhapsody"]));
+        assert_eq!(tokenize("a I im of"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn token_overlap_counts_shared_tokens() {
+        let a = toks(&["bohemian", "rhapsody"]);
+        let b = toks(&["rhapsody", "live"]);
+        assert_eq!(token_overlap(&a, &b), 1);
+        assert_eq!(token_overlap(&a, &toks(&["nothing"])), 0);
+    }
+
+    #[test]
+    fn parse_timestamp_requires_colon_and_fraction() {
+        assert_eq!(parse_timestamp("01:23.45"), Some(83450));
+        assert_eq!(parse_timestamp("00:00.00"), Some(0));
+        assert_eq!(parse_timestamp("01:23"), None);
+        assert_eq!(parse_timestamp("9999"), None);
+        assert_eq!(parse_timestamp("ab:cd.ef"), None);
+    }
+
+    #[test]
+    fn ts_to_ms_converts_minutes_and_seconds() {
+        assert_eq!(ts_to_ms("01:30.5"), 90500);
+        assert_eq!(ts_to_ms("00:01.000"), 1000);
+        assert_eq!(ts_to_ms("garbage"), 0);
+    }
+
+    #[test]
+    fn enhanced_detection_needs_word_timestamps() {
+        assert!(is_enhanced_lrc("[00:00.00]<00:00.40>Hi"));
+        assert!(!is_enhanced_lrc("[00:00.00]Hi"));
+        assert!(!is_enhanced_lrc("plain <tag> no timestamp"));
+        assert!(has_word_timestamp("<00:01.50>word"));
+        assert!(!has_word_timestamp("<notatime>word"));
+    }
+
+    #[test]
+    fn parse_lrc_line_start_splits_timestamp_and_text() {
+        assert_eq!(
+            parse_lrc_line_start("[00:12.34]Hello world"),
+            Some(("00:12.34", "Hello world"))
+        );
+        assert_eq!(parse_lrc_line_start("no bracket"), None);
+        assert_eq!(parse_lrc_line_start("[xx]text"), None);
+    }
+
+    #[test]
+    fn parse_regular_lrc_chains_line_end_to_next_start() {
+        let (lines, enhanced) = parse_regular_lrc("[00:00.00]First\n[00:03.00]Second\n");
+        assert!(!enhanced);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "First");
+        assert_eq!(lines[0].start, 0);
+        assert_eq!(lines[0].end, 3000);
+        assert_eq!(lines[1].start, 3000);
+        assert!(lines[1].words.is_empty());
+    }
+
+    #[test]
+    fn extract_and_strip_word_timestamps_are_consistent() {
+        let line = "<00:00.00>Hello <00:00.50>world";
+        let matches = extract_word_timestamps(line);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0], ("00:00.00".to_string(), "Hello".to_string()));
+        assert_eq!(matches[1], ("00:00.50".to_string(), "world".to_string()));
+        assert_eq!(strip_word_timestamps(line), "Hello world");
+    }
+
+    #[test]
+    fn parse_enhanced_lrc_builds_word_offsets() {
+        let lines = parse_enhanced_lrc("[00:00.00]<00:00.00>Hello <00:00.50>world");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "Hello world");
+        assert_eq!(lines[0].words.len(), 2);
+        assert_eq!(lines[0].words[0].word, "Hello");
+        assert_eq!(lines[0].words[0].start, 0);
+        assert_eq!((lines[0].words[0].char_start, lines[0].words[0].char_end), (0, 5));
+        assert_eq!(lines[0].words[1].start, 500);
+        assert_eq!(lines[0].words[1].char_start, 6);
+    }
+
+    #[test]
+    fn parse_richsync_maps_fragments_to_words() {
+        let data = json!([
+            {
+                "ts": 1.0,
+                "te": 2.0,
+                "l": [
+                    { "c": "Hi", "o": 0.0 },
+                    { "c": " ", "o": 0.2 },
+                    { "c": "there", "o": 0.3 }
+                ]
+            }
+        ]);
+        let lines = parse_richsync(data.as_array().unwrap());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "Hi there");
+        assert_eq!(lines[0].start, 1000);
+        assert_eq!(lines[0].end, 2000);
+        assert_eq!(lines[0].words.len(), 2);
+        assert_eq!(lines[0].words[0].word, "Hi");
+        assert_eq!(lines[0].words[0].start, 1000);
+        assert_eq!(lines[0].words[0].end, 1300);
+        assert_eq!(lines[0].words[1].word, "there");
+        assert_eq!(lines[0].words[1].start, 1300);
+        assert_eq!(lines[0].words[1].end, 2000);
+        assert_eq!((lines[0].words[1].char_start, lines[0].words[1].char_end), (3, 8));
+    }
+
+    #[test]
+    fn mx_best_match_scores_artist_double() {
+        let list = json!([
+            { "track": { "track_name": "Bohemian Rhapsody", "artist_name": "Queen", "track_id": 111 } },
+            { "track": { "track_name": "Something Else", "artist_name": "Other Band", "track_id": 222 } }
+        ]);
+        let id = mx_best_match(list.as_array().unwrap(), "Queen", "Bohemian Rhapsody");
+        assert_eq!(id, Some(111));
+    }
+
+    #[test]
+    fn mx_best_match_rejects_when_no_overlap() {
+        let list = json!([
+            { "track": { "track_name": "Totally Unrelated", "artist_name": "Nobody", "track_id": 5 } }
+        ]);
+        assert_eq!(mx_best_match(list.as_array().unwrap(), "Queen", "Bohemian Rhapsody"), None);
+    }
+
+    #[tokio::test]
+    async fn lrclib_get_from_parses_synced_lyrics_over_http() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/get"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "syncedLyrics": "[00:01.00]hello\n[00:03.00]world"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let data = lrclib_get_from(&client, &server.uri(), "artist", "title").await.unwrap();
+        assert!(!data.enhanced);
+        assert_eq!(data.lines.len(), 2);
+        assert_eq!(data.lines[0].text, "hello");
+        assert_eq!(data.lines[0].start, 1000);
+    }
+
+    #[tokio::test]
+    async fn lrclib_get_from_returns_none_on_error_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/get"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        assert!(lrclib_get_from(&client, &server.uri(), "a", "t").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn lrclib_search_from_prefers_enhanced_lrc() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "syncedLyrics": "[00:01.00]plain line" },
+                { "syncedLyrics": "[00:02.00]<00:02.00>word <00:02.50>timed" }
+            ])))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let data = lrclib_search_from(&client, &server.uri(), "a", "t").await.unwrap();
+        assert!(data.enhanced);
+    }
+
+    #[tokio::test]
+    async fn fetch_musixmatch_from_search_then_subtitle_over_http() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/token.get"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": { "header": { "status_code": 200 }, "body": { "user_token": "tok" } }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/track.search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": { "header": { "status_code": 200 }, "body": { "track_list": [
+                    { "track": { "track_id": 42, "track_name": "Bohemian Rhapsody", "artist_name": "Queen" } }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/track.richsync.get"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": { "header": { "status_code": 200 }, "body": {} }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/track.subtitle.get"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": { "header": { "status_code": 200 }, "body": {
+                    "subtitle": { "subtitle_body": "[00:01.00]hello\n[00:03.00]world" }
+                } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let data = fetch_musixmatch_from(&client, &server.uri(), "Queen", "Bohemian Rhapsody")
+            .await
+            .unwrap();
+        assert_eq!(data.lines.len(), 2);
+        assert_eq!(data.lines[0].text, "hello");
+        assert_eq!(data.lines[0].start, 1000);
+    }
+
+    #[tokio::test]
+    async fn fetch_netease_from_search_then_lyric_over_http() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/search/pc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": { "songs": [ { "id": 99 } ] }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/song/lyric"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "lrc": { "lyric": "[00:01.00]hi\n[00:02.00]there" }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let data = fetch_netease_from(&client, &server.uri(), "artist", "some title")
+            .await
+            .unwrap();
+        assert_eq!(data.lines.len(), 2);
+        assert!(!data.enhanced);
+        assert_eq!(data.lines[1].text, "there");
+    }
+
+    #[tokio::test]
+    async fn fetch_netease_from_returns_none_when_no_songs() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/search/pc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": { "songs": [] }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        assert!(fetch_netease_from(&client, &server.uri(), "a", "t").await.is_none());
+    }
+
+    // Contract: skwd-wall's LyricsService.qml reads lines/enhanced/notFound off lyrics.peek,
+    // and relies on the cached/cacheMiss distinction to decide whether to fetch.
+    #[tokio::test]
+    async fn lyrics_peek_response_contract() {
+        let h = crate::server::test_state();
+
+        assert_eq!(
+            h.dispatch("lyrics.peek", serde_json::json!({})).await.error.unwrap().code,
+            -32602
+        );
+
+        let miss = h
+            .dispatch("lyrics.peek", serde_json::json!({ "artist": "a", "title": "t" }))
+            .await
+            .result
+            .unwrap();
+        assert_eq!(miss["cacheMiss"], true);
+
+        {
+            let db = h.state.db.try_lock().unwrap();
+            let lines = vec![LyricLine { text: "hello".into(), start: 0, end: 1000, words: vec![] }];
+            upsert_lyrics(&db, "a", "t", false, &lines).unwrap();
+            mark_not_found(&db, "b", "u").unwrap();
+        }
+
+        let hit = h
+            .dispatch("lyrics.peek", serde_json::json!({ "artist": "a", "title": "t" }))
+            .await
+            .result
+            .unwrap();
+        assert_eq!(hit["enhanced"], false);
+        assert_eq!(hit["cached"], true);
+        assert_eq!(hit["lines"][0]["text"], "hello");
+
+        let known = h
+            .dispatch("lyrics.peek", serde_json::json!({ "artist": "b", "title": "u" }))
+            .await
+            .result
+            .unwrap();
+        assert_eq!(known["notFound"], true);
+        assert_eq!(known["cached"], true);
     }
 }

@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusqlite::Connection;
-use tokio::process::Command;
 use tokio::sync::{Mutex, Semaphore, broadcast};
 use tracing::warn;
 
@@ -12,7 +11,7 @@ use anyhow::bail;
 use crate::config::Config;
 use crate::db;
 use crate::server::make_event;
-use crate::util::{self, BatchJobState};
+use crate::util::{self, BatchJobState, CommandRunner, CommandSpec};
 
 const MAX_JOBS: usize = 2;
 use super::super::VIDEO_EXTS;
@@ -59,6 +58,7 @@ fn get_preset(key: &str) -> Option<Preset> {
 pub type ConvertState = BatchJobState;
 
 pub async fn start(
+    runner: Arc<dyn CommandRunner>,
     config: &Config,
     db: Arc<Mutex<Connection>>,
     event_tx: broadcast::Sender<String>,
@@ -156,6 +156,7 @@ pub async fn start(
         let max_w = resolution.max_w;
         let max_h = resolution.max_h;
         let preset_name = preset_key.to_string();
+        let runner = runner.clone();
 
         let handle = tokio::spawn(async move {
             {
@@ -177,6 +178,7 @@ pub async fn start(
             }
 
             let result = convert_one(
+                &*runner,
                 &src,
                 &video_dir,
                 &we_dir,
@@ -273,6 +275,7 @@ struct ConvertOk {
     we_id: Option<String>,
 }
 
+#[derive(Debug)]
 enum ConvertResult {
     Skip {
         orig_size: u64,
@@ -284,6 +287,7 @@ enum ConvertResult {
 }
 
 async fn convert_one(
+    runner: &dyn CommandRunner,
     src: &str,
     video_dir: &Path,
     we_dir: &Path,
@@ -301,7 +305,7 @@ async fn convert_one(
 
     let orig_size = tokio::fs::metadata(src).await.map(|m| m.len()).unwrap_or(0);
 
-    let (codec, width, height) = probe_video(src)
+    let (codec, width, height) = probe_video(runner, src)
         .await
         .map_err(|e| ConvertResult::Failed(e.to_string()))?;
 
@@ -327,34 +331,12 @@ async fn convert_one(
     let dest_name = format!("{}_{}.mp4", stem, util::hash_prefix(src));
     let dest_path = converted_dir.join(&dest_name);
 
-    let vf =
-        format!("scale=min({max_w}\\,iw):min({max_h}\\,ih):force_original_aspect_ratio=decrease:force_divisible_by=2");
+    let vf = build_scale_vf(max_w, max_h);
+    let dest_str = dest_path.to_string_lossy().to_string();
+    let args = build_ffmpeg_convert_args(src, crf, maxrate, bufsize, &vf, &dest_str);
 
-    let output = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-i",
-            src,
-            "-c:v",
-            "libx265",
-            "-preset",
-            "medium",
-            "-crf",
-            &crf.to_string(),
-            "-maxrate",
-            maxrate,
-            "-bufsize",
-            bufsize,
-            "-vf",
-            &vf,
-            "-an",
-            "-movflags",
-            "+faststart",
-            "-tag:v",
-            "hvc1",
-            &dest_path.to_string_lossy(),
-        ])
-        .output()
+    let output = runner
+        .run(CommandSpec::new("ffmpeg").args(args))
         .await
         .map_err(|e| ConvertResult::Failed(format!("ffmpeg: {e}")))?;
 
@@ -368,7 +350,7 @@ async fn convert_one(
         .map_err(|e| ConvertResult::Failed(format!("stat: {e}")))?;
     let new_size = new_meta.len();
 
-    let (_, new_w, new_h) = probe_video(dest_path.to_str().unwrap())
+    let (_, new_w, new_h) = probe_video(runner, dest_path.to_str().unwrap())
         .await
         .map_err(|e| ConvertResult::Failed(e.to_string()))?;
 
@@ -394,29 +376,47 @@ async fn convert_one(
     })
 }
 
-async fn probe_video(path: &str) -> anyhow::Result<(String, u32, u32)> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=codec_name,width,height",
-            "-of",
-            "csv=p=0",
-            path,
-        ])
-        .output()
+async fn probe_video(runner: &dyn CommandRunner, path: &str) -> anyhow::Result<(String, u32, u32)> {
+    let output = runner
+        .run(CommandSpec::new("ffprobe").args([
+            "-v", "quiet", "-select_streams", "v:0", "-show_entries",
+            "stream=codec_name,width,height", "-of", "csv=p=0", path,
+        ]))
         .await
         .map_err(|e| anyhow::anyhow!("ffprobe: {e}"))?;
 
     let text = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_ffprobe_csv(&text))
+}
+
+fn build_scale_vf(max_w: u32, max_h: u32) -> String {
+    format!("scale=min({max_w}\\,iw):min({max_h}\\,ih):force_original_aspect_ratio=decrease:force_divisible_by=2")
+}
+
+fn build_ffmpeg_convert_args(
+    src: &str,
+    crf: u32,
+    maxrate: &str,
+    bufsize: &str,
+    vf: &str,
+    dest: &str,
+) -> Vec<String> {
+    [
+        "-y", "-i", src, "-c:v", "libx265", "-preset", "medium", "-crf", &crf.to_string(),
+        "-maxrate", maxrate, "-bufsize", bufsize, "-vf", vf, "-an", "-movflags", "+faststart",
+        "-tag:v", "hvc1", dest,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+fn parse_ffprobe_csv(text: &str) -> (String, u32, u32) {
     let parts: Vec<&str> = text.trim().split(',').collect();
     let codec = parts.first().unwrap_or(&"").to_string();
     let w = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0u32);
     let h = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0u32);
-    Ok((codec, w, h))
+    (codec, w, h)
 }
 
 async fn scan_we_videos(we_dir: &Path, files: &mut Vec<String>) {
@@ -477,4 +477,145 @@ fn broadcast_finished(tx: &broadcast::Sender<String>, s: &ConvertState) {
             "failed": s.failed,
         }),
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ffprobe_csv_extracts_codec_and_dims() {
+        assert_eq!(parse_ffprobe_csv("h264,1920,1080\n"), ("h264".to_string(), 1920, 1080));
+        assert_eq!(parse_ffprobe_csv("hevc,3840,2160"), ("hevc".to_string(), 3840, 2160));
+    }
+
+    #[test]
+    fn parse_ffprobe_csv_tolerates_garbage() {
+        assert_eq!(parse_ffprobe_csv(""), (String::new(), 0, 0));
+        assert_eq!(parse_ffprobe_csv("vp9"), ("vp9".to_string(), 0, 0));
+        assert_eq!(parse_ffprobe_csv("av1,wide,tall"), ("av1".to_string(), 0, 0));
+    }
+
+    #[test]
+    fn build_scale_vf_clamps_to_max_dims() {
+        let vf = build_scale_vf(2560, 1440);
+        assert!(vf.contains("min(2560\\,iw)"));
+        assert!(vf.contains("min(1440\\,ih)"));
+        assert!(vf.contains("force_divisible_by=2"));
+    }
+
+    #[test]
+    fn build_ffmpeg_convert_args_has_expected_flags() {
+        let args = build_ffmpeg_convert_args("in.mp4", 28, "5M", "10M", "scale=x", "out.mp4");
+        assert_eq!(args[0], "-y");
+        assert_eq!(args[args.len() - 1], "out.mp4");
+        let joined = args.join(" ");
+        assert!(joined.contains("libx265"));
+        assert!(joined.contains("-crf 28"));
+        assert!(joined.contains("-maxrate 5M"));
+        assert!(joined.contains("hvc1"));
+        assert!(joined.contains("-an"));
+    }
+
+    #[test]
+    fn get_preset_known_values_and_presets_agree() {
+        let p = get_preset("balanced").unwrap();
+        assert_eq!((p.crf, p.maxrate, p.bufsize), (26, "10M", "20M"));
+        assert!(get_preset("nope").is_none());
+        let j = presets();
+        for key in ["light", "balanced", "quality"] {
+            let gp = get_preset(key).unwrap();
+            assert_eq!(j[key]["crf"], gp.crf);
+            assert_eq!(j[key]["maxrate"], gp.maxrate);
+        }
+    }
+
+    // Contract: skwd-wall's VideoConvertService.qml reads these fields off the
+    // skwd.wall.convert.progress event (camelCase `currentFile`).
+    #[tokio::test]
+    async fn convert_progress_event_contract() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let state = Arc::new(Mutex::new(ConvertState::default()));
+        {
+            let mut s = state.lock().await;
+            s.running = true;
+            s.progress = 1;
+            s.total = 4;
+            s.current_file = "clip.mp4".to_string();
+            s.succeeded = 1;
+        }
+        broadcast_progress(&tx, &state).await;
+        let evt: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(evt["event"], "skwd.wall.convert.progress");
+        let d = &evt["data"];
+        assert_eq!(d["running"], true);
+        assert_eq!(d["progress"], 1);
+        assert_eq!(d["total"], 4);
+        assert_eq!(d["currentFile"], "clip.mp4");
+        assert_eq!(d["converted"], 1);
+    }
+
+    // Full convert flow under mock: ffprobe returns canned dims, the fake ffmpeg *creates* the
+    // output file (side-effect), and we assert the whole chain (probe -> encode -> stat -> reprobe
+    // -> trash src -> place output) end to end.
+    #[tokio::test]
+    async fn convert_one_full_flow_with_side_effect_runner() {
+        use crate::util::{FakeRunner, OutSpec};
+        let dir = tempfile::tempdir().unwrap();
+        let video_dir = dir.path().join("vids");
+        let converted = dir.path().join("converted-videos");
+        let trash = dir.path().join("trash");
+        for d in [&video_dir, &converted, &trash] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let src = video_dir.join("clip.mp4");
+        std::fs::write(&src, vec![0u8; 5000]).unwrap();
+
+        let runner = FakeRunner::new();
+        runner.on("ffprobe", &["vids/clip.mp4"], b"h264,1920,1080", 0);
+        runner.on_creating("ffmpeg", &["libx265"], OutSpec::LastArg, &vec![0u8; 1500]);
+        runner.on("ffprobe", &["converted-videos"], b"hevc,1280,720", 0);
+
+        let ok = convert_one(
+            &runner,
+            src.to_str().unwrap(),
+            &video_dir,
+            std::path::Path::new("/no-we"),
+            &trash,
+            &converted,
+            26,
+            "10M",
+            "20M",
+            1280,
+            720,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!((ok.new_w, ok.new_h), (1280, 720));
+        assert_eq!(ok.orig_size, 5000);
+        assert_eq!(ok.new_size, 1500);
+        assert!(ok.we_id.is_none());
+        assert!(!src.exists(), "source should have been moved to trash");
+        assert!(video_dir.join(&ok.final_dest).exists() || std::path::Path::new(&ok.final_dest).exists());
+    }
+
+    // Skip path: already-hevc within bounds returns the Skip variant without invoking ffmpeg.
+    #[tokio::test]
+    async fn convert_one_skips_already_optimal() {
+        use crate::util::FakeRunner;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("ok.mp4");
+        std::fs::write(&src, b"x").unwrap();
+        let runner = FakeRunner::new();
+        runner.on("ffprobe", &["ok.mp4"], b"hevc,1280,720", 0);
+
+        let res = convert_one(
+            &runner, src.to_str().unwrap(), dir.path(), std::path::Path::new("/no-we"),
+            dir.path(), dir.path(), 26, "10M", "20M", 2560, 1440,
+        )
+        .await;
+        assert!(matches!(res, Err(ConvertResult::Skip { codec, .. }) if codec == "hevc"));
+        assert_eq!(runner.call_count(), 1, "ffmpeg must not run on skip");
+    }
 }

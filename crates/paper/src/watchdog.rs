@@ -19,7 +19,7 @@ pub fn start(limit_mb: u64, check_interval_secs: u64) {
             tracing::warn!(
                 rss_mb = rss_kb / 1024,
                 limit_mb,
-                "RSS exceeded threshold — re-execing"
+                "RSS exceeded threshold - re-execing"
             );
             let mut cmd = std::process::Command::new(&exe);
             if argv.len() > 1 {

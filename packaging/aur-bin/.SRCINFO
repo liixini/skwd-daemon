@@ -14,7 +14,7 @@ pkgbase = skwd-daemon-bin
 	depends = wayland
 	depends = mesa
 	optdepends = ollama: local LLM for automated wallpaper tagging
-	optdepends = steamcmd: Steam Workshop Wallpaper Engine downloads
+	optdepends = steamcmd: Steam Workshop Wallpaper Engine downloads when the Steam client is not running
 	optdepends = linux-wallpaperengine: Wallpaper Engine scene rendering
 	provides = skwd-daemon=0.0.0
 	conflicts = skwd-daemon

@@ -61,3 +61,20 @@ impl MusicState {
         *g = name;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn client_id_and_device_roundtrip() {
+        let (tx, _rx) = broadcast::channel(8);
+        let ms = MusicState::new(tx);
+        assert_eq!(ms.current_device().await, "skwd-music");
+        assert_eq!(ms.current_client_id().await, "");
+        ms.set_client_id("cid-123".into()).await;
+        assert_eq!(ms.current_client_id().await, "cid-123");
+        ms.set_device("living-room".into()).await;
+        assert_eq!(ms.current_device().await, "living-room");
+    }
+}

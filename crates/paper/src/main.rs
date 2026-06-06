@@ -1,3 +1,5 @@
+#![allow(clippy::manual_c_str_literals)]
+
 use anyhow::Result;
 use clap::Parser;
 
@@ -37,6 +39,8 @@ struct Cli {
     mute: bool,
     #[arg(long = "volume", default_value_t = 80)]
     volume: u32,
+    #[arg(long = "playback-rate", default_value_t = 1.0)]
+    playback_rate: f64,
     #[arg(long = "layer", value_enum, default_value_t = LayerArg::Background)]
     layer: LayerArg,
 }
@@ -111,7 +115,12 @@ fn main() -> Result<()> {
         };
         image_paper::run(target, &cli.file, cli.persist, cli.fill_mode)
     } else {
-        let mpv_opts = parse_mpv_opts(cli.mpv_opts.as_deref().unwrap_or(""));
+        let mut mpv_opts = parse_mpv_opts(cli.mpv_opts.as_deref().unwrap_or(""));
+        if (cli.playback_rate - 1.0).abs() > f64::EPSILON
+            && !mpv_opts.iter().any(|(k, _)| k == "speed")
+        {
+            mpv_opts.push(("speed".into(), format!("{:.4}", cli.playback_rate)));
+        }
         let target = if cli.output == "*" {
             wayland::OutputTarget::All
         } else {
@@ -138,4 +147,33 @@ fn parse_mpv_opts(s: &str) -> Vec<(String, String)> {
             Some((k, v))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_image_path_matches_image_extensions() {
+        for p in ["a.jpg", "B.PNG", "c.webp", "/x/y.AVIF", "d.gif"] {
+            assert!(is_image_path(p), "{p} should be image");
+        }
+        for p in ["a.mp4", "b.webm", "noext", "c.txt"] {
+            assert!(!is_image_path(p), "{p} should not be image");
+        }
+    }
+
+    #[test]
+    fn parse_mpv_opts_splits_pairs_and_trims() {
+        let opts = parse_mpv_opts(" loop = inf ; volume=50 ; ");
+        assert_eq!(
+            opts,
+            vec![
+                ("loop".to_string(), "inf".to_string()),
+                ("volume".to_string(), "50".to_string()),
+            ]
+        );
+        assert!(parse_mpv_opts("").is_empty());
+        assert!(parse_mpv_opts("novalue").is_empty());
+    }
 }
