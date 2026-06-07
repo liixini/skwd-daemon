@@ -80,6 +80,8 @@ async fn apply_static_inner(
     let _apply_guard = apply_lock().lock().await;
     let lock_wait_ms = lock_wait.elapsed().as_millis() as u64;
     let is_kde = is_kde();
+    let resolved_path = resolve_static_or_optimized(path, config);
+    let path = resolved_path.as_str();
     let prev_image = read_prev_transition_image(&config.cache_dir()).await;
     let prev_was_we = linux_we_running().await;
 
@@ -955,7 +957,11 @@ pub async fn read_prev_transition_image(cache_dir: &Path) -> Option<String> {
             .get("path")
             .and_then(|v| v.as_str())
             .filter(|p| Path::new(p).exists())
-            .map(std::string::ToString::to_string),
+            .map(std::string::ToString::to_string)
+            .or_else(|| {
+                let snapshot = cache_dir.join("wallpaper/static-render.jpg");
+                snapshot.exists().then(|| snapshot.display().to_string())
+            }),
         "we" => state
             .get("path")
             .and_then(|v| v.as_str())
