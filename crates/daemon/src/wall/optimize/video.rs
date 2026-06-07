@@ -148,6 +148,7 @@ pub async fn start(
         let state = state.clone();
         let video_dir = video_dir.clone();
         let we_dir = we_dir.clone();
+        let cache_dir = cache_dir.clone();
         let trash_dir = trash_dir.clone();
         let converted_dir = converted_dir.clone();
         let crf = preset.crf;
@@ -210,6 +211,18 @@ pub async fn start(
                         let _ = db::delete_meta_by_we_id(&conn, we_id);
                     }
                     drop(conn);
+
+                    let new_name = Path::new(&conv.final_dest)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&name)
+                        .to_string();
+                    if new_name != name {
+                        crate::wall::apply::repoint_optimized_wallpaper(
+                            &cache_dir, &name, &new_name, &conv.final_dest,
+                        )
+                        .await;
+                    }
 
                     let mut s = state.lock().await;
                     s.succeeded += 1;

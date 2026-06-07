@@ -61,6 +61,13 @@ pub async fn optimize_single_inline(
     }
 
     let final_path = wall_dir.join(&opt.new_name);
+    crate::wall::apply::repoint_optimized_wallpaper(
+        &cache_dir,
+        &opt.old_name,
+        &opt.new_name,
+        &final_path.display().to_string(),
+    )
+    .await;
     Ok((opt.new_name, final_path))
 }
 
@@ -171,6 +178,7 @@ pub async fn start(
         let event_tx = event_tx.clone();
         let state = state.clone();
         let wall_dir = wall_dir.clone();
+        let cache_dir = cache_dir.clone();
         let trash_dir = trash_dir.clone();
         let staging_dir = staging_dir.clone();
         let quality = preset.quality;
@@ -211,6 +219,13 @@ pub async fn start(
                         let _ = event_tx.send(make_event("skwd.wall.file_renamed", serde_json::json!({
                             "old_name": opt.old_name, "new_name": opt.new_name
                         })));
+                        crate::wall::apply::repoint_optimized_wallpaper(
+                            &cache_dir,
+                            &opt.old_name,
+                            &opt.new_name,
+                            &wall_dir.join(&opt.new_name).display().to_string(),
+                        )
+                        .await;
                     }
 
                     let mut s = state.lock().await;

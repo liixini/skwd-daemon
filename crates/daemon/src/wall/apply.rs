@@ -145,6 +145,20 @@ async fn apply_static_inner(
         };
         let target_is_wildcard = target_outs.iter().any(|o| o == "*");
 
+        let stable_dir = config.cache_dir().join("wallpaper");
+        let _ = tokio::fs::create_dir_all(&stable_dir).await;
+        let render_cur = stable_dir.join("static-render.jpg");
+        let render_prev = stable_dir.join("static-render-prev.jpg");
+        if render_cur.exists() {
+            let _ = tokio::fs::copy(&render_cur, &render_prev).await;
+        }
+        let render_src = resolve_static_or_optimized(path, config);
+        let render_to = if tokio::fs::copy(&render_src, &render_cur).await.is_ok() {
+            render_cur.display().to_string()
+        } else {
+            render_src
+        };
+
         let pre_state = read_outputs_state(&config.cache_dir()).await;
         let prev_wildcard_static: Option<String> = if !target_is_wildcard {
             pre_state
@@ -203,14 +217,15 @@ async fn apply_static_inner(
             None
         } else {
             prev_image
-                .as_deref()
-                .filter(|p| *p != path && Path::new(p).exists())
-                .map(std::string::ToString::to_string)
+                .clone()
+                .filter(|p| Path::new(p).exists())
+                .or_else(|| render_prev.exists().then(|| render_prev.display().to_string()))
+                .filter(|p| *p != render_to)
         };
 
         if let Some(prev) = prev_for_transition.as_deref() {
             let thumbs =
-                pick_thumbs(neighbors, &config.wallpaper_dir(), &[prev, path], 20).await;
+                pick_thumbs(neighbors, &config.wallpaper_dir(), &[prev, render_to.as_str()], 20).await;
             let shader = config.transition.shader.clone();
             let dur_ms = config.transition.duration_ms;
             for out in &target_outs {
@@ -218,7 +233,7 @@ async fn apply_static_inner(
                     &bin,
                     out,
                     prev,
-                    path,
+                    &render_to,
                     &shader,
                     dur_ms,
                     &thumbs,
@@ -231,7 +246,7 @@ async fn apply_static_inner(
             }
         }
 
-        ensure_steady_image_paper(&still_bin, &target_outs, path, config.display.fill_mode).await;
+        ensure_steady_image_paper(&still_bin, &target_outs, &render_to, config.display.fill_mode).await;
         drop_video_persist_papers_for(&target_outs).await;
         drop_persist_papers_for(&target_outs).await;
         let prev_steady = std::mem::take(&mut fleet().lock().await.steady);
@@ -273,6 +288,19 @@ async fn apply_static_inner(
         "applied static wallpaper"
     );
     Ok(())
+}
+
+pub(crate) fn resolve_static_or_optimized(path: &str, config: &Config) -> String {
+    if path.is_empty() || Path::new(path).exists() {
+        return path.to_string();
+    }
+    if let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
+        let webp = config.wallpaper_dir().join(format!("{stem}.webp"));
+        if webp.exists() {
+            return webp.display().to_string();
+        }
+    }
+    path.to_string()
 }
 
 pub async fn restore(config: &Config) -> anyhow::Result<String> {
@@ -332,6 +360,7 @@ pub async fn restore(config: &Config) -> anyhow::Result<String> {
                 .collect();
             last_id = match wp_type.as_str() {
                 "static" if !path.is_empty() => {
+                    let path = resolve_static_or_optimized(&path, config);
                     apply_static_inner(&path, &outputs_arg, &[], &[], config, true).await?;
                     path
                 }
@@ -365,8 +394,9 @@ pub async fn restore(config: &Config) -> anyhow::Result<String> {
             if path.is_empty() {
                 anyhow::bail!("no path in state");
             }
-            apply_static_inner(path, &[], &[], &[], config, true).await?;
-            Ok(path.to_string())
+            let path = resolve_static_or_optimized(path, config);
+            apply_static_inner(&path, &[], &[], &[], config, true).await?;
+            Ok(path)
         }
         "video" => {
             let path = state.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -1114,6 +1144,58 @@ pub async fn read_outputs_state(cache_dir: &Path) -> serde_json::Value {
     }
 }
 
+pub async fn repoint_optimized_wallpaper(
+    cache_dir: &Path,
+    old_name: &str,
+    new_name: &str,
+    new_path: &str,
+) {
+    if old_name == new_name {
+        return;
+    }
+    let basename_is_old = |entry: &serde_json::Value| {
+        entry
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|p| Path::new(p).file_name())
+            .and_then(|s| s.to_str())
+            == Some(old_name)
+    };
+
+    {
+        let _guard = outputs_state_lock().lock().await;
+        let state_path = cache_dir.join("outputs.json");
+        if let Ok(text) = tokio::fs::read_to_string(&state_path).await
+            && let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text)
+        {
+            let mut changed = false;
+            if let Some(map) = v.as_object_mut() {
+                for entry in map.values_mut() {
+                    if basename_is_old(entry) {
+                        entry["path"] = serde_json::json!(new_path);
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                write_outputs_state_atomic(&state_path, &v.to_string()).await;
+            }
+        }
+    }
+
+    let last_path = cache_dir.join("last-wallpaper.json");
+    if let Ok(text) = tokio::fs::read_to_string(&last_path).await
+        && let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text)
+        && basename_is_old(&v)
+    {
+        v["path"] = serde_json::json!(new_path);
+        if v.get("name").is_some() {
+            v["name"] = serde_json::json!(new_name);
+        }
+        let _ = tokio::fs::write(&last_path, v.to_string()).await;
+    }
+}
+
 fn is_kde() -> bool {
     std::env::var("XDG_CURRENT_DESKTOP")
         .map(|d| {
@@ -1140,6 +1222,78 @@ mod tests {
             read_outputs_state(dir.path()).await,
             serde_json::json!({ "DP-1": "wall.png" })
         );
+    }
+
+    #[tokio::test]
+    async fn repoint_optimized_wallpaper_updates_outputs_and_last_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path();
+        let wall = "/home/u/Pictures/Wallpapers";
+        std::fs::write(
+            cache.join("outputs.json"),
+            format!(r#"{{"DP-1":{{"type":"static","path":"{wall}/x.jpg"}},"DP-2":{{"type":"static","path":"{wall}/other.png"}}}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            cache.join("last-wallpaper.json"),
+            format!(r#"{{"type":"static","name":"x.jpg","path":"{wall}/x.jpg"}}"#),
+        )
+        .unwrap();
+
+        repoint_optimized_wallpaper(cache, "x.jpg", "x.webp", &format!("{wall}/x.webp")).await;
+
+        let outputs = read_outputs_state(cache).await;
+        assert_eq!(outputs["DP-1"]["path"], format!("{wall}/x.webp"), "applied output repointed to webp");
+        assert_eq!(outputs["DP-2"]["path"], format!("{wall}/other.png"), "untouched output unchanged");
+
+        let last: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cache.join("last-wallpaper.json")).unwrap()).unwrap();
+        assert_eq!(last["path"], format!("{wall}/x.webp"));
+        assert_eq!(last["name"], "x.webp");
+    }
+
+    #[test]
+    fn resolve_static_or_optimized_falls_back_to_webp_when_original_trashed() {
+        let dir = tempfile::tempdir().unwrap();
+        let wall = dir.path().join("walls");
+        std::fs::create_dir_all(&wall).unwrap();
+        let mut cfg = Config::default();
+        cfg.paths.wallpaper = Some(wall.display().to_string());
+
+        let jpg = wall.join("x.jpg");
+        let webp = wall.join("x.webp");
+
+        std::fs::write(&jpg, b"j").unwrap();
+        assert_eq!(
+            resolve_static_or_optimized(&jpg.display().to_string(), &cfg),
+            jpg.display().to_string(),
+            "existing original is kept"
+        );
+
+        std::fs::remove_file(&jpg).unwrap();
+        std::fs::write(&webp, b"w").unwrap();
+        assert_eq!(
+            resolve_static_or_optimized(&jpg.display().to_string(), &cfg),
+            webp.display().to_string(),
+            "trashed original falls back to same-stem webp"
+        );
+
+        std::fs::remove_file(&webp).unwrap();
+        assert_eq!(
+            resolve_static_or_optimized(&jpg.display().to_string(), &cfg),
+            jpg.display().to_string(),
+            "no webp -> returns original unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn repoint_optimized_wallpaper_noop_when_name_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path();
+        std::fs::write(cache.join("outputs.json"), r#"{"DP-1":{"type":"static","path":"/w/x.png"}}"#).unwrap();
+        repoint_optimized_wallpaper(cache, "x.png", "x.png", "/w/x.png").await;
+        let outputs = read_outputs_state(cache).await;
+        assert_eq!(outputs["DP-1"]["path"], "/w/x.png");
     }
 
     #[test]
