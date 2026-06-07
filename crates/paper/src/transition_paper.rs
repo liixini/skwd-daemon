@@ -609,6 +609,10 @@ impl App {
             loc_fit_offset,
             fit_vao,
         });
+        self.old_pixels = Vec::new();
+        self.new_pixels = Vec::new();
+        self.thumbs = Vec::new();
+        unsafe { libc::malloc_trim(0) };
         self.start_time = Some(Instant::now());
         Ok(())
     }

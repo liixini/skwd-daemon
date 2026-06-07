@@ -153,8 +153,19 @@ pub async fn run() -> anyhow::Result<()> {
                 match crate::config::load() {
                     Ok(new_cfg) => {
                         info!("[config] reloaded from {}", config_path.display());
-                        let prev_engine = state.config.read().await.paper.engine;
+                        let (prev_engine, prev_niri) = {
+                            let c = state.config.read().await;
+                            (c.paper.engine, c.niri.clone())
+                        };
                         let new_engine = new_cfg.paper.engine;
+                        let backdrop_changed = prev_niri.overview_backdrop != new_cfg.niri.overview_backdrop
+                            || prev_niri.overview_backdrop_blur_enabled != new_cfg.niri.overview_backdrop_blur_enabled
+                            || prev_niri.overview_backdrop_blur != new_cfg.niri.overview_backdrop_blur
+                            || prev_niri.backdrop != new_cfg.niri.backdrop
+                            || prev_niri.backdrop_follow_wallpaper != new_cfg.niri.backdrop_follow_wallpaper
+                            || prev_niri.backdrop_auto_theme != new_cfg.niri.backdrop_auto_theme
+                            || prev_niri.backdrop_theme != new_cfg.niri.backdrop_theme
+                            || prev_niri.backdrop_dim != new_cfg.niri.backdrop_dim;
                         let release_browser = state.steam_state.lock().await.apply_runtime_config(&new_cfg);
                         if release_browser {
                             info!("[config] steam backend left the client, releasing steamworks browser");
@@ -174,6 +185,20 @@ pub async fn run() -> anyhow::Result<()> {
                                     crate::wall::apply::reapply_statics_for_engine_change(&cfg_snapshot).await
                                 {
                                     warn!("[config] engine-change re-apply failed: {e}");
+                                }
+                            });
+                        }
+
+                        if backdrop_changed {
+                            info!("[config] niri overview backdrop settings changed, re-rendering");
+                            let cfg = state.config.read().await.clone();
+                            tokio::spawn(async move {
+                                if cfg.niri.overview_backdrop {
+                                    if let Some(src) = crate::wall::overview_backdrop::resolve_source(&cfg).await {
+                                        crate::wall::overview_backdrop::refresh(&src, &cfg).await;
+                                    }
+                                } else {
+                                    crate::wall::overview_backdrop::refresh("", &cfg).await;
                                 }
                             });
                         }
@@ -220,6 +245,44 @@ pub(super) fn we_removed_payload(we_id: &str) -> serde_json::Value {
     serde_json::json!({ "we_id": we_id })
 }
 
+async fn auto_recolor_new(
+    state: &SharedState,
+    tx: &broadcast::Sender<String>,
+    config: &crate::config::Config,
+    src_name: &str,
+    src_path: &std::path::Path,
+) {
+    let theme = config.effects.auto_recolor_theme().to_string();
+    let params = serde_json::json!({ "theme": theme });
+    let sfx = wall::effects::native::suffix("theme", &params);
+    let Ok(out) = wall::effects::native::library_path(src_path, &sfx) else {
+        return;
+    };
+    let wall_dir = config.wallpaper_dir();
+    let out_name = out.strip_prefix(&wall_dir).map_or_else(
+        |_| out.file_name().map_or_else(String::new, |n| n.to_string_lossy().to_string()),
+        |p| p.to_string_lossy().to_string(),
+    );
+
+    {
+        let mut set = state.suppress_set.lock().unwrap();
+        set.insert(out_name.clone());
+    }
+    let render_res = wall::effects::native::render("theme", src_path, &params, &out).await;
+    {
+        let mut set = state.suppress_set.lock().unwrap();
+        set.remove(&out_name);
+    }
+
+    match render_res {
+        Ok(()) => {
+            info!("[server] auto-recolored {src_name} -> {out_name} ({theme})");
+            cache::process_single(config, state.db_shared.clone(), tx, &out_name, &out, "static").await;
+        }
+        Err(e) => warn!("[server] auto-recolor failed for {src_name}: {e}"),
+    }
+}
+
 async fn run_watcher_loop(
     mut rx: mpsc::UnboundedReceiver<watcher::FsEvent>,
     tx: broadcast::Sender<String>,
@@ -249,6 +312,7 @@ async fn run_watcher_loop(
                 let suppress = state.suppress_set.clone();
                 let db = state.db_shared.clone();
 
+                let (final_name, final_path): (String, std::path::PathBuf) =
                 if wp_type == "static" && config.performance.auto_optimize_images && optimize::should_optimize(name) {
                     let stem = std::path::Path::new(name)
                         .file_stem()
@@ -262,24 +326,35 @@ async fn run_watcher_loop(
                         set.insert(new_name.clone());
                     }
 
-                    match optimize::optimize_single_inline(&*state.runner, &config, &db, path, name).await {
-                        Ok((final_name, final_path)) => {
-                            info!("[server] optimized {name} -> {final_name}");
-                            cache::process_single(&config, db, &tx, &final_name, &final_path, wp_type).await;
+                    let result = match optimize::optimize_single_inline(&*state.runner, &config, &db, path, name).await {
+                        Ok((fname, fpath)) => {
+                            info!("[server] optimized {name} -> {fname}");
+                            cache::process_single(&config, db.clone(), &tx, &fname, &fpath, wp_type).await;
+                            (fname, fpath)
                         }
                         Err(e) => {
                             warn!("[server] optimize failed for {name}: {e}, caching original");
-                            cache::process_single(&config, db, &tx, name, path, wp_type).await;
+                            cache::process_single(&config, db.clone(), &tx, name, path, wp_type).await;
+                            (name.clone(), path.clone())
                         }
-                    }
+                    };
 
                     {
                         let mut set = suppress.lock().unwrap();
                         set.remove(name);
                         set.remove(&new_name);
                     }
+                    result
                 } else {
-                    cache::process_single(&config, db, &tx, name, path, wp_type).await;
+                    cache::process_single(&config, db.clone(), &tx, name, path, wp_type).await;
+                    (name.clone(), path.clone())
+                };
+
+                if wp_type == "static"
+                    && config.effects.auto_recolor
+                    && !final_name.contains("effects/")
+                {
+                    auto_recolor_new(&state, &tx, &config, &final_name, &final_path).await;
                 }
             }
             watcher::FsEvent::FileRemoved { name, file_type } => {

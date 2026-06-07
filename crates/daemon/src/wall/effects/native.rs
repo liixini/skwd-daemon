@@ -50,6 +50,9 @@ pub fn library_path(input: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
 }
 
 pub fn suffix(effect: &str, params: &Value) -> String {
+    if let Some(def) = super::registry::find(effect) {
+        return def.suffix.map_or_else(|| effect.to_string(), |f| f(params));
+    }
     match effect {
         "theme" => {
             let theme = params
@@ -65,21 +68,28 @@ pub fn suffix(effect: &str, params: &Value) -> String {
     }
 }
 
+fn with_cat(mut schema: Value, category: &str) -> Value {
+    schema["category"] = Value::String(category.to_string());
+    schema
+}
+
 pub fn list() -> Value {
-    json!([
-        theme_schema(),
-        simple_schema("invert",    "Invert",    "Invert every colour channel."),
-        simple_schema("flip",      "Flip",      "Flip the image vertically."),
-        simple_schema("mirror",    "Mirror",    "Mirror the image horizontally."),
-        simple_schema("grayscale", "Grayscale", "Drop colour, keep luminance."),
-        brightness_schema(),
-        contrast_schema(),
-        saturation_schema(),
-        gamma_schema(),
-        pixelate_schema(),
-        border_schema(),
-        round_schema(),
-    ])
+    let mut effects = vec![
+        with_cat(theme_schema(), "Colour"),
+        with_cat(simple_schema("invert",    "Invert",    "Invert every colour channel."), "Adjust"),
+        with_cat(simple_schema("flip",      "Flip",      "Flip the image vertically."), "Transform"),
+        with_cat(simple_schema("mirror",    "Mirror",    "Mirror the image horizontally."), "Transform"),
+        with_cat(simple_schema("grayscale", "Grayscale", "Drop colour, keep luminance."), "Adjust"),
+        with_cat(brightness_schema(), "Adjust"),
+        with_cat(contrast_schema(), "Adjust"),
+        with_cat(saturation_schema(), "Adjust"),
+        with_cat(gamma_schema(), "Adjust"),
+        with_cat(pixelate_schema(), "Stylize"),
+        with_cat(border_schema(), "Transform"),
+        with_cat(round_schema(), "Transform"),
+    ];
+    effects.extend(super::registry::schemas());
+    Value::Array(effects)
 }
 
 pub async fn render(effect: &str, input: &Path, params: &Value, output: &Path) -> anyhow::Result<()> {
@@ -92,7 +102,10 @@ pub async fn render(effect: &str, input: &Path, params: &Value, output: &Path) -
         let img = ImageReader::open(&input)?
             .with_guessed_format()?
             .decode()?;
-        let out = render_sync(&effect, img, &params)?;
+        let out = match super::registry::find(&effect) {
+            Some(def) => (def.render)(img, &params)?,
+            None => render_sync(&effect, img, &params)?,
+        };
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -422,6 +435,10 @@ fn apply_corner_mask(img: &mut RgbaImage, radius: u32) {
     }
 }
 
+pub fn theme_image(img: DynamicImage, theme: &str) -> anyhow::Result<DynamicImage> {
+    apply_theme(img, &json!({ "theme": theme }))
+}
+
 fn apply_theme(img: DynamicImage, params: &Value) -> anyhow::Result<DynamicImage> {
     let name = params
         .get("theme")
@@ -553,5 +570,16 @@ mod tests {
                 assert!(p["type"].is_string(), "param missing type in {}", effect["id"]);
             }
         }
+    }
+
+    #[test]
+    fn every_effect_has_nonempty_category() {
+        let v = list();
+        for effect in v.as_array().unwrap() {
+            let cat = effect["category"].as_str().unwrap_or("");
+            assert!(!cat.is_empty(), "effect {} missing category", effect["id"]);
+        }
+        let theme = v.as_array().unwrap().iter().find(|e| e["id"] == "theme").unwrap();
+        assert_eq!(theme["category"], "Colour");
     }
 }

@@ -13,6 +13,9 @@ pub fn backdrop_path(config: &Config) -> PathBuf {
 }
 
 pub async fn resolve_source(config: &Config) -> Option<String> {
+    if let Some(b) = config.niri.backdrop_source() {
+        return Some(b.to_string());
+    }
     let cache_dir = config.cache_dir();
     let state_path = cache_dir.join("last-wallpaper.json");
     let text = tokio::fs::read_to_string(&state_path).await.ok()?;
@@ -66,16 +69,37 @@ pub async fn refresh(source: &str, config: &Config) {
     }
 
     let blur = config.niri.overview_backdrop_blur.max(1) as f32;
+    let blur_enabled = config.niri.overview_backdrop_blur_enabled;
+    let theme = config.niri.backdrop_theme_name().map(str::to_string);
+    let dim = config.niri.backdrop_dim.min(100);
     let src = source.to_string();
     let dst = backdrop_path(config);
 
     let blur_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let img = ImageReader::open(&src)?.with_guessed_format()?.decode()?;
-        let blurred = image::imageops::blur(&img.to_rgb8(), blur);
+        let mut img = ImageReader::open(&src)?.with_guessed_format()?.decode()?;
+        if let Some(t) = theme.as_deref() {
+            match crate::wall::effects::native::theme_image(img.clone(), t) {
+                Ok(themed) => img = themed,
+                Err(e) => tracing::warn!("overview-backdrop: theme '{t}' failed: {e}"),
+            }
+        }
+        let mut out = if blur_enabled {
+            image::imageops::blur(&img.to_rgb8(), blur)
+        } else {
+            img.to_rgb8()
+        };
+        if dim > 0 {
+            let keep = 100 - dim;
+            for px in out.pixels_mut() {
+                px[0] = u8::try_from(u32::from(px[0]) * keep / 100).unwrap_or(255);
+                px[1] = u8::try_from(u32::from(px[1]) * keep / 100).unwrap_or(255);
+                px[2] = u8::try_from(u32::from(px[2]) * keep / 100).unwrap_or(255);
+            }
+        }
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        blurred.save(&dst)?;
+        out.save(&dst)?;
         Ok(())
     })
     .await;

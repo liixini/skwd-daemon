@@ -25,6 +25,8 @@ pub struct Config {
     #[serde(default)]
     pub steam: SteamConfig,
     #[serde(default)]
+    pub effects: EffectsConfig,
+    #[serde(default)]
     pub integrations: Vec<Integration>,
     #[serde(default, rename = "wallpaperMute")]
     pub wallpaper_mute: Option<bool>,
@@ -441,6 +443,25 @@ impl SteamConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct EffectsConfig {
+    #[serde(default, rename = "autoRecolor")]
+    pub auto_recolor: bool,
+    #[serde(default, rename = "autoTheme")]
+    pub auto_theme: String,
+}
+
+impl EffectsConfig {
+    #[must_use]
+    pub fn auto_recolor_theme(&self) -> &str {
+        if self.auto_theme.trim().is_empty() {
+            "Catppuccin"
+        } else {
+            self.auto_theme.trim()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum PostProcessEntry {
@@ -494,8 +515,48 @@ pub struct Integration {
 pub struct NiriConfig {
     #[serde(default, rename = "overviewBackdrop")]
     pub overview_backdrop: bool,
+    #[serde(default = "default_true", rename = "overviewBackdropBlurEnabled")]
+    pub overview_backdrop_blur_enabled: bool,
     #[serde(default = "default_backdrop_blur", rename = "overviewBackdropBlur")]
     pub overview_backdrop_blur: u32,
+    #[serde(default)]
+    pub backdrop: String,
+    #[serde(default, rename = "backdropFollowWallpaper")]
+    pub backdrop_follow_wallpaper: bool,
+    #[serde(default, rename = "backdropAutoTheme")]
+    pub backdrop_auto_theme: bool,
+    #[serde(default, rename = "backdropTheme")]
+    pub backdrop_theme: String,
+    #[serde(default, rename = "backdropDim")]
+    pub backdrop_dim: u32,
+}
+
+impl NiriConfig {
+    #[must_use]
+    pub fn backdrop_source(&self) -> Option<&str> {
+        if self.backdrop_follow_wallpaper {
+            return None;
+        }
+        let p = self.backdrop.trim();
+        if p.is_empty() || !std::path::Path::new(p).exists() {
+            None
+        } else {
+            Some(p)
+        }
+    }
+
+    #[must_use]
+    pub fn backdrop_theme_name(&self) -> Option<&str> {
+        if !self.backdrop_auto_theme {
+            return None;
+        }
+        let t = self.backdrop_theme.trim();
+        if t.is_empty() {
+            Some("Catppuccin")
+        } else {
+            Some(t)
+        }
+    }
 }
 
 fn default_backdrop_blur() -> u32 { 30 }
@@ -977,6 +1038,31 @@ mod tests {
         let mut c = Config::default();
         c.paths.wallpaper = Some("   ".into());
         assert_eq!(c.wallpaper_dir(), home().join("Pictures/Wallpapers"));
+    }
+
+    #[test]
+    fn niri_backdrop_source_requires_existing_path() {
+        let mut n = NiriConfig::default();
+        assert_eq!(n.backdrop_source(), None, "unset -> auto");
+        n.backdrop = "  ".into();
+        assert_eq!(n.backdrop_source(), None, "blank -> auto");
+        n.backdrop = "/no/such/file.png".into();
+        assert_eq!(n.backdrop_source(), None, "missing path -> auto");
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("bd.png");
+        std::fs::write(&f, b"x").unwrap();
+        n.backdrop = f.display().to_string();
+        assert_eq!(n.backdrop_source(), Some(f.display().to_string().as_str()));
+    }
+
+    #[test]
+    fn effects_auto_recolor_theme_defaults_to_catppuccin() {
+        let mut e = EffectsConfig::default();
+        assert_eq!(e.auto_recolor_theme(), "Catppuccin", "unset -> default theme");
+        e.auto_theme = "  ".into();
+        assert_eq!(e.auto_recolor_theme(), "Catppuccin", "blank -> default theme");
+        e.auto_theme = "Tokyo Night".into();
+        assert_eq!(e.auto_recolor_theme(), "Tokyo Night", "explicit theme wins");
     }
 
     #[test]

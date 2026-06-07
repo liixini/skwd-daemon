@@ -208,6 +208,23 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
             Response::ok(req.id, serde_json::json!({"ok": true}))
         }
 
+        "backdrop" => {
+            let path = req.str_param("path", "").to_string();
+            let config = state.config.read().await.clone();
+            let source = if path.trim().is_empty() {
+                super::overview_backdrop::resolve_source(&config).await
+            } else {
+                Some(path)
+            };
+            match source {
+                Some(src) => {
+                    super::overview_backdrop::refresh(&src, &config).await;
+                    Response::ok(req.id, serde_json::json!({"backdrop": src}))
+                }
+                None => Response::ok(req.id, serde_json::json!({"backdrop": null})),
+            }
+        }
+
         "restore" => {
             let config = state.config.read().await.clone();
             match apply::restore(&config).await {

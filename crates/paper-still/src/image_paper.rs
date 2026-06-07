@@ -418,6 +418,7 @@ impl App {
             s.surface.damage_buffer(0, 0, bw as i32, bh as i32);
             s.surface.commit();
         }
+        unsafe { libc::malloc_trim(0) };
         tracing::info!(path = %cmd.path, w = new_w, h = new_h, "image persist: swapped");
     }
 }

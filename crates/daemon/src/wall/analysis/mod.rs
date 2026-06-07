@@ -435,6 +435,12 @@ pub async fn retag_one(
                 "UPDATE meta SET analysis_error = ?1 WHERE key = ?2",
                 rusqlite::params![err_msg, key],
             );
+            drop(conn);
+
+            let _ = event_tx.send(make_event(
+                "skwd.wall.analysis.item_failed",
+                serde_json::json!({ "key": key, "error": err_msg }),
+            ));
             Err(e)
         }
     }
