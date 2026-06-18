@@ -289,6 +289,14 @@ pub fn set_favourite(conn: &Connection, key: &str, favourite: bool) -> rusqlite:
     Ok(changed > 0)
 }
 
+pub fn analysis_targets(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT key, thumb FROM meta WHERE thumb IS NOT NULL AND thumb != '' ORDER BY key",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    Ok(rows.flatten().collect())
+}
+
 pub fn update_analysis(
     conn: &Connection,
     key: &str,
@@ -488,6 +496,22 @@ mod tests {
     fn migrate_is_idempotent() {
         let conn = mem();
         assert!(migrate(&conn).is_ok());
+    }
+
+    #[test]
+    fn analysis_targets_returns_row_keys_and_thumbs_skips_empty() {
+        let conn = mem();
+        upsert_cache_entry(&conn, "k1", "static", "a", "/c/a.webp", "sm", "", "", 1, 99, 0, 0).unwrap();
+        upsert_cache_entry(&conn, "k2", "static", "b", "/c/b.webp", "sm", "", "", 1, 99, 0, 0).unwrap();
+        upsert_cache_entry(&conn, "k3", "static", "c", "", "sm", "", "", 1, 99, 0, 0).unwrap();
+        let t = analysis_targets(&conn).unwrap();
+        assert_eq!(
+            t,
+            vec![
+                ("k1".to_string(), "/c/a.webp".to_string()),
+                ("k2".to_string(), "/c/b.webp".to_string()),
+            ]
+        );
     }
 
     #[test]

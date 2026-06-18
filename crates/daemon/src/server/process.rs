@@ -60,6 +60,13 @@ impl ManagedProcess {
         self.launch_with_env(&[]);
     }
 
+    fn command_override(&self) -> Option<PathBuf> {
+        if self.label != "wall-ui" {
+            return None;
+        }
+        std::env::var_os("SKWD_WALL_BIN").map(PathBuf::from)
+    }
+
     pub fn launch_with_env(&mut self, extra_env: &[(&str, String)]) {
         if self.dry_run || is_headless() {
             return;
@@ -67,14 +74,24 @@ impl ManagedProcess {
         if self.is_running() {
             return;
         }
-        let _ = std::process::Command::new("pkill")
-            .arg("-f")
-            .arg(format!("quickshell .*{}", self.shell_qml.display()))
-            .status();
-        info!("launching {}: quickshell -p {}", self.label, self.shell_qml.display());
-        let install_dir = self.shell_qml.parent().unwrap_or_else(|| Path::new("/usr/share/skwd-wall"));
-        let mut cmd = tokio::process::Command::new("quickshell");
-        cmd.arg("-p").arg(&self.shell_qml).env(self.env_key, install_dir);
+        let mut cmd = if let Some(bin) = self.command_override() {
+            let _ = std::process::Command::new("pkill")
+                .arg("-f")
+                .arg(format!("^{}", bin.display()))
+                .status();
+            info!("launching {}: {}", self.label, bin.display());
+            tokio::process::Command::new(bin)
+        } else {
+            let _ = std::process::Command::new("pkill")
+                .arg("-f")
+                .arg(format!("quickshell .*{}", self.shell_qml.display()))
+                .status();
+            info!("launching {}: quickshell -p {}", self.label, self.shell_qml.display());
+            let install_dir = self.shell_qml.parent().unwrap_or_else(|| Path::new("/usr/share/skwd-wall"));
+            let mut c = tokio::process::Command::new("quickshell");
+            c.arg("-p").arg(&self.shell_qml).env(self.env_key, install_dir);
+            c
+        };
         cmd.kill_on_drop(true);
         for (k, v) in extra_env {
             cmd.env(k, v);

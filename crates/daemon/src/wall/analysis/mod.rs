@@ -21,16 +21,17 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
     let method = req.method.strip_prefix("analysis.").unwrap_or(&req.method);
     match method {
         "start" => {
+            let force = req.bool_param("force", false);
             let config = state.config.read().await.clone();
             let analysis_state = state.analysis_state.clone();
             let db = state.db_shared.clone();
             let tx = event_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = start(&config, db, tx, analysis_state).await {
+                if let Err(e) = start(&config, db, tx, analysis_state, force).await {
                     warn!("analysis start failed: {e}");
                 }
             });
-            Response::ok(req.id, serde_json::json!({"started": true}))
+            Response::ok(req.id, serde_json::json!({"started": true, "force": force}))
         }
 
         "stop" => {
@@ -131,6 +132,7 @@ pub async fn start(
     db: Arc<Mutex<Connection>>,
     event_tx: broadcast::Sender<String>,
     state: Arc<Mutex<AnalysisState>>,
+    force: bool,
 ) -> anyhow::Result<()> {
     {
         let s = state.lock().await;
@@ -188,35 +190,21 @@ pub async fn start(
         }
     }
 
-    let cache_dir = config.cache_dir().join("wallpaper");
-    let thumbs_dirs = vec![
-        cache_dir.join("thumbs"),
-        cache_dir.join("we-thumbs"),
-        cache_dir.join("video-thumbs"),
-    ];
-
-    let (existing_tags, existing_colors, failed_keys) = {
+    let (existing_tags, existing_colors, failed_keys, targets) = {
         let conn = db.lock().await;
-        load_existing(&conn, &ollama_model)
+        let (t, c, f) = load_existing(&conn);
+        (t, c, f, db::analysis_targets(&conn).unwrap_or_default())
     };
 
-    let mut thumbs = Vec::new();
-    for dir in &thumbs_dirs {
-        collect_thumbs(dir, &mut thumbs).await;
-    }
-    thumbs.sort();
+    let total_thumbs = targets.len();
 
-    let total_thumbs = thumbs.len();
-
-    
     let mut queue: Vec<(String, String, bool)> = Vec::new();
-    for path in &thumbs {
-        let key = thumb_to_key(path);
-        let has_tags = existing_tags.contains(&key);
-        let has_colors = existing_colors.contains(&key);
-        let was_failed = failed_keys.contains(&key);
-        if !has_tags || !has_colors || was_failed {
-            queue.push((path.clone(), key, was_failed));
+    for (key, thumb) in &targets {
+        let has_tags = existing_tags.contains(key);
+        let has_colors = existing_colors.contains(key);
+        let was_failed = failed_keys.contains(key);
+        if force || !has_tags || !has_colors || was_failed {
+            queue.push((thumb.clone(), key.clone(), was_failed));
         }
     }
     let retry_count = queue.iter().filter(|(_, _, f)| *f).count();
@@ -271,7 +259,7 @@ pub async fn start(
                 let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into());
                 let weather_json = serde_json::to_string(&weather).unwrap_or_else(|_| "[]".into());
                 let conn = db.lock().await;
-                let _ = db::update_analysis(
+                match db::update_analysis(
                     &conn,
                     key,
                     Some(&tags_json),
@@ -280,9 +268,11 @@ pub async fn start(
                     Some(hue),
                     Some(sat),
                     Some(&weather_json),
-                );
-                
-                
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => warn!("analysis: 0 rows updated for key '{key}' (not in db?)"),
+                    Err(e) => warn!("analysis: db write failed for key '{key}': {e}"),
+                }
                 let _ = conn.execute(
                     "UPDATE meta SET analysis_error = NULL WHERE key = ?1",
                     rusqlite::params![key],
@@ -404,7 +394,7 @@ pub async fn retag_one(
             let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into());
             let weather_json = serde_json::to_string(&weather).unwrap_or_else(|_| "[]".into());
             let conn = db.lock().await;
-            let _ = db::update_analysis(
+            match db::update_analysis(
                 &conn,
                 key,
                 Some(&tags_json),
@@ -413,7 +403,11 @@ pub async fn retag_one(
                 Some(hue),
                 Some(sat),
                 Some(&weather_json),
-            );
+            ) {
+                Ok(true) => {}
+                Ok(false) => warn!("retag_one: 0 rows updated for key '{key}' (not in db?)"),
+                Err(e) => warn!("retag_one: db write failed for key '{key}': {e}"),
+            }
             let _ = conn.execute(
                 "UPDATE meta SET analysis_error = NULL, tags_raw = ?1 WHERE key = ?2",
                 rusqlite::params![tags_json, key],
@@ -447,6 +441,13 @@ pub async fn retag_one(
 }
 
 
+fn transcode_to_png(raw: &[u8]) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(raw).ok()?;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Png).ok()?;
+    Some(buf.into_inner())
+}
+
 async fn analyze_one(
     thumb_path: &str,
     ollama_url: &str,
@@ -454,9 +455,15 @@ async fn analyze_one(
     prompt: &str,
     client: &reqwest::Client,
 ) -> anyhow::Result<(i64, i64, Vec<String>, String, Vec<String>)> {
-    let image_bytes = tokio::fs::read(thumb_path)
+    let raw = tokio::fs::read(thumb_path)
         .await
         .map_err(|e| anyhow::anyhow!("read thumb: {e}"))?;
+    let raw_for_task = raw.clone();
+    let transcoded = tokio::task::spawn_blocking(move || transcode_to_png(&raw_for_task))
+        .await
+        .ok()
+        .flatten();
+    let image_bytes = transcoded.unwrap_or(raw);
     use base64::Engine as _;
     let image_b64 = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
     if image_b64.is_empty() {
@@ -561,7 +568,7 @@ fn parse_tags_and_weather(text: &str) -> (Vec<String>, Vec<String>) {
 
     let mut weather = Vec::new();
     if let Some(wl) = weather_line {
-        for raw in wl.split(',') {
+        fUpdates handling surrounding Ollama scanningor raw in wl.split(',') {
             let w = raw.trim().to_lowercase().trim_end_matches('.').to_string();
             if !w.is_empty() && w.len() <= 24 && !weather.contains(&w) {
                 weather.push(w);
@@ -606,19 +613,14 @@ fn format_eta(seconds: f64) -> String {
     }
 }
 
-fn thumb_to_key(path: &str) -> String {
-    let fname = path.rsplit('/').next().unwrap_or(path);
-    fname.rsplit_once('.').map_or(fname, |(s, _)| s).to_string()
-}
-
-fn load_existing(conn: &Connection, model: &str) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
+fn load_existing(conn: &Connection) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
     let mut tags_set = HashSet::new();
     let mut colors_set = HashSet::new();
     let mut failed_set = HashSet::new();
 
-    if let Ok(mut stmt) = conn.prepare("SELECT key, tags, colors, analysis_error FROM meta WHERE analyzed_by = ?1") {
+    if let Ok(mut stmt) = conn.prepare("SELECT key, tags, colors, analysis_error FROM meta") {
         let _ = stmt
-            .query_map(rusqlite::params![model], |row| {
+            .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
@@ -649,12 +651,6 @@ fn load_existing(conn: &Connection, model: &str) -> (HashSet<String>, HashSet<St
     (tags_set, colors_set, failed_set)
 }
 
-async fn collect_thumbs(dir: &Path, result: &mut Vec<String>) {
-    let thumb_exts: &[&str] = &["webp", "jpg", "jpeg", "png"];
-    for path_str in crate::util::scan_dir_by_ext(dir, thumb_exts).await {
-        result.push(path_str);
-    }
-}
 
 async fn broadcast_progress(tx: &broadcast::Sender<String>, state: &Arc<Mutex<AnalysisState>>) {
     let s = state.lock().await;
@@ -677,6 +673,40 @@ async fn broadcast_progress(tx: &broadcast::Sender<String>, state: &Arc<Mutex<An
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_existing_counts_tags_regardless_of_model() {
+        let conn = crate::db::open_in_memory().unwrap();
+        crate::db::upsert_cache_entry(&conn, "k1", "static", "a", "/t1.webp", "sm", "", "", 1, 99, 0, 0).unwrap();
+        crate::db::upsert_cache_entry(&conn, "k2", "static", "b", "/t2.webp", "sm", "", "", 1, 99, 0, 0).unwrap();
+        crate::db::update_analysis(&conn, "k1", Some("[\"x\"]"), Some("{}"), Some("modelA"), Some(0), Some(0), Some("[]")).unwrap();
+        crate::db::update_analysis(&conn, "k2", Some("[\"y\"]"), Some("{}"), Some("modelB"), Some(0), Some(0), Some("[]")).unwrap();
+
+        let (tags, colors, failed) = load_existing(&conn);
+        assert!(tags.contains("k1") && tags.contains("k2"), "tags counted across both models");
+        assert!(colors.contains("k1") && colors.contains("k2"), "colors counted across both models");
+        assert!(failed.is_empty(), "no failures expected");
+    }
+
+    #[test]
+    fn transcode_to_png_converts_non_png_input_to_png() {
+        let img = image::RgbImage::from_pixel(3, 2, image::Rgb([10, 20, 30]));
+        let mut bmp = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut bmp, image::ImageFormat::Bmp)
+            .unwrap();
+        let bmp_bytes = bmp.into_inner();
+
+        let png = transcode_to_png(&bmp_bytes).expect("transcode should succeed");
+        assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n", "output must be PNG");
+        let decoded = image::load_from_memory(&png).expect("png decodes");
+        assert_eq!((decoded.width(), decoded.height()), (3, 2));
+    }
+
+    #[test]
+    fn transcode_to_png_returns_none_for_garbage() {
+        assert!(transcode_to_png(b"not an image").is_none());
+    }
 
     #[test]
     fn parse_tags_uses_first_comma_line_normalizes_and_dedups() {
