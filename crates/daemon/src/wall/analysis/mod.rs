@@ -568,7 +568,7 @@ fn parse_tags_and_weather(text: &str) -> (Vec<String>, Vec<String>) {
 
     let mut weather = Vec::new();
     if let Some(wl) = weather_line {
-        fUpdates handling surrounding Ollama scanningor raw in wl.split(',') {
+        for raw in wl.split(',') {
             let w = raw.trim().to_lowercase().trim_end_matches('.').to_string();
             if !w.is_empty() && w.len() <= 24 && !weather.contains(&w) {
                 weather.push(w);
