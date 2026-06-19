@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::process::Stdio;
 
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -7,10 +8,26 @@ use crate::config::Config;
 use crate::util::CommandExt;
 
 pub(super) async fn run_sh(cmd: &str) -> anyhow::Result<()> {
-    let status = Command::new("sh").arg("-c").arg(cmd).silent().status().await?;
-    if !status.success() {
-        warn!("command failed ({}): {cmd}", status);
-        anyhow::bail!("shell command failed ({status}): {cmd}");
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut detail = String::new();
+        if !stderr.trim().is_empty() {
+            detail.push_str(&format!("\n  stderr: {}", stderr.trim()));
+        }
+        if !stdout.trim().is_empty() {
+            detail.push_str(&format!("\n  stdout: {}", stdout.trim()));
+        }
+        warn!("command failed ({}): {cmd}{detail}", out.status);
+        anyhow::bail!("shell command failed ({}): {cmd}", out.status);
     }
     Ok(())
 }
@@ -122,5 +139,12 @@ mod tests {
     fn substitute_placeholders_leaves_unknown_tokens() {
         let out = substitute_placeholders("%unknown% %name%", "static", "a", "p", "t");
         assert_eq!(out, "%unknown% a");
+    }
+
+    #[tokio::test]
+    async fn run_sh_ok_on_success_err_on_failure() {
+        assert!(run_sh("true").await.is_ok());
+        let err = run_sh("echo boom >&2; exit 3").await.unwrap_err().to_string();
+        assert!(err.contains("exit status: 3"), "error carries the exit status: {err}");
     }
 }

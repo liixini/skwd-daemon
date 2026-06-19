@@ -207,6 +207,10 @@ pub(super) async fn generate_matugen_config(config: &Config) -> PathBuf {
         emitted += 1;
     }
 
+    if emitted == 0 {
+        lines.push("[templates]".to_string());
+    }
+
     let _ = tokio::fs::create_dir_all(config_path.parent().unwrap_or_else(|| Path::new("/tmp"))).await;
     let _ = tokio::fs::write(&config_path, lines.join("\n")).await;
     info!("generated matugen config with {emitted} integrations");
@@ -458,6 +462,80 @@ mod tests {
         assert!(content.contains("[templates.complete]"));
         assert!(!content.contains("[templates.no-output]"));
         assert!(!content.contains("[templates.no-template]"));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn run_matugen_generates_user_config_templates_end_to_end() {
+        let have_matugen = Command::new("matugen")
+            .arg("--version")
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !have_matugen {
+            eprintln!("matugen not installed; skipping end-to-end test");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(cache.join("wallpaper")).unwrap();
+
+        let img = image::RgbImage::from_fn(64, 64, |x, y| {
+            image::Rgb([(x * 4) as u8, (y * 4) as u8, 120])
+        });
+        let img_path = dir.path().join("wp.png");
+        img.save(&img_path).unwrap();
+
+        let user_tmpl = dir.path().join("tmpl.txt");
+        std::fs::write(&user_tmpl, "primary={{colors.primary.default.hex}}").unwrap();
+        let user_out = dir.path().join("user-out.txt");
+        let user_cfg = dir.path().join("user-matugen.toml");
+        std::fs::write(
+            &user_cfg,
+            format!(
+                "[config]\n[templates.t]\ninput_path = \"{}\"\noutput_path = \"{}\"\n",
+                user_tmpl.display(),
+                user_out.display()
+            ),
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.features.matugen = true;
+        config.paths.cache = Some(cache.to_string_lossy().to_string());
+        config.paths.templates = Some(dir.path().to_string_lossy().to_string());
+        config.default_matugen_config = Some(user_cfg.to_string_lossy().to_string());
+
+        run_matugen(&img_path.to_string_lossy(), &config).await;
+
+        assert!(
+            user_out.exists(),
+            "user matugen config template was NOT generated (issue #68)"
+        );
+        let content = std::fs::read_to_string(&user_out).unwrap();
+        assert!(content.starts_with("primary=#"), "template rendered: {content}");
+    }
+
+    #[tokio::test]
+    async fn generate_matugen_config_always_has_templates_table_for_matugen4() {
+        let tmp = std::env::temp_dir().join(format!("skwd-test-matugen-empty-{}", std::process::id()));
+        let cache_dir = tmp.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let mut config = Config::default();
+        config.features.matugen = true;
+        config.paths.cache = Some(cache_dir.to_string_lossy().to_string());
+        config.integrations = vec![];
+
+        let cfg_path = generate_matugen_config(&config).await;
+        let content = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(
+            content.contains("[templates]"),
+            "matugen 4.x rejects a config with no templates table (issue #68):\n{content}"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }

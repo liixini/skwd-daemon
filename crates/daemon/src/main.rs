@@ -10,8 +10,15 @@ use tracing_subscriber::{
     EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt,
 };
 
+const VERSION: &str = env!("SKWD_VERSION");
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("skwd-daemon {VERSION}");
+        return Ok(());
+    }
+
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let log_dir = std::env::var("XDG_CACHE_HOME")
@@ -35,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
 
     Box::leak(Box::new(_file_guard));
 
-    tracing::info!(log_dir = %log_dir.display(), "daemon starting; logs at ~/.cache/skwd/skwd.log");
+    tracing::info!(version = VERSION, log_dir = %log_dir.display(), "skwd-daemon starting; logs at ~/.cache/skwd/skwd.log");
 
     wall::apply::kill_orphan_paper_procs().await;
 
