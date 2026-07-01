@@ -52,6 +52,12 @@ pub async fn resolve_source(config: &Config) -> Option<String> {
     }
 }
 
+pub async fn refresh_for(config: &Config) {
+    if let Some(src) = resolve_source(config).await {
+        refresh(&src, config).await;
+    }
+}
+
 fn is_niri() -> bool {
     std::env::var("XDG_CURRENT_DESKTOP")
         .map(|d| d.to_lowercase().contains("niri"))
@@ -161,4 +167,56 @@ fn which_paper_still() -> String {
             }
         }
     "skwd-paper-still".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn config_with_cache(cache: &Path) -> Config {
+        let mut config = Config::default();
+        config.paths.cache = Some(cache.display().to_string());
+        config
+    }
+
+    #[tokio::test]
+    async fn resolve_source_follows_last_wallpaper_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path();
+        let img = cache.join("wp.png");
+        std::fs::write(&img, b"x").unwrap();
+        std::fs::write(
+            cache.join("last-wallpaper.json"),
+            format!(r#"{{"type":"static","name":"wp.png","path":"{}"}}"#, img.display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_source(&config_with_cache(cache)).await,
+            Some(img.display().to_string()),
+            "backdrop must follow last-wallpaper.json - random rotation persists it, so refresh_for \
+             (called from both the manual apply and the rotation loop) picks up the rotated wallpaper"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_source_prefers_explicit_backdrop_over_wallpaper() {
+        let dir = tempfile::tempdir().unwrap();
+        let bd = dir.path().join("fixed.png");
+        std::fs::write(&bd, b"x").unwrap();
+        std::fs::write(
+            dir.path().join("last-wallpaper.json"),
+            r#"{"type":"static","name":"other.png","path":"/does/not/matter.png"}"#,
+        )
+        .unwrap();
+
+        let mut config = config_with_cache(dir.path());
+        config.niri.backdrop = bd.display().to_string();
+        assert_eq!(
+            resolve_source(&config).await,
+            Some(bd.display().to_string()),
+            "an explicit niri.backdrop path overrides the follow-wallpaper source"
+        );
+    }
 }

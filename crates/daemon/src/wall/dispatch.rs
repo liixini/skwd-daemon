@@ -190,9 +190,7 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                     {
                         let cfg_clone = config.clone();
                         tokio::spawn(async move {
-                            if let Some(src) = super::overview_backdrop::resolve_source(&cfg_clone).await {
-                                super::overview_backdrop::refresh(&src, &cfg_clone).await;
-                            }
+                            super::overview_backdrop::refresh_for(&cfg_clone).await;
                         });
                     }
 
@@ -655,6 +653,7 @@ pub async fn dispatch(req: &Request, event_tx: &broadcast::Sender<String>, state
                                 "skwd.wall.applied",
                                 serde_json::json!({"type": kind, "name": &name, "path": &path_str, "random": true}),
                             );
+                            super::overview_backdrop::refresh_for(&cfg).await;
                         }
                         Err(e) => {
                             warn!("[random] failed to apply {wp_type} {name}: {e}");

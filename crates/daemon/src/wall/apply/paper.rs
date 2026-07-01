@@ -229,6 +229,9 @@ pub(super) async fn broadcast_warmup(warmup: bool) {
 }
 
 pub async fn on_wall_show(config: &Config) {
+    if super::is_kde() {
+        return;
+    }
     if config.paper.engine != config::PaperEngine::SkwdPaper {
         return;
     }

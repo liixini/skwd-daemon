@@ -4,27 +4,25 @@ use tokio::process::Command;
 use tracing::{info, warn};
 
 use crate::config::{self, Config};
-use crate::util::CommandExt;
 
 use super::{is_kde, read_outputs_state};
 
-pub(super) async fn run_plasma_evaluate_script(script: &str) -> anyhow::Result<()> {
-    let status = Command::new("qdbus6")
+pub(super) async fn run_plasma_evaluate_script(script: &str) -> anyhow::Result<String> {
+    let out = Command::new("qdbus6")
         .arg("org.kde.plasmashell")
         .arg("/PlasmaShell")
         .arg("org.kde.PlasmaShell.evaluateScript")
         .arg(script)
-        .silent()
-        .status()
+        .output()
         .await?;
-    if !status.success() {
-        warn!("plasmashell evaluateScript failed ({})", status);
-        anyhow::bail!("plasmashell evaluateScript failed ({status})");
+    if !out.status.success() {
+        warn!("plasmashell evaluateScript failed ({})", out.status);
+        anyhow::bail!("plasmashell evaluateScript failed ({})", out.status);
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-pub(super) async fn query_kde_screen_map() -> HashMap<String, u32> {
+pub(super) async fn query_kde_screen_map() -> HashMap<String, (i64, i64)> {
     let out = match Command::new("kscreen-doctor").arg("-j").output().await {
         Ok(o) if o.status.success() => o.stdout,
         _ => return HashMap::new(),
@@ -33,7 +31,7 @@ pub(super) async fn query_kde_screen_map() -> HashMap<String, u32> {
     parse_kscreen_json(&text)
 }
 
-fn parse_kscreen_json(text: &str) -> HashMap<String, u32> {
+fn parse_kscreen_json(text: &str) -> HashMap<String, (i64, i64)> {
     let json: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => return HashMap::new(),
@@ -43,33 +41,67 @@ fn parse_kscreen_json(text: &str) -> HashMap<String, u32> {
     };
     let mut map = HashMap::new();
     for output in outputs {
-        let connected = output.get("connected").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let connected =
+            output.get("connected").and_then(serde_json::Value::as_bool).unwrap_or(false);
         if !connected {
             continue;
         }
-        let name = match output.get("name").and_then(|v| v.as_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
+        if output.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+            continue;
+        }
+        let Some(name) = output.get("name").and_then(|v| v.as_str()) else {
+            continue;
         };
-        let priority = match output.get("priority").and_then(serde_json::Value::as_u64) {
-            Some(p) if p >= 1 => u32::try_from(p - 1).unwrap_or(0),
-            _ => continue,
-        };
-        map.insert(name, priority);
+        let pos = output.get("pos");
+        let x = pos.and_then(|p| p.get("x")).and_then(serde_json::Value::as_i64);
+        let y = pos.and_then(|p| p.get("y")).and_then(serde_json::Value::as_i64);
+        if let (Some(x), Some(y)) = (x, y) {
+            map.insert(name.to_string(), (x, y));
+        }
     }
     map
 }
 
-pub(super) fn kde_target_indices(outputs: &[String], map: &HashMap<String, u32>) -> Vec<u32> {
-    if outputs.is_empty() {
-        if map.is_empty() {
-            Vec::new()
-        } else {
-            map.values().copied().collect()
-        }
-    } else {
-        outputs.iter().filter_map(|o| map.get(o).copied()).collect()
+fn kde_targets(outputs: &[String], map: &HashMap<String, (i64, i64)>) -> (Vec<(i64, i64)>, bool) {
+    if outputs.is_empty() || outputs.iter().any(|o| o == "*") || map.is_empty() {
+        return (Vec::new(), true);
     }
+    (outputs.iter().filter_map(|o| map.get(o).copied()).collect(), false)
+}
+
+fn kde_match_js(targets: &[(i64, i64)], apply_all: bool) -> String {
+    if apply_all {
+        return "function __kmatch(s){ return true; }".to_string();
+    }
+    let arr = targets
+        .iter()
+        .map(|(x, y)| format!("[{x},{y}]"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "var __kt=[{arr}]; \
+         function __kmatch(s){{ if(s===-1) return false; var g=screenGeometry(s); \
+           for(var k=0;k<__kt.length;k++){{ if(Math.abs(__kt[k][0]-g.x)<=1 && Math.abs(__kt[k][1]-g.y)<=1) return true; }} \
+           return false; }}"
+    )
+}
+
+fn kde_static_script(matcher: &str, file_url: &str, fill_mode: u32) -> String {
+    format!(
+        "{matcher} \
+         var ds = desktops(); var __n = 0; \
+         for (var i = 0; i < ds.length; i++) {{ \
+           if (ds[i].screen === -1) continue; \
+           if (!__kmatch(ds[i].screen)) continue; \
+           var d = ds[i]; \
+           d.wallpaperPlugin = 'org.kde.image'; \
+           d.currentConfigGroup = ['Wallpaper', 'org.kde.image', 'General']; \
+           d.writeConfig('Image', '{file_url}'); \
+           d.writeConfig('FillMode', '{fill_mode}'); \
+           __n++; \
+         }} \
+         __n;"
+    )
 }
 
 pub(super) fn kde_fill_mode_value(fm: config::FillMode) -> u32 {
@@ -84,29 +116,30 @@ pub(super) fn kde_fill_mode_value(fm: config::FillMode) -> u32 {
 
 pub(super) async fn apply_kde_static(path: &str, outputs: &[String], config: &Config) -> anyhow::Result<()> {
     let map = query_kde_screen_map().await;
-    let targets = kde_target_indices(outputs, &map);
-    let indices_js = targets.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(",");
+    let (targets, apply_all) = kde_targets(outputs, &map);
+    let matcher = kde_match_js(&targets, apply_all);
     let fill_mode = kde_fill_mode_value(config.display.fill_mode);
     let file_url = format!("file://{path}");
     info!(
         path = %path,
         outputs = ?outputs,
         targets = ?targets,
+        apply_all,
         "apply_kde_static: setting wallpaper via plasmashell evaluateScript"
     );
-    let script = format!(
-        "var targets = [{indices_js}]; \
-         var ds = desktops(); \
-         for (var i = 0; i < ds.length; i++) {{ \
-           if (targets.length > 0 && targets.indexOf(ds[i].screen) === -1) continue; \
-           var d = ds[i]; \
-           d.wallpaperPlugin = 'org.kde.image'; \
-           d.currentConfigGroup = ['Wallpaper', 'org.kde.image', 'General']; \
-           d.writeConfig('Image', '{file_url}'); \
-           d.writeConfig('FillMode', '{fill_mode}'); \
-         }}"
-    );
-    run_plasma_evaluate_script(&script).await
+    let script = kde_static_script(&matcher, &file_url, fill_mode);
+    let matched: i64 = run_plasma_evaluate_script(&script).await?.parse().unwrap_or(-1);
+    if !apply_all && !targets.is_empty() && matched == 0 {
+        warn!(
+            outputs = ?outputs,
+            targets = ?targets,
+            "apply_kde_static: requested outputs matched no Plasma desktop \
+             (geometry/scaling mismatch?) - wallpaper not applied"
+        );
+    } else {
+        info!(matched, "apply_kde_static: applied to {matched} desktop(s)");
+    }
+    Ok(())
 }
 
 pub(super) async fn kde_unload_video_plugin(outputs: &[String]) {
@@ -117,24 +150,17 @@ pub(super) async fn kde_unload_video_plugin(outputs: &[String]) {
     if map.is_empty() {
         return;
     }
-    let target_indices: Vec<u32> = if outputs.is_empty() || outputs.iter().any(|o| o == "*") {
-        map.values().copied().collect()
-    } else {
-        outputs.iter().filter_map(|o| map.get(o).copied()).collect()
-    };
-    if target_indices.is_empty() {
+    let (targets, apply_all) = kde_targets(outputs, &map);
+    if !apply_all && targets.is_empty() {
         return;
     }
-    let indices_js = target_indices
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
+    let matcher = kde_match_js(&targets, apply_all);
     let script = format!(
-        "var idx = [{indices_js}]; \
+        "{matcher} \
          var ds = desktops(); \
          for (var i = 0; i < ds.length; i++) {{ \
-           if (idx.indexOf(ds[i].screen) === -1) continue; \
+           if (ds[i].screen === -1) continue; \
+           if (!__kmatch(ds[i].screen)) continue; \
            ds[i].wallpaperPlugin = 'org.kde.image'; \
          }}"
     );
@@ -182,11 +208,12 @@ pub(super) async fn kde_apply_audio(
         if !video_outputs.contains(out) {
             continue;
         }
-        let Some(&idx) = kde_map.get(out) else {
+        let Some(&(x, y)) = kde_map.get(out) else {
             continue;
         };
         let mut entry = serde_json::Map::new();
-        entry.insert("screen".into(), serde_json::json!(idx));
+        entry.insert("x".into(), serde_json::json!(x));
+        entry.insert("y".into(), serde_json::json!(y));
         if let Some(&m) = mute_per_output.get(out) {
             // MuteMode: 5 = always mute, 4 = never mute (always play)
             entry.insert(
@@ -212,9 +239,11 @@ pub(super) async fn kde_apply_audio(
         "var cfgs = {configs_js}; \
          var ds = desktops(); \
          for (var i = 0; i < ds.length; i++) {{ \
+           if (ds[i].screen === -1) continue; \
+           var g = screenGeometry(ds[i].screen); \
            var cfg = null; \
            for (var j = 0; j < cfgs.length; j++) {{ \
-             if (cfgs[j].screen === ds[i].screen) {{ cfg = cfgs[j]; break; }} \
+             if (Math.abs(cfgs[j].x - g.x) <= 1 && Math.abs(cfgs[j].y - g.y) <= 1) {{ cfg = cfgs[j]; break; }} \
            }} \
            if (cfg === null) continue; \
            var d = ds[i]; \
@@ -252,31 +281,25 @@ pub(super) async fn apply_kde_video(
         (mute_mode.to_string(), vol)
     };
 
+    let entry_for = |name: &str, &(x, y): &(i64, i64)| {
+        let (mute_mode, volume) = resolve(name);
+        serde_json::json!({
+            "x": x,
+            "y": y,
+            "muteMode": mute_mode,
+            "volume": format!("{volume}"),
+        })
+    };
+
     let (per_screen, fallback_to_all): (Vec<serde_json::Value>, bool) = if map.is_empty() {
         (Vec::new(), true)
-    } else if outputs.is_empty() {
-        let mut v = Vec::new();
-        for (name, idx) in &map {
-            let (mute_mode, volume) = resolve(name);
-            v.push(serde_json::json!({
-                "screen": idx,
-                "muteMode": mute_mode,
-                "volume": format!("{volume}"),
-            }));
-        }
-        (v, false)
+    } else if outputs.is_empty() || outputs.iter().any(|o| o == "*") {
+        (map.iter().map(|(name, pos)| entry_for(name, pos)).collect(), false)
     } else {
-        let mut v = Vec::new();
-        for name in outputs {
-            if let Some(idx) = map.get(name) {
-                let (mute_mode, volume) = resolve(name);
-                v.push(serde_json::json!({
-                    "screen": idx,
-                    "muteMode": mute_mode,
-                    "volume": format!("{volume}"),
-                }));
-            }
-        }
+        let v = outputs
+            .iter()
+            .filter_map(|name| map.get(name).map(|pos| entry_for(name, pos)))
+            .collect();
         (v, false)
     };
 
@@ -296,9 +319,11 @@ pub(super) async fn apply_kde_video(
          var fallbackToAll = {fallback_to_all}; \
          var ds = desktops(); \
          for (var i = 0; i < ds.length; i++) {{ \
+           if (ds[i].screen === -1) continue; \
+           var g = screenGeometry(ds[i].screen); \
            var match = null; \
            for (var j = 0; j < configs.length; j++) {{ \
-             if (configs[j].screen === ds[i].screen) {{ match = configs[j]; break; }} \
+             if (Math.abs(configs[j].x - g.x) <= 1 && Math.abs(configs[j].y - g.y) <= 1) {{ match = configs[j]; break; }} \
            }} \
            if (!fallbackToAll && match === null) continue; \
            var muteMode = match ? match.muteMode : '{global_mute_mode}'; \
@@ -311,7 +336,7 @@ pub(super) async fn apply_kde_video(
            d.writeConfig('Volume', volume); \
          }}"
     );
-    run_plasma_evaluate_script(&script).await
+    run_plasma_evaluate_script(&script).await.map(|_| ())
 }
 
 #[cfg(test)]
@@ -319,19 +344,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_kscreen_json_maps_connected_outputs_priority_minus_one() {
+    fn parse_kscreen_json_maps_connected_outputs_to_position() {
         let json = r#"{"outputs":[
-            {"name":"DP-1","connected":true,"priority":1},
-            {"name":"DP-2","connected":true,"priority":2},
-            {"name":"HDMI-1","connected":false,"priority":3},
-            {"name":"zero","connected":true,"priority":0}
+            {"name":"DP-1","connected":true,"enabled":true,"pos":{"x":0,"y":0}},
+            {"name":"DP-2","connected":true,"enabled":true,"pos":{"x":1920,"y":0}},
+            {"name":"DP-3","connected":true,"enabled":true,"pos":{"x":3840,"y":0}},
+            {"name":"PORTRAIT","connected":true,"enabled":true,"pos":{"x":-1080,"y":0}},
+            {"name":"HDMI-1","connected":false,"pos":{"x":0,"y":0}},
+            {"name":"OFF","connected":true,"enabled":false,"pos":{"x":0,"y":0}}
         ]}"#;
         let map = parse_kscreen_json(json);
-        assert_eq!(map.get("DP-1"), Some(&0));
-        assert_eq!(map.get("DP-2"), Some(&1));
-        assert_eq!(map.get("HDMI-1"), None);
-        assert_eq!(map.get("zero"), None);
-        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("DP-1"), Some(&(0, 0)));
+        assert_eq!(map.get("DP-2"), Some(&(1920, 0)));
+        assert_eq!(map.get("DP-3"), Some(&(3840, 0)));
+        assert_eq!(map.get("PORTRAIT"), Some(&(-1080, 0)));
+        assert_eq!(map.get("HDMI-1"), None, "disconnected dropped");
+        assert_eq!(map.get("OFF"), None, "disabled dropped");
+        assert_eq!(map.len(), 4);
     }
 
     #[test]
@@ -341,19 +370,53 @@ mod tests {
     }
 
     #[test]
-    fn kde_target_indices_filters_and_defaults() {
+    fn kde_targets_specific_match_and_all() {
         let mut map = HashMap::new();
-        map.insert("DP-1".to_string(), 0u32);
-        map.insert("DP-2".to_string(), 1u32);
+        map.insert("DP-1".to_string(), (0i64, 0i64));
+        map.insert("PORTRAIT".to_string(), (-1080i64, 0i64));
 
-        assert_eq!(kde_target_indices(&["DP-2".to_string()], &map), vec![1]);
+        let (t, all) = kde_targets(&["PORTRAIT".to_string()], &map);
+        assert!(!all);
+        assert_eq!(t, vec![(-1080, 0)]);
 
-        let mut all = kde_target_indices(&[], &map);
-        all.sort_unstable();
-        assert_eq!(all, vec![0, 1]);
+        let (t, all) = kde_targets(&[], &map);
+        assert!(all);
+        assert!(t.is_empty());
 
-        assert!(kde_target_indices(&[], &HashMap::new()).is_empty());
-        assert!(kde_target_indices(&["unknown".to_string()], &map).is_empty());
+        let (_t, all) = kde_targets(&["*".to_string()], &map);
+        assert!(all);
+
+        let (t, all) = kde_targets(&["UNKNOWN".to_string()], &map);
+        assert!(!all, "unknown target must not fall back to all");
+        assert!(t.is_empty());
+
+        let (_t, all) = kde_targets(&["DP-1".to_string()], &HashMap::new());
+        assert!(all);
+    }
+
+    #[test]
+    fn kde_match_js_all_vs_specific() {
+        assert!(kde_match_js(&[], true).contains("return true"));
+        let js = kde_match_js(&[(1920, 0), (-1080, 0)], false);
+        assert!(js.contains("[1920,0]"));
+        assert!(js.contains("[-1080,0]"));
+        assert!(js.contains("screenGeometry"));
+        assert!(js.contains("s===-1"), "specific matcher must reject screen -1");
+        assert!(js.contains("Math.abs"), "match must use a tolerance, not exact equality");
+    }
+
+    #[test]
+    fn kde_static_script_guards_minus_one_and_returns_count() {
+        let matcher = kde_match_js(&[(0, 0)], false);
+        let script = kde_static_script(&matcher, "file:///w.png", 2);
+        assert!(
+            script.contains("ds[i].screen === -1) continue"),
+            "static script must skip desktops with no monitor"
+        );
+        assert!(script.contains("var __n = 0"), "must initialise a match counter");
+        assert!(script.trim_end().ends_with("__n;"), "must return the match count");
+        assert!(script.contains("file:///w.png"));
+        assert!(script.contains("writeConfig('FillMode', '2')"));
     }
 
     #[test]
