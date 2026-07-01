@@ -14,7 +14,7 @@ use tracing::{info, warn};
 
 use crate::config::{self, Config};
 
-use super::{paper_bin, read_prev_transition_image};
+use super::{paper_bin, read_outputs_state, read_prev_transition_image};
 
 fn paper_stderr() -> Stdio {
     Stdio::inherit()
@@ -228,6 +228,24 @@ pub(super) async fn broadcast_warmup(warmup: bool) {
     }
 }
 
+async fn outputs_divergent_static(cache_dir: &Path) -> bool {
+    let state = read_outputs_state(cache_dir).await;
+    let Some(map) = state.as_object() else {
+        return false;
+    };
+    if map.is_empty() {
+        return false;
+    }
+    let mut paths = HashSet::new();
+    for entry in map.values() {
+        if entry.get("type").and_then(|v| v.as_str()).unwrap_or("static") != "static" {
+            return true;
+        }
+        paths.insert(entry.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string());
+    }
+    paths.len() > 1
+}
+
 pub async fn on_wall_show(config: &Config) {
     if super::is_kde() {
         return;
@@ -255,6 +273,10 @@ pub async fn on_wall_show(config: &Config) {
         if !map.is_empty() {
             return;
         }
+    }
+
+    if outputs_divergent_static(&config.cache_dir()).await {
+        return;
     }
     let bin = paper_bin();
     let shader = config.transition.shader.clone();
@@ -709,4 +731,49 @@ pub(super) async fn spawn_paper_await_ready(
         info!(pid, dur_ms, "paper ready");
     }
     Ok(child)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_outputs(dir: &Path, json: &str) {
+        std::fs::write(dir.join("outputs.json"), json).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prewarm_skips_divergent_static_desktop() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = dir.path();
+
+        write_outputs(c, r#"{"*":{"type":"static","path":"/a.png"}}"#);
+        assert!(!outputs_divergent_static(c).await, "single * -> uniform");
+
+        write_outputs(
+            c,
+            r#"{"DP-1":{"type":"static","path":"/a.png"},"DP-2":{"type":"static","path":"/a.png"}}"#,
+        );
+        assert!(!outputs_divergent_static(c).await, "same wallpaper per output -> uniform");
+
+        write_outputs(
+            c,
+            r#"{"DP-1":{"type":"static","path":"/a.png"},"DP-2":{"type":"static","path":"/b.png"}}"#,
+        );
+        assert!(outputs_divergent_static(c).await, "different wallpapers -> divergent, skip prewarm");
+
+        write_outputs(
+            c,
+            r#"{"DP-1":{"type":"static","path":"/a.png"},"DP-2":{"type":"video","path":"/v.mp4"}}"#,
+        );
+        assert!(outputs_divergent_static(c).await, "any non-static output -> skip prewarm");
+    }
+
+    #[tokio::test]
+    async fn prewarm_allowed_when_outputs_state_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !outputs_divergent_static(dir.path()).await,
+            "no outputs.json -> not divergent (prewarm allowed, preserves single/uniform warmup)"
+        );
+    }
 }
