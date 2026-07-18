@@ -238,7 +238,6 @@ struct GlState {
     egl_display: khronos_egl::Display,
     egl_config: khronos_egl::Config,
     primary_ctx: khronos_egl::Context,
-    primary_pbuffer: khronos_egl::Surface,
     tex_old: u32,
     tex_new: u32,
     video_old: Option<VideoSource>,
@@ -401,21 +400,7 @@ impl App {
         EGL.bind_api(khronos_egl::OPENGL_API)
             .map_err(|e| anyhow!("eglBindAPI: {e:?}"))?;
 
-        let attribs = [
-            khronos_egl::SURFACE_TYPE,
-            khronos_egl::WINDOW_BIT | khronos_egl::PBUFFER_BIT,
-            khronos_egl::RENDERABLE_TYPE,
-            khronos_egl::OPENGL_BIT,
-            khronos_egl::RED_SIZE,
-            8,
-            khronos_egl::GREEN_SIZE,
-            8,
-            khronos_egl::BLUE_SIZE,
-            8,
-            khronos_egl::ALPHA_SIZE,
-            0,
-            khronos_egl::NONE,
-        ];
+        let attribs = crate::render::wayland_config_attributes();
         let egl_config = EGL
             .choose_first_config(egl_display, &attribs)
             .map_err(|e| anyhow!("eglChooseConfig: {e:?}"))?
@@ -432,24 +417,8 @@ impl App {
             .create_context(egl_display, egl_config, None, &ctx_attribs)
             .map_err(|e| anyhow!("eglCreateContext: {e:?}"))?;
 
-        let pb_attribs = [
-            khronos_egl::WIDTH,
-            1,
-            khronos_egl::HEIGHT,
-            1,
-            khronos_egl::NONE,
-        ];
-        let primary_pbuffer = EGL
-            .create_pbuffer_surface(egl_display, egl_config, &pb_attribs)
-            .map_err(|e| anyhow!("eglCreatePbufferSurface: {e:?}"))?;
-
-        EGL.make_current(
-            egl_display,
-            Some(primary_pbuffer),
-            Some(primary_pbuffer),
-            Some(primary_ctx),
-        )
-        .map_err(|e| anyhow!("eglMakeCurrent: {e:?}"))?;
+        EGL.make_current(egl_display, None, None, Some(primary_ctx))
+            .map_err(|e| anyhow!("eglMakeCurrent: {e:?}"))?;
 
         gl::load_with(|name| {
             let cname = CString::new(name).unwrap();
@@ -583,7 +552,6 @@ impl App {
             egl_display,
             egl_config,
             primary_ctx,
-            primary_pbuffer,
             tex_old,
             tex_new,
             video_old,
@@ -754,12 +722,7 @@ impl App {
         let to_is_video = is_video_path(&cmd.to);
         let needs_thumbs = chosen_name == "mosaic-tumble";
 
-        EGL.make_current(
-            gl_state.egl_display,
-            Some(gl_state.primary_pbuffer),
-            Some(gl_state.primary_pbuffer),
-            Some(gl_state.primary_ctx),
-        )
+        EGL.make_current(gl_state.egl_display, None, None, Some(gl_state.primary_ctx))
         .map_err(|e| anyhow!("eglMakeCurrent (primary): {e:?}"))?;
 
         let thumbs_t = Instant::now();
@@ -929,8 +892,8 @@ impl App {
             if needs_primary {
                 let _ = EGL.make_current(
                     gl_state.egl_display,
-                    Some(gl_state.primary_pbuffer),
-                    Some(gl_state.primary_pbuffer),
+                    None,
+                    None,
                     Some(gl_state.primary_ctx),
                 );
                 if transition_completing

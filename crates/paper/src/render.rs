@@ -9,11 +9,30 @@ use crate::video_source::VideoSource;
 type EglInstance = khronos_egl::Instance<khronos_egl::Static>;
 const EGL: EglInstance = khronos_egl::Instance::new(khronos_egl::Static);
 
+/// Wayland EGL configs commonly expose window surfaces without pbuffers.
+/// The offscreen FBO uses an EGL_KHR_surfaceless_context instead.
+pub(crate) fn wayland_config_attributes() -> [i32; 13] {
+    [
+        khronos_egl::SURFACE_TYPE,
+        khronos_egl::WINDOW_BIT,
+        khronos_egl::RENDERABLE_TYPE,
+        khronos_egl::OPENGL_BIT,
+        khronos_egl::RED_SIZE,
+        8,
+        khronos_egl::GREEN_SIZE,
+        8,
+        khronos_egl::BLUE_SIZE,
+        8,
+        khronos_egl::ALPHA_SIZE,
+        0,
+        khronos_egl::NONE,
+    ]
+}
+
 pub struct SharedRenderer {
     egl_display: khronos_egl::Display,
     egl_config: khronos_egl::Config,
     primary_ctx: khronos_egl::Context,
-    primary_pbuffer: khronos_egl::Surface,
     pub fbo_w: u32,
     pub fbo_h: u32,
     blit_program: u32,
@@ -56,21 +75,7 @@ impl SharedRenderer {
         EGL.bind_api(khronos_egl::OPENGL_API)
             .map_err(|e| anyhow!("eglBindAPI: {e:?}"))?;
 
-        let attribs = [
-            khronos_egl::SURFACE_TYPE,
-            khronos_egl::WINDOW_BIT | khronos_egl::PBUFFER_BIT,
-            khronos_egl::RENDERABLE_TYPE,
-            khronos_egl::OPENGL_BIT,
-            khronos_egl::RED_SIZE,
-            8,
-            khronos_egl::GREEN_SIZE,
-            8,
-            khronos_egl::BLUE_SIZE,
-            8,
-            khronos_egl::ALPHA_SIZE,
-            0,
-            khronos_egl::NONE,
-        ];
+        let attribs = wayland_config_attributes();
         let egl_config = EGL
             .choose_first_config(egl_display, &attribs)
             .map_err(|e| anyhow!("eglChooseConfig: {e:?}"))?
@@ -87,24 +92,8 @@ impl SharedRenderer {
             .create_context(egl_display, egl_config, None, &ctx_attribs)
             .map_err(|e| anyhow!("eglCreateContext primary: {e:?}"))?;
 
-        let pb_attribs = [
-            khronos_egl::WIDTH,
-            1,
-            khronos_egl::HEIGHT,
-            1,
-            khronos_egl::NONE,
-        ];
-        let primary_pbuffer = EGL
-            .create_pbuffer_surface(egl_display, egl_config, &pb_attribs)
-            .map_err(|e| anyhow!("eglCreatePbufferSurface: {e:?}"))?;
-
-        EGL.make_current(
-            egl_display,
-            Some(primary_pbuffer),
-            Some(primary_pbuffer),
-            Some(primary_ctx),
-        )
-        .map_err(|e| anyhow!("eglMakeCurrent primary: {e:?}"))?;
+        EGL.make_current(egl_display, None, None, Some(primary_ctx))
+            .map_err(|e| anyhow!("eglMakeCurrent primary: {e:?}"))?;
 
         gl::load_with(|name| {
             let cname = CString::new(name).unwrap();
@@ -126,7 +115,6 @@ impl SharedRenderer {
             egl_display,
             egl_config,
             primary_ctx,
-            primary_pbuffer,
             fbo_w,
             fbo_h,
             blit_program,
@@ -137,12 +125,7 @@ impl SharedRenderer {
 
     pub fn render_mpv_to_fbo(&mut self) -> bool {
         if EGL
-            .make_current(
-                self.egl_display,
-                Some(self.primary_pbuffer),
-                Some(self.primary_pbuffer),
-                Some(self.primary_ctx),
-            )
+            .make_current(self.egl_display, None, None, Some(self.primary_ctx))
             .is_err()
         {
             tracing::warn!("eglMakeCurrent primary failed");
@@ -262,12 +245,7 @@ impl OutputBlitter {
 impl SharedRenderer {
     pub fn load_path(&mut self, path: &str, mute: bool, volume: u32) -> Result<()> {
         if EGL
-            .make_current(
-                self.egl_display,
-                Some(self.primary_pbuffer),
-                Some(self.primary_pbuffer),
-                Some(self.primary_ctx),
-            )
+            .make_current(self.egl_display, None, None, Some(self.primary_ctx))
             .is_err()
         {
             return Err(anyhow!("eglMakeCurrent for load_path"));
@@ -306,7 +284,6 @@ impl Drop for SharedRenderer {
             gl::DeleteTextures(1, &self.video.fbo_texture);
         }
         let _ = EGL.make_current(self.egl_display, None, None, None);
-        let _ = EGL.destroy_surface(self.egl_display, self.primary_pbuffer);
         let _ = EGL.destroy_context(self.egl_display, self.primary_ctx);
     }
 }
@@ -389,4 +366,22 @@ pub fn wayland_display_ptr(surface: &WlSurface) -> Result<*mut c_void> {
         .upgrade()
         .ok_or_else(|| anyhow!("wayland backend gone"))?;
     Ok(conn.display_ptr() as *mut c_void)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wayland_config_uses_window_surfaces_only() {
+        let attribs = wayland_config_attributes();
+        let surface_type = attribs
+            .windows(2)
+            .find(|pair| pair[0] == khronos_egl::SURFACE_TYPE)
+            .map(|pair| pair[1])
+            .expect("surface type attribute");
+
+        assert_eq!(surface_type, khronos_egl::WINDOW_BIT);
+        assert_eq!(surface_type & khronos_egl::PBUFFER_BIT, 0);
+    }
 }
