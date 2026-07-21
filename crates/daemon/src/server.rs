@@ -326,6 +326,35 @@ mod harness_tests {
     }
 
     #[tokio::test]
+    async fn wallpapers_flag_gates_the_whole_wallpaper_surface() {
+        let h = test_state();
+        {
+            let mut c = h.state.config.write().await;
+            c.features.wallpapers = false;
+            c.features.steam = true;
+            c.features.analysis = true;
+        }
+        for method in [
+            "wall.cache_status",
+            "effects.list",
+            "optimize.status",
+            "video_convert.status",
+            "steam.status",
+            "analysis.status",
+        ] {
+            let e = h.dispatch(method, serde_json::json!({})).await.error.unwrap();
+            assert_eq!(e.code, -32601, "{method}");
+            assert!(
+                e.message.contains("wallpapers module is disabled"),
+                "{method}: {}",
+                e.message
+            );
+        }
+        let r = h.dispatch("bar.show", serde_json::json!({})).await;
+        assert!(r.error.is_none(), "the rest of the shell keeps working");
+    }
+
+    #[tokio::test]
     async fn lyrics_music_analysis_disabled_paths() {
         let h = test_state();
         {

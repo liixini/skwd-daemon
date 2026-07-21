@@ -264,6 +264,9 @@ pub(super) async fn dispatch_request(
         return Response::ok(req.id, serde_json::json!({"ok": true}));
     }
     if req.method.starts_with("wall.") {
+        if !state.config.read().await.features.wallpapers {
+            return Response::err(req.id, -32601, "wallpapers module is disabled");
+        }
         return wall::dispatch(req, event_tx, state).await;
     }
     if req.method.starts_with("bar.") {
@@ -285,19 +288,33 @@ pub(super) async fn dispatch_request(
         return dispatch_power(req, event_tx, state).await;
     }
     if req.method.starts_with("steam.") {
-        if !state.config.read().await.features.steam {
+        let f = state.config.read().await.features.clone();
+        if !f.wallpapers {
+            return Response::err(req.id, -32601, "wallpapers module is disabled");
+        }
+        if !f.steam {
             return Response::err(req.id, -32601, "steam module is disabled");
         }
         return steam::dispatch(req, event_tx, state).await;
     }
     if req.method.starts_with("optimize.") || req.method.starts_with("video_convert.") {
+        if !state.config.read().await.features.wallpapers {
+            return Response::err(req.id, -32601, "wallpapers module is disabled");
+        }
         return optimize::dispatch(req, event_tx, state).await;
     }
     if req.method.starts_with("effects.") {
+        if !state.config.read().await.features.wallpapers {
+            return Response::err(req.id, -32601, "wallpapers module is disabled");
+        }
         return wall::effects::dispatch(req, event_tx, state).await;
     }
     if req.method.starts_with("analysis.") {
-        if !state.config.read().await.features.analysis {
+        let f = state.config.read().await.features.clone();
+        if !f.wallpapers {
+            return Response::err(req.id, -32601, "wallpapers module is disabled");
+        }
+        if !f.analysis {
             return Response::err(req.id, -32601, "analysis module is disabled");
         }
         return analysis::dispatch(req, event_tx, state).await;

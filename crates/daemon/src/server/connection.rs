@@ -33,15 +33,17 @@ pub async fn run() -> anyhow::Result<()> {
 
     wall::bootstrap::run(&crate::config::load().unwrap_or_default()).await;
     let config = crate::config::load().expect("failed to load config");
-    wall::clean_trash::run(&config).await;
+    if config.features.wallpapers {
+        wall::clean_trash::run(&config).await;
 
-    {
         let cfg_clone = config.clone();
         tokio::spawn(async move {
             if let Some(prev) = wall::overview_backdrop::resolve_source(&cfg_clone).await {
                 wall::overview_backdrop::refresh(&prev, &cfg_clone).await;
             }
         });
+    } else {
+        info!("wallpapers module disabled by config; skipping wallpaper subsystems");
     }
 
     let steam_state = Arc::new(Mutex::new(SteamState::new(&config)));
@@ -108,16 +110,20 @@ pub async fn run() -> anyhow::Result<()> {
         });
     }
 
-    let _watcher_handle: Option<notify::RecommendedWatcher> = match watcher::start(&config, &state.suppress_set) {
-        Ok((rx, handle)) => {
-            let tx = event_tx.clone();
-            let ws = state.clone();
-            tokio::spawn(run_watcher_loop(rx, tx, ws));
-            Some(handle)
-        }
-        Err(e) => {
-            warn!("file watcher failed to start: {e}");
-            None
+    let _watcher_handle: Option<notify::RecommendedWatcher> = if !config.features.wallpapers {
+        None
+    } else {
+        match watcher::start(&config, &state.suppress_set) {
+            Ok((rx, handle)) => {
+                let tx = event_tx.clone();
+                let ws = state.clone();
+                tokio::spawn(run_watcher_loop(rx, tx, ws));
+                Some(handle)
+            }
+            Err(e) => {
+                warn!("file watcher failed to start: {e}");
+                None
+            }
         }
     };
 
@@ -174,7 +180,8 @@ pub async fn run() -> anyhow::Result<()> {
                         *state.config.write().await = new_cfg;
                         let _ = broadcast_event(&tx, "skwd.wall.config_changed", serde_json::json!({}));
 
-                        if prev_engine != new_engine {
+                        let wallpapers_on = state.config.read().await.features.wallpapers;
+                        if wallpapers_on && prev_engine != new_engine {
                             info!(
                                 "[config] paper.engine changed: {:?} -> {:?}, re-applying static wallpapers",
                                 prev_engine, new_engine
@@ -189,7 +196,7 @@ pub async fn run() -> anyhow::Result<()> {
                             });
                         }
 
-                        if backdrop_changed {
+                        if wallpapers_on && backdrop_changed {
                             info!("[config] niri overview backdrop settings changed, re-rendering");
                             let cfg = state.config.read().await.clone();
                             tokio::spawn(async move {

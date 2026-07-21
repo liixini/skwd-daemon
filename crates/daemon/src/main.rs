@@ -44,7 +44,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(version = VERSION, log_dir = %log_dir.display(), "skwd-daemon starting; logs at ~/.cache/skwd/skwd.log");
 
-    wall::apply::kill_orphan_paper_procs().await;
+    if config::load().unwrap_or_default().features.wallpapers {
+        wall::apply::kill_orphan_paper_procs().await;
+    } else {
+        tracing::info!("wallpapers module disabled; leaving external paper renderers alone");
+    }
 
     server::run().await
 }

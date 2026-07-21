@@ -352,6 +352,8 @@ pub struct PathsConfig {
 #[allow(dead_code)]
 pub struct FeaturesConfig {
     #[serde(default = "default_true")]
+    pub wallpapers: bool,
+    #[serde(default = "default_true")]
     pub matugen: bool,
     #[serde(default)]
     pub ollama: bool,
@@ -373,6 +375,7 @@ pub struct FeaturesConfig {
 impl Default for FeaturesConfig {
     fn default() -> Self {
         Self {
+            wallpapers: true,
             matugen: true,
             ollama: false,
             steam: false,
