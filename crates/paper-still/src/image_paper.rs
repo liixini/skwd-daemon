@@ -44,6 +44,19 @@ fn decode_image(file_path: &str) -> Result<(u32, u32, Vec<u8>)> {
     Ok((img_w, img_h, rgba.into_raw()))
 }
 
+fn copy_pixels_into_canvas(canvas: &mut [u8], pixels: &[u8]) -> Result<()> {
+    let canvas_len = canvas.len();
+    let destination = canvas.get_mut(..pixels.len()).ok_or_else(|| {
+        anyhow!(
+            "wl_shm canvas is too small: need {} bytes, got {}",
+            pixels.len(),
+            canvas_len
+        )
+    })?;
+    destination.copy_from_slice(pixels);
+    Ok(())
+}
+
 pub fn run(target: OutputTarget, file_path: &str, persist: bool, fill_mode: FillMode, namespace: &str) -> Result<()> {
     let (img_w, img_h, bytes) = decode_image(file_path)?;
     tracing::info!(w = img_w, h = img_h, ?fill_mode, "image decoded");
@@ -338,7 +351,7 @@ impl App {
         let (buffer, canvas) = pool
             .create_buffer(bw as i32, bh as i32, stride, wl_shm::Format::Abgr8888)
             .map_err(|e| anyhow!("create_buffer: {e}"))?;
-        canvas.copy_from_slice(&pixels);
+        copy_pixels_into_canvas(canvas, &pixels)?;
         self.buffer = Some(buffer.wl_buffer().clone());
         self._buffer_keepalive = Some(buffer);
         self.buffer_w = bw;
@@ -420,6 +433,30 @@ impl App {
         }
         unsafe { libc::malloc_trim(0) };
         tracing::info!(path = %cmd.path, w = new_w, h = new_h, "image persist: swapped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_pixels_into_canvas;
+
+    #[test]
+    fn copies_into_alignment_padded_canvas() {
+        let pixels = [1, 2, 3, 4, 5];
+        let mut canvas = [0xaa; 64];
+
+        copy_pixels_into_canvas(&mut canvas, &pixels).unwrap();
+
+        assert_eq!(&canvas[..pixels.len()], &pixels);
+        assert!(canvas[pixels.len()..].iter().all(|byte| *byte == 0xaa));
+    }
+
+    #[test]
+    fn rejects_canvas_smaller_than_pixels() {
+        let mut canvas = [0; 3];
+        let error = copy_pixels_into_canvas(&mut canvas, &[1, 2, 3, 4]).unwrap_err();
+
+        assert!(error.to_string().contains("need 4 bytes, got 3"));
     }
 }
 

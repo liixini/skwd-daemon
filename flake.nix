@@ -20,6 +20,10 @@
 
             cargoLock = {
               lockFile = ./Cargo.lock;
+              outputHashes = {
+                "ffmpeg-sys-the-third-6.0.0+ffmpeg-9.0" = "sha256-eUjUy23f9bFGuxeK1QoeccRyrzm4PdQYN6VzsgWqKB0=";
+                "ffmpeg-the-third-6.0.0+ffmpeg-9.0" = "sha256-eUjUy23f9bFGuxeK1QoeccRyrzm4PdQYN6VzsgWqKB0=";
+              };
             };
 
             nativeBuildInputs = with pkgs; [

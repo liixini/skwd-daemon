@@ -46,7 +46,9 @@ fn print_help() {
     println!("  skwd wall hide");
     println!("  skwd wall list");
     println!("  skwd wall import '{{\"path\":\"/abs/path/to/file.jpg\"}}'");
-    println!("  skwd wall apply '{{\"name\":\"file.jpg\"}}'");
+    println!("  skwd wall apply '{{\"path\":\"/abs/path/to/file.jpg\",\"type\":\"static\"}}'");
+    println!("  skwd wall apply '{{\"path\":\"/abs/path/to/file.mp4\",\"type\":\"video\"}}'");
+    println!("  skwd wall apply '{{\"we_id\":\"123456789\",\"type\":\"we\"}}'");
     println!("  skwd wall restore");
     println!("  skwd wall retheme");
     println!("  skwd wall theme_preview '{{\"name\":\"file.jpg\"}}'");

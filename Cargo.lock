@@ -1150,9 +1150,8 @@ dependencies = [
 
 [[package]]
 name = "ffmpeg-sys-the-third"
-version = "5.0.0+ffmpeg-8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b00c204bb97c2b6c0329104c3e8bcf58d4d13cc88a04233326570672e0c2c5c9"
+version = "6.0.0+ffmpeg-9.0"
+source = "git+https://github.com/shssoichiro/ffmpeg-the-third.git?rev=47eb652418f56f8010e640946b105cd5614701f7#47eb652418f56f8010e640946b105cd5614701f7"
 dependencies = [
  "bindgen",
  "cc",
@@ -1164,9 +1163,8 @@ dependencies = [
 
 [[package]]
 name = "ffmpeg-the-third"
-version = "5.0.0+ffmpeg-8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "791f0d9315e4f0a0861fa5c8ca8d70a1bd099cce72bff111b4f7ed8d6ebe8ba3"
+version = "6.0.0+ffmpeg-9.0"
+source = "git+https://github.com/shssoichiro/ffmpeg-the-third.git?rev=47eb652418f56f8010e640946b105cd5614701f7#47eb652418f56f8010e640946b105cd5614701f7"
 dependencies = [
  "bitflags 2.11.0",
  "ffmpeg-sys-the-third",
