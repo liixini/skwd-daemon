@@ -117,7 +117,7 @@ fn apply_kaleidoscope(img: DynamicImage, params: &Value) -> DynamicImage {
 
 fn kuwahara_schema() -> Value {
     json!({
-        "id": "kuwahara", "label": "Kuwahara (painterly)",
+        "id": "kuwahara", "label": "Kuwahara",
         "description": "Oil-painting smear that keeps edges.",
         "params": [
             { "id": "radius", "label": "Radius", "type": "integer",
