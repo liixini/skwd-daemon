@@ -29,6 +29,7 @@
             nativeBuildInputs = with pkgs; [
               pkg-config
               rustPlatform.bindgenHook
+              makeWrapper
             ];
 
             buildInputs = with pkgs; [
@@ -48,6 +49,7 @@
               libpulseaudio
               wayland
               libGL
+              qt6.qttools
             ];
 
             env.NIX_LDFLAGS = "-L${pkgs.libpulseaudio.out}/lib";
@@ -57,6 +59,11 @@
               substituteInPlace $out/lib/systemd/user/skwd-daemon.service \
                 --replace-fail "/usr/bin/skwd-daemon" "$out/bin/skwd-daemon"
               install -Dm644 data/host/shell.qml $out/share/skwd/skwd-daemon/host/shell.qml
+            '';
+
+            postFixup = ''
+              wrapProgram $out/bin/skwd-daemon \
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.qt6.qttools ]}
             '';
 
             meta = {

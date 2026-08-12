@@ -7,7 +7,7 @@ pkgdesc='Daemon for Skwd Shell, a collection of Quickshell programs and widgets 
 arch=('x86_64')
 url='https://github.com/liixini/skwd-daemon'
 license=('MIT')
-depends=('gcc-libs' 'imagemagick' 'ffmpeg' 'alsa-lib' 'libpulse' 'wayland' 'mesa')
+depends=('gcc-libs' 'imagemagick' 'ffmpeg' 'alsa-lib' 'libpulse' 'wayland' 'mesa' 'qt6-tools')
 optdepends=(
   'ollama: local LLM for automated wallpaper tagging'
   'steamcmd: Steam Workshop Wallpaper Engine downloads when the Steam client is not running'

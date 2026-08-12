@@ -35,6 +35,7 @@ BuildRequires:  pkgconfig(egl)
 Requires:       ImageMagick
 Requires:       /usr/bin/ffmpeg
 Requires:       /usr/bin/ffprobe
+Requires:       qt6-qttools
 
 Suggests:       ollama
 Suggests:       steamcmd

@@ -43,17 +43,37 @@ pub enum CachedLyrics {
     KnownMiss,
 }
 
+const NOT_FOUND_RETRY_SECS: i64 = 24 * 60 * 60;
+
 pub fn lookup_lyrics(conn: &Connection, artist: &str, title: &str) -> Option<CachedLyrics> {
-    let row: Option<(String, i64, i64)> = conn
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .cast_signed();
+    lookup_lyrics_at(conn, artist, title, now)
+}
+
+fn lookup_lyrics_at(
+    conn: &Connection,
+    artist: &str,
+    title: &str,
+    now: i64,
+) -> Option<CachedLyrics> {
+    let row: Option<(String, i64, i64, Option<i64>)> = conn
         .query_row(
-            "SELECT data, enhanced, not_found FROM lyrics WHERE artist=?1 AND title=?2",
+            "SELECT data, enhanced, not_found, fetched_at FROM lyrics WHERE artist=?1 AND title=?2",
             params![artist, title],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .ok();
 
-    let (data_json, enhanced_int, not_found_int) = row?;
+    let (data_json, enhanced_int, not_found_int, fetched_at) = row?;
     if not_found_int != 0 {
+        let fetched_at = fetched_at?;
+        if fetched_at <= 0 || now.saturating_sub(fetched_at) >= NOT_FOUND_RETRY_SECS {
+            return None;
+        }
         return Some(CachedLyrics::KnownMiss);
     }
     let lines: Vec<LyricLine> = serde_json::from_str(&data_json).ok()?;
@@ -584,5 +604,27 @@ mod tests {
             .unwrap();
         assert_eq!(known["notFound"], true);
         assert_eq!(known["cached"], true);
+    }
+
+    #[test]
+    fn known_misses_expire_after_24_hours() {
+        let db = crate::db::open_in_memory().unwrap();
+        db.execute(
+            "INSERT INTO lyrics(artist, title, enhanced, data, fetched_at, not_found)
+             VALUES('recent', 'miss', 0, '[]', 100, 1),
+                   ('stale', 'miss', 0, '[]', 99, 1),
+                   ('legacy', 'miss', 0, '[]', 0, 1)",
+            [],
+        )
+        .unwrap();
+
+        let now = 100 + NOT_FOUND_RETRY_SECS;
+        assert!(matches!(
+            lookup_lyrics_at(&db, "recent", "miss", now - 1),
+            Some(CachedLyrics::KnownMiss)
+        ));
+        assert!(lookup_lyrics_at(&db, "recent", "miss", now).is_none());
+        assert!(lookup_lyrics_at(&db, "stale", "miss", now).is_none());
+        assert!(lookup_lyrics_at(&db, "legacy", "miss", now).is_none());
     }
 }

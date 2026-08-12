@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
+use std::io::ErrorKind;
 
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -7,19 +9,60 @@ use crate::config::{self, Config};
 
 use super::{is_kde, read_outputs_state};
 
+const QDBUS_CANDIDATES: &[&str] = &[
+    "qdbus6",
+    "qdbus-qt6",
+    "qdbus",
+    "/usr/lib64/qt6/bin/qdbus",
+    "/usr/lib/qt6/bin/qdbus",
+];
+
 pub(super) async fn run_plasma_evaluate_script(script: &str) -> anyhow::Result<String> {
-    let out = Command::new("qdbus6")
-        .arg("org.kde.plasmashell")
-        .arg("/PlasmaShell")
-        .arg("org.kde.PlasmaShell.evaluateScript")
-        .arg(script)
-        .output()
-        .await?;
-    if !out.status.success() {
-        warn!("plasmashell evaluateScript failed ({})", out.status);
-        anyhow::bail!("plasmashell evaluateScript failed ({})", out.status);
+    let candidates: Vec<&OsStr> = QDBUS_CANDIDATES.iter().map(OsStr::new).collect();
+    run_plasma_evaluate_script_with(script, &candidates).await
+}
+
+async fn run_plasma_evaluate_script_with(script: &str, candidates: &[&OsStr]) -> anyhow::Result<String> {
+    let mut missing = Vec::new();
+    for candidate in candidates {
+        let out = match Command::new(candidate)
+            .arg("org.kde.plasmashell")
+            .arg("/PlasmaShell")
+            .arg("org.kde.PlasmaShell.evaluateScript")
+            .arg(script)
+            .output()
+            .await
+        {
+            Ok(out) => out,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                missing.push(candidate.to_string_lossy().into_owned());
+                continue;
+            }
+            Err(error) => {
+                anyhow::bail!("failed to launch {}: {error}", candidate.to_string_lossy());
+            }
+        };
+
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            warn!(
+                command = %candidate.to_string_lossy(),
+                status = %out.status,
+                stderr = %stderr,
+                "plasmashell evaluateScript failed"
+            );
+            anyhow::bail!(
+                "plasmashell evaluateScript via {} failed ({}): {}",
+                candidate.to_string_lossy(),
+                out.status,
+                stderr
+            );
+        }
+
+        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+
+    anyhow::bail!("no Qt 6 qdbus executable found (tried: {})", missing.join(", "))
 }
 
 pub(super) async fn query_kde_screen_map() -> HashMap<String, (i64, i64)> {
@@ -41,8 +84,10 @@ fn parse_kscreen_json(text: &str) -> HashMap<String, (i64, i64)> {
     };
     let mut map = HashMap::new();
     for output in outputs {
-        let connected =
-            output.get("connected").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let connected = output
+            .get("connected")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         if !connected {
             continue;
         }
@@ -200,10 +245,7 @@ pub(super) async fn kde_apply_audio(
     }
 
     let mut configs: Vec<serde_json::Value> = Vec::new();
-    let touched: HashSet<&String> = mute_per_output
-        .keys()
-        .chain(volume_per_output.keys())
-        .collect();
+    let touched: HashSet<&String> = mute_per_output.keys().chain(volume_per_output.keys()).collect();
     for out in touched {
         if !video_outputs.contains(out) {
             continue;
@@ -216,10 +258,7 @@ pub(super) async fn kde_apply_audio(
         entry.insert("y".into(), serde_json::json!(y));
         if let Some(&m) = mute_per_output.get(out) {
             // MuteMode: 5 = always mute, 4 = never mute (always play)
-            entry.insert(
-                "muteMode".into(),
-                serde_json::json!(if m { "5" } else { "4" }),
-            );
+            entry.insert("muteMode".into(), serde_json::json!(if m { "5" } else { "4" }));
         }
         if let Some(&v) = volume_per_output.get(out) {
             // Volume: plugin schema is Double in 0.0..1.0 - convert from 0..100 percent.
@@ -233,8 +272,7 @@ pub(super) async fn kde_apply_audio(
         return;
     }
 
-    let configs_js =
-        serde_json::to_string(&configs).unwrap_or_else(|_| "[]".to_string());
+    let configs_js = serde_json::to_string(&configs).unwrap_or_else(|_| "[]".to_string());
     let script = format!(
         "var cfgs = {configs_js}; \
          var ds = desktops(); \
@@ -303,8 +341,7 @@ pub(super) async fn apply_kde_video(
         (v, false)
     };
 
-    let configs_js =
-        serde_json::to_string(&per_screen).unwrap_or_else(|_| "[]".to_string());
+    let configs_js = serde_json::to_string(&per_screen).unwrap_or_else(|_| "[]".to_string());
 
     info!(
         path = %path,
@@ -342,6 +379,60 @@ pub(super) async fn apply_kde_video(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn executable(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[tokio::test]
+    async fn qdbus_resolution_skips_missing_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("qdbus6");
+        let fallback = temp.path().join("qdbus-qt6");
+        executable(&fallback, "#!/bin/sh\nprintf '2\\n'\n");
+        let candidates = [missing.as_os_str(), fallback.as_os_str()];
+
+        let result = run_plasma_evaluate_script_with("1 + 1", &candidates).await.unwrap();
+
+        assert_eq!(result, "2");
+    }
+
+    #[tokio::test]
+    async fn qdbus_resolution_reports_all_missing_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("qdbus6");
+        let second = temp.path().join("qdbus-qt6");
+        let candidates = [first.as_os_str(), second.as_os_str()];
+
+        let error = run_plasma_evaluate_script_with("1 + 1", &candidates)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("no Qt 6 qdbus executable found"));
+        assert!(error.contains("qdbus6"));
+        assert!(error.contains("qdbus-qt6"));
+    }
+
+    #[tokio::test]
+    async fn qdbus_resolution_preserves_command_stderr() {
+        let temp = tempfile::tempdir().unwrap();
+        let command = temp.path().join("qdbus-qt6");
+        executable(&command, "#!/bin/sh\necho 'dbus unavailable' >&2\nexit 3\n");
+        let candidates = [command.as_os_str()];
+
+        let error = run_plasma_evaluate_script_with("1 + 1", &candidates)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("dbus unavailable"));
+        assert!(error.contains("qdbus-qt6"));
+    }
 
     #[test]
     fn parse_kscreen_json_maps_connected_outputs_to_position() {
@@ -402,7 +493,10 @@ mod tests {
         assert!(js.contains("[-1080,0]"));
         assert!(js.contains("screenGeometry"));
         assert!(js.contains("s===-1"), "specific matcher must reject screen -1");
-        assert!(js.contains("Math.abs"), "match must use a tolerance, not exact equality");
+        assert!(
+            js.contains("Math.abs"),
+            "match must use a tolerance, not exact equality"
+        );
     }
 
     #[test]
