@@ -2,7 +2,7 @@
 
 Name:           skwd-daemon
 Version:        0.1.0
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Daemon for Skwd Shell, a collection of Quickshell programs and widgets
 
 License:        MIT
