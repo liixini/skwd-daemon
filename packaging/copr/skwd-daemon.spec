@@ -2,7 +2,7 @@
 
 Name:           skwd-daemon
 Version:        0.1.0
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Daemon for Skwd Shell, a collection of Quickshell programs and widgets
 
 License:        MIT
@@ -61,6 +61,7 @@ install -Dpm 0755 target/release/skwd-daemon %{buildroot}%{_bindir}/skwd-daemon
 install -Dpm 0755 target/release/skwd %{buildroot}%{_bindir}/skwd
 install -Dpm 0755 target/release/skwd-paper %{buildroot}%{_bindir}/skwd-paper
 install -Dpm 0755 target/release/skwd-paper-still %{buildroot}%{_bindir}/skwd-paper-still
+install -Dpm 0644 target/release/libsteam_api.so %{buildroot}%{_prefix}/lib/%{name}/libsteam_api.so
 install -Dpm 0644 data/skwd-daemon.service %{buildroot}%{_prefix}/lib/systemd/user/skwd-daemon.service
 install -Dpm 0644 LICENSE %{buildroot}%{_datadir}/licenses/%{name}/LICENSE
 
@@ -82,5 +83,6 @@ fi
 %{_bindir}/skwd
 %{_bindir}/skwd-paper
 %{_bindir}/skwd-paper-still
+%{_prefix}/lib/%{name}/libsteam_api.so
 %{_prefix}/lib/systemd/user/skwd-daemon.service
 %{_prefix}/lib/systemd/user-preset/90-skwd-daemon.preset

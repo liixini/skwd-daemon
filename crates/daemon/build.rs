@@ -9,7 +9,7 @@ fn main() {
         return;
     }
 
-    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib/skwd-daemon:$ORIGIN");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let target_dir = match out_dir.ancestors().nth(3) {
