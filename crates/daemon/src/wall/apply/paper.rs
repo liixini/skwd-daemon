@@ -16,6 +16,8 @@ use crate::config::{self, Config};
 
 use super::{paper_bin, read_outputs_state, read_prev_transition_image};
 
+const PAPER_READY_TIMEOUT_MS: u64 = 2500;
+
 fn paper_stderr() -> Stdio {
     Stdio::inherit()
 }
@@ -361,15 +363,17 @@ pub(super) async fn spawn_steady_image_paper(
     } else {
         None
     };
-    manager().steady.insert_killing_prev(output.to_string(), PersistPaper { child, stdin }).await;
     if let Some((p, n)) = notify {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(2500),
-            n.notified(),
-        )
-        .await;
-        ready_registry().lock().await.remove(&p);
+        match await_paper_ready_or_exit(&mut child, p, n, PAPER_READY_TIMEOUT_MS).await {
+            Ok(true) => {}
+            Ok(false) => warn!(pid = p, output = %output, "steady image paper readiness timed out"),
+            Err(error) => return Err(error),
+        }
     }
+    manager()
+        .steady
+        .insert_killing_prev(output.to_string(), PersistPaper { child, stdin })
+        .await;
     info!(pid = ?pid, output = %output, "steady image: spawned");
     Ok(())
 }
@@ -418,6 +422,11 @@ pub(super) async fn spawn_transition_overlay(
     };
     let notify = Arc::new(Notify::new());
     ready_registry().lock().await.insert(pid, notify.clone());
+    match await_paper_ready_or_exit(&mut child, pid, notify, PAPER_READY_TIMEOUT_MS).await {
+        Ok(true) => {}
+        Ok(false) => warn!(pid, output = %output, "transition overlay readiness timed out"),
+        Err(error) => return Err(error),
+    }
     let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
     let output_owned = output.to_string();
     tokio::spawn(async move {
@@ -442,8 +451,6 @@ pub(super) async fn spawn_transition_overlay(
     {
         let _ = prev.kill_tx.send(());
     }
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(2500), notify.notified()).await;
-    ready_registry().lock().await.remove(&pid);
     info!(pid, output = %output, "transition overlay: spawned");
     Ok(())
 }
@@ -517,7 +524,24 @@ pub(super) async fn spawn_video_persist_paper(
         return Err(std::io::Error::other("video persist paper missing stdin"));
     };
     let pid = child.id();
-    manager().video.insert_killing_prev(output.to_string(), PersistPaper { child, stdin }).await;
+    let notify = if let Some(p) = pid {
+        let n = Arc::new(Notify::new());
+        ready_registry().lock().await.insert(p, n.clone());
+        Some((p, n))
+    } else {
+        None
+    };
+    if let Some((p, n)) = notify {
+        match await_paper_ready_or_exit(&mut child, p, n, PAPER_READY_TIMEOUT_MS).await {
+            Ok(true) => {}
+            Ok(false) => warn!(pid = p, output = %output, "video persist paper readiness timed out"),
+            Err(error) => return Err(error),
+        }
+    }
+    manager()
+        .video
+        .insert_killing_prev(output.to_string(), PersistPaper { child, stdin })
+        .await;
     info!(pid = ?pid, output = %output, "video persist: spawned");
     Ok(pid)
 }
@@ -647,15 +671,17 @@ pub(super) async fn spawn_persist_paper(
     } else {
         None
     };
-    manager().persist.insert_killing_prev(output.to_string(), PersistPaper { child, stdin }).await;
     if let Some((p, n)) = notify {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(2500),
-            n.notified(),
-        )
-        .await;
-        ready_registry().lock().await.remove(&p);
+        match await_paper_ready_or_exit(&mut child, p, n, PAPER_READY_TIMEOUT_MS).await {
+            Ok(true) => {}
+            Ok(false) => warn!(pid = p, output = %output, "persist paper readiness timed out"),
+            Err(error) => return Err(error),
+        }
     }
+    manager()
+        .persist
+        .insert_killing_prev(output.to_string(), PersistPaper { child, stdin })
+        .await;
     info!(pid = ?pid, output = %output, "persist: spawned");
     Ok(())
 }
@@ -694,6 +720,37 @@ pub async fn signal_paper_ready(pid: u32) {
     }
 }
 
+async fn await_paper_ready_or_exit(
+    child: &mut Child,
+    pid: u32,
+    notify: Arc<Notify>,
+    timeout_ms: u64,
+) -> std::io::Result<bool> {
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async {
+        tokio::select! {
+            _ = notify.notified() => Ok(()),
+            status = child.wait() => {
+                let status = status?;
+                Err(std::io::Error::other(format!(
+                    "paper process {pid} exited before readiness: {status}"
+                )))
+            }
+        }
+    })
+    .await;
+    ready_registry().lock().await.remove(&pid);
+
+    match outcome {
+        Ok(result) => result.map(|()| true),
+        Err(_) => match child.try_wait()? {
+            Some(status) => Err(std::io::Error::other(format!(
+                "paper process {pid} exited before readiness: {status}"
+            ))),
+            None => Ok(false),
+        },
+    }
+}
+
 pub(super) async fn spawn_paper_await_ready(
     bin: &str,
     args: &[String],
@@ -707,7 +764,7 @@ pub(super) async fn spawn_paper_await_ready(
         .stderr(paper_stderr());
     cmd.as_std_mut().process_group(0);
     cmd.kill_on_drop(false);
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
     let Some(pid) = child.id() else {
         return Ok(child);
     };
@@ -716,19 +773,12 @@ pub(super) async fn spawn_paper_await_ready(
         let mut reg = ready_registry().lock().await;
         reg.insert(pid, notify.clone());
     }
-    let timed_out = tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms),
-        notify.notified(),
-    )
-    .await
-    .is_err();
-    let mut reg = ready_registry().lock().await;
-    reg.remove(&pid);
+    let ready = await_paper_ready_or_exit(&mut child, pid, notify, timeout_ms).await?;
     let dur_ms = spawn_start.elapsed().as_millis() as u64;
-    if timed_out {
-        warn!(pid, dur_ms, timeout_ms, "paper readiness timed out");
-    } else {
+    if ready {
         info!(pid, dur_ms, "paper ready");
+    } else {
+        warn!(pid, dur_ms, timeout_ms, "paper readiness timed out");
     }
     Ok(child)
 }
@@ -739,6 +789,18 @@ mod tests {
 
     fn write_outputs(dir: &Path, json: &str) {
         std::fs::write(dir.join("outputs.json"), json).unwrap();
+    }
+
+    #[tokio::test]
+    async fn paper_exit_before_readiness_is_an_error() {
+        let args = vec!["-c".to_string(), "exit 42".to_string()];
+        let error = spawn_paper_await_ready("/bin/sh", &args, 1000)
+            .await
+            .expect_err("exited paper was accepted as ready");
+        assert!(
+            error.to_string().contains("42"),
+            "exit status was missing from error: {error}"
+        );
     }
 
     #[tokio::test]

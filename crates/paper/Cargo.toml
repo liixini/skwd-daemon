@@ -33,7 +33,7 @@ gl = "0.14"
 
 image = { workspace = true }
 
-ffmpeg-the-third = { git = "https://github.com/shssoichiro/ffmpeg-the-third.git", rev = "47eb652418f56f8010e640946b105cd5614701f7" }
+ffmpeg-the-third = { git = "https://github.com/shssoichiro/ffmpeg-the-third.git", rev = "47eb652418f56f8010e640946b105cd5614701f7", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
 
 cpal = "0.16"
 ringbuf = "0.4"

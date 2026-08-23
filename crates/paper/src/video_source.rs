@@ -11,6 +11,24 @@ use crate::audio::AudioPlayer;
 
 static FFMPEG_INIT: Once = Once::new();
 
+fn sw_thread_count(width: u32, height: u32) -> usize {
+    let cap = if u64::from(width) * u64::from(height) > 2_100_000 {
+        8
+    } else {
+        4
+    };
+    std::thread::available_parallelism()
+        .map_or(2, std::num::NonZeroUsize::get)
+        .clamp(2, cap)
+}
+
+fn sw_threading_config(width: u32, height: u32) -> ff::codec::threading::Config {
+    ff::codec::threading::Config {
+        kind: ff::codec::threading::Type::Frame,
+        count: sw_thread_count(width, height),
+    }
+}
+
 fn init_ffmpeg() -> Result<()> {
     let mut err: Option<ff::Error> = None;
     FFMPEG_INIT.call_once(|| {
@@ -82,12 +100,10 @@ impl VideoSource {
             let time_base_secs =
                 f64::from(tb.numerator()) / f64::from(tb.denominator()).max(1.0);
             let parameters = stream.parameters();
+            let (width, height) = (parameters.width(), parameters.height());
             let mut ctx = ff::codec::context::Context::from_parameters(parameters)
                 .with_context(|| "decoder context from parameters")?;
-            ctx.set_threading(ff::codec::threading::Config {
-                kind: ff::codec::threading::Type::None,
-                count: 1,
-            });
+            ctx.set_threading(sw_threading_config(width, height));
             let decoder = ctx
                 .decoder()
                 .video()
@@ -572,5 +588,37 @@ fn create_quad_vao() -> (u32, u32) {
         gl::BindVertexArray(0);
         gl::BindBuffer(gl::ARRAY_BUFFER, 0);
         (vao, vbo)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_is_never_single_threaded() {
+        for (w, h) in [
+            (0, 0),
+            (1280, 720),
+            (1920, 1080),
+            (3440, 1440),
+            (3840, 2160),
+            (7680, 4320),
+        ] {
+            assert!(sw_thread_count(w, h) >= 2, "{w}x{h} fell back to serial decode");
+            assert_eq!(
+                sw_threading_config(w, h).kind,
+                ff::codec::threading::Type::Frame,
+                "{w}x{h} did not enable frame threading"
+            );
+        }
+    }
+
+    #[test]
+    fn threads_stay_bounded_and_scale_with_resolution() {
+        assert!(sw_thread_count(1920, 1080) <= 4);
+        assert!(sw_thread_count(3840, 2160) <= 8);
+        assert!(sw_thread_count(7680, 4320) <= 8);
+        assert!(sw_thread_count(3840, 2160) >= sw_thread_count(1920, 1080));
     }
 }
